@@ -19,11 +19,11 @@ pub struct DartDocument {
 
 impl DartDocument {
     /// Load the Dart program against `doc` and run its `main`.
-    pub fn start(doc: BaseDocument, wasm: &[u8], mjs: &str) -> Result<Self> {
+    pub fn start(doc: BaseDocument, wasm: &[u8]) -> Result<Self> {
         let inner = Rc::new(RefCell::new(doc));
         let listeners = Listeners::default();
         let host = PageHost::new("dart", inner.clone(), listeners.clone());
-        let mut runtime = DartRuntime::load(wasm, mjs, Box::new(host))?;
+        let mut runtime = DartRuntime::load(wasm, Box::new(host))?;
         runtime.run_main()?;
         Ok(Self { inner, runtime, listeners })
     }

@@ -2,12 +2,13 @@
 //!
 //! Dart's wasm treats strings and other values as opaque host references (externref) and
 //! calls small JS snippets for helpers. We provide those in Rust: values are `HostValue`s
-//! inside externrefs, and each dart2wasm import is recognised by its snippet in the
-//! generated `.mjs` (read as an import table only, never executed). Calls to
-//! `globalThis.host.<name>(...)` go to the `Host`; unknown snippets trap with their text.
+//! inside externrefs, and each dart2wasm import is recognised by its snippet in the import
+//! table (read as data, never executed). Calls to `globalThis.host.<name>(...)` go to the
+//! `Host`; unknown snippets trap with their text.
 //!
 //! The wasm must be built with `packs/dart/build.sh`, which converts dart2wasm's legacy
-//! exception instructions into the standard ones wasmtime implements.
+//! exception instructions into the standard ones wasmtime implements, and embeds the import
+//! table in a `dart2wasm-imports` custom section so no `.mjs` is shipped.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -90,8 +91,8 @@ fn engine() -> &'static Engine {
 
 impl DartRuntime {
     /// Compile and instantiate a Dart program. Does not run `main`.
-    pub fn load(wasm: &[u8], mjs: &str, host: Box<dyn Host>) -> Result<Self> {
-        let table = read_import_table(mjs)?;
+    pub fn load(wasm: &[u8], host: Box<dyn Host>) -> Result<Self> {
+        let table = read_import_table(&embedded_import_table(wasm)?)?;
         let module = Module::new(engine(), wasm)?;
         let mut store = Store::new(engine(), State { host, callbacks: Vec::new() });
 
@@ -202,10 +203,45 @@ fn classify(body: &str) -> Helper {
     }
 }
 
-/// Read `const dart2wasm = { X: body, ... }` out of the generated loader.
-fn read_import_table(mjs: &str) -> Result<HashMap<String, Helper>> {
-    let start = mjs.find("const dart2wasm = {").context("no dart2wasm import table in .mjs")?;
-    let rest = &mjs[start..];
+/// The import table `packs/dart/embed_imports.dart` stored in the wasm's custom section.
+fn embedded_import_table(wasm: &[u8]) -> Result<String> {
+    const SECTION: &[u8] = b"dart2wasm-imports";
+    let leb = |i: &mut usize| -> Result<usize> {
+        let (mut value, mut shift) = (0usize, 0);
+        loop {
+            let byte = *wasm.get(*i).context("truncated wasm")?;
+            *i += 1;
+            value |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    };
+    // Skip the 8-byte header, then walk sections: id, size, contents.
+    let mut i = 8;
+    while i < wasm.len() {
+        let id = wasm[i];
+        i += 1;
+        let size = leb(&mut i)?;
+        let end = i + size;
+        if id == 0 {
+            let mut j = i;
+            let name_len = leb(&mut j)?;
+            if wasm.get(j..j + name_len) == Some(SECTION) {
+                let payload = wasm.get(j + name_len..end).context("truncated custom section")?;
+                return Ok(String::from_utf8_lossy(payload).into_owned());
+            }
+        }
+        i = end;
+    }
+    bail!("no dart2wasm-imports section: build this page's Dart with packs/dart/build.sh")
+}
+
+/// Read `const dart2wasm = { X: body, ... }`, the import table dart2wasm writes.
+fn read_import_table(source: &str) -> Result<HashMap<String, Helper>> {
+    let start = source.find("const dart2wasm = {").context("no dart2wasm import table")?;
+    let rest = &source[start..];
     let end = rest.find("\n    };").context("unterminated dart2wasm import table")?;
     let entry = Regex::new(r"^\s+([A-Za-z_$][\w$]*): (.*)$").unwrap();
 
@@ -466,12 +502,12 @@ mod tests {
     #[test]
     fn counter_example_runs_and_handles_clicks() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/counter");
-        let (Ok(wasm), Ok(mjs)) = (std::fs::read(dir.join("main.wasm")), std::fs::read_to_string(dir.join("main.mjs"))) else {
+        let Ok(wasm) = std::fs::read(dir.join("main.wasm")) else {
             panic!("build the example first: packs/dart/build.sh examples/counter/main.dart");
         };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let host = FakeHost { calls: calls.clone(), next_handle: 0.0 };
-        let mut runtime = DartRuntime::load(&wasm, &mjs, Box::new(host)).unwrap();
+        let mut runtime = DartRuntime::load(&wasm, Box::new(host)).unwrap();
 
         runtime.run_main().unwrap();
         runtime.fire_callback(0).unwrap();
@@ -496,6 +532,14 @@ mod tests {
                 "domAppend(3, 6)",
             ]
         );
+    }
+
+    #[test]
+    fn wasm_without_embedded_table_is_rejected_with_a_hint() {
+        // A valid, empty wasm module: magic + version, no sections.
+        let empty = b"\0asm\x01\0\0\0";
+        let err = embedded_import_table(empty).unwrap_err().to_string();
+        assert!(err.contains("packs/dart/build.sh"), "{err}");
     }
 
     #[test]

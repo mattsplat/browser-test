@@ -210,7 +210,7 @@ async fn build_page_document(
         return (SubDocumentAttr::new(document), title, favicon_url);
     };
     match fetch_dart_program(&wasm_url, net_provider, signal).await {
-        Ok((wasm, mjs)) => match DartDocument::start(document, &wasm, &mjs) {
+        Ok(wasm) => match DartDocument::start(document, &wasm) {
             Ok(dart) => (SubDocumentAttr::new(dart), title, favicon_url),
             // Loading failed partway; the document it was given is gone, so show the error.
             Err(e) => (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url),
@@ -235,18 +235,16 @@ fn dart_script_url(document: &BaseDocument) -> Option<Url> {
     document.url().join(src).ok()
 }
 
-/// Fetch a dart2wasm program: the `.wasm` and the `.mjs` beside it (read only as an import
-/// table). Both go through the gate like any other request.
+/// Fetch a Dart program: one `.wasm`, with its import table embedded by
+/// `packs/dart/build.sh`. It goes through the gate like any other request.
 async fn fetch_dart_program(
     wasm_url: &Url,
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
-) -> anyhow::Result<(Vec<u8>, String)> {
-    let mjs_url = Url::parse(&wasm_url.as_str().replace(".wasm", ".mjs"))?;
-    let fetch = |url: Url| net_provider.fetch_async(Request::get(url).signal(signal.clone()));
-    let (_, wasm) = fetch(wasm_url.clone()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let (_, mjs) = fetch(mjs_url).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    Ok((wasm.to_vec(), String::from_utf8_lossy(&mjs).into_owned()))
+) -> anyhow::Result<Vec<u8>> {
+    let request = Request::get(wasm_url.clone()).signal(signal.clone());
+    let (_, wasm) = net_provider.fetch_async(request).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok(wasm.to_vec())
 }
 
 fn error_document(message: &str) -> SubDocumentAttr {

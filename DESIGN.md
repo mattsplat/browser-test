@@ -195,9 +195,11 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 - `browser/src/trace_panel.rs`: the Trace panel (toolbar button) showing every host call.
 - `packs/dart/dom.dart`: the Dart-side API (`query`, `create`, `Element.text`,
   `append`, `onClick`). `packs/dart/build.sh`: compile plus the exnref step.
-- Pages opt in with `<script type="application/dart" src="app.wasm">`. The `.wasm` and the
-  `.mjs` beside it are fetched through the gate.
-- Known gaps: the `.mjs` must sit beside the `.wasm`; only click events; no way to remove
+- Pages opt in with `<script type="application/dart" src="app.wasm">`, fetched through the
+  gate. A page ships only the `.wasm`: `build.sh` moves dart2wasm's import table into a
+  `dart2wasm-imports` custom section (`packs/dart/embed_imports.dart`) and deletes the
+  generated `.mjs` and `.support.js`.
+- Known gaps: only click events; no way to remove
   listeners; Dart's `print` goes to the trace, not a console view; the source map is not
   used yet, so errors show wasm function numbers rather than Dart lines.
 

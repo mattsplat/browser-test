@@ -1,7 +1,7 @@
 #!/bin/sh
 # Compile a Dart entry point for this browser's Dart pack.
 #
-# usage: packs/dart/build.sh path/to/main.dart   ->  path/to/main.wasm + main.mjs
+# usage: packs/dart/build.sh path/to/main.dart   ->  path/to/main.wasm
 #
 # dart2wasm emits legacy wasm exception instructions, which wasmtime does not implement,
 # so the output is passed through the SDK's own wasm-opt with --translate-to-exnref.
@@ -23,4 +23,8 @@ dart compile wasm "$src" -o "$out"
   --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
   --enable-mutable-globals --enable-multivalue --enable-tail-call \
   --translate-to-exnref -o "$out"
-echo "built $out (+ ${out%.wasm}.mjs, read by the browser as an import table only)"
+
+# Move the import table into the .wasm and drop the JS loader files: pages ship one file.
+dart run "$(dirname "$0")/embed_imports.dart" "$out" "${out%.wasm}.mjs"
+rm -f "${out%.wasm}.mjs" "${out%.wasm}.support.js"
+echo "built $out"
