@@ -1,7 +1,7 @@
 #!/bin/sh
 # Compile a Dart entry point for this browser's Dart pack.
 #
-# usage: packs/dart/build.sh path/to/main.dart   ->  path/to/main.wasm
+# usage: packs/dart/build.sh path/to/main.dart [out.wasm]   (default: path/to/main.wasm)
 #
 # dart2wasm emits legacy wasm exception instructions, which wasmtime does not implement,
 # so the output is passed through the SDK's own wasm-opt with --translate-to-exnref.
@@ -10,8 +10,8 @@
 set -e
 
 src="$1"
-[ -n "$src" ] || { echo "usage: $0 path/to/main.dart" >&2; exit 2; }
-out="${src%.dart}.wasm"
+[ -n "$src" ] || { echo "usage: $0 path/to/main.dart [out.wasm]" >&2; exit 2; }
+out="${2:-${src%.dart}.wasm}"
 
 sdk="$(dirname "$(dirname "$(readlink -f "$(command -v dart)")")")"
 wasm_opt="$sdk/bin/utils/wasm-opt"

@@ -11,7 +11,7 @@ use crate::icons::{self, IconButton};
 use crate::nav::{is_enter_key, open_in_external_browser, req_from_string};
 use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt, active_tab};
 use crate::url_suggestions::{Suggestion, SuggestionKind, UrlSuggester, UrlSuggestions};
-use crate::{IS_MOBILE, StdNetProvider};
+use crate::{IS_MOBILE, StdNetProvider, settings};
 
 fn with_sub_doc(tab: Store<Tab>, mut cb: impl FnMut(&mut BaseDocument)) {
     let node_handle_lens = tab.node_handle();
@@ -435,6 +435,13 @@ pub fn Toolbar(
                 }
                 if menu_open() {
                     div { class: "menu-dropdown",
+                        div { class: "menu-item", onclick: move |_| {
+                            settings::update(|s| s.dev_mode = !s.dev_mode);
+                            menu_open.set(false);
+                        },
+                            if settings::get().dev_mode { "Dev mode: ON (compile Dart source)" } else { "Dev mode: OFF" }
+                        }
+                        div { class: "menu-item-separator" }
                         div { class: "menu-item", onclick: move |_| nav_about(AboutPage::Settings), "Settings" }
                         div { class: "menu-item", onclick: move |_| nav_about(AboutPage::History), "History" }
                         div { class: "menu-item", onclick: move |_| nav_about(AboutPage::Bookmarks), "Bookmarks" }

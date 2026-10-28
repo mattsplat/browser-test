@@ -211,6 +211,24 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
   delivery); no mouse/keyboard event details; Dart's `print` goes to the trace, not a console view; the source map is not
   used yet, so errors show wasm function numbers rather than Dart lines.
 
+## Step 3 notes: dev mode
+
+- Menu → **Dev mode** toggles it (saved in `settings.json` in the app's config folder, along
+  with per-site grants). History moved to the app's own folder too.
+- A page opts in by pointing its Dart script at source: `<script type="application/dart"
+  src="main.dart">` (see `examples/counter/dev.html`).
+- Rules (`dev_mode_decision` in `document_loader.rs`, tested): off → never compile, never ask;
+  remembered Block → skip; remembered Allow → compile; no answer yet → the prompt bar asks
+  (Allow for this site / Allow once / Block). Skips are recorded in the trace.
+- `dev_compile.rs` runs `packs/dart/build.sh` in `sandbox-exec` with outbound network denied,
+  using the local Dart SDK. `file://` pages compile in their own folder (multi-file apps and
+  their pubspec work); `http(s)` pages compile as a single file fetched through the gate.
+  Output is cached and rebuilt when any `.dart` file or the pubspec is newer, so editing
+  and reloading is the "hot restart" level from the design.
+- Compile errors are shown on the page. Packages resolve with `dart pub get --offline`, so a
+  project needs `dart pub get` run once with network.
+- Not yet: stateful hot reload; multi-file apps over http.
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).

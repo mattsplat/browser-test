@@ -461,3 +461,39 @@ body,
   white-space: nowrap;
   font-family: monospace;
 }
+
+/* Step 3: dev-mode permission prompt (browser UI, never page content) */
+
+.prompt-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #FFF8E1;
+  border-bottom: 1px solid #E0C97A;
+  font-family: sans-serif;
+  font-size: 13px;
+}
+
+.prompt-text {
+  flex: 1 1 auto;
+}
+
+.prompt-button {
+  padding: 5px 10px;
+  border: 1px solid #BBB;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    background: #F0F0F0;
+  }
+
+  &.primary {
+    background: #1565C0;
+    border-color: #1565C0;
+    color: white;
+  }
+}

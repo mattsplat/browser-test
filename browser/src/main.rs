@@ -31,9 +31,12 @@ macro_rules! local_asset {
 mod about_pages;
 mod dart_document;
 mod dart_pack;
+mod dev_compile;
 mod gate;
 mod host;
+mod prompt;
 mod request_panel;
+mod settings;
 mod trace_panel;
 mod browser_history;
 #[cfg(any(feature = "screenshot", feature = "capture"))]
@@ -209,6 +212,7 @@ fn app() -> Element {
                 show_requests,
                 show_trace,
             }
+            prompt::PromptBar {}
             for tab in tabs.iter() {
                 TabWebView {
                     key: "{tab.tab_id()}",

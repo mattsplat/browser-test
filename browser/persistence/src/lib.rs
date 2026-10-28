@@ -280,7 +280,7 @@ fn set_favicon_by_url_inner(conn: &Connection, page_url: &Url, favicon_url: &Url
 fn open_file_connection() -> Result<Connection, String> {
     use directories::ProjectDirs;
 
-    let dirs = ProjectDirs::from("com", "DioxusLabs", "Blitz")
+    let dirs = ProjectDirs::from("dev", "mattsplat", "browser-test")
         .ok_or_else(|| "ProjectDirs::from returned None".to_string())?;
     let db_path = dirs.data_dir().join("history.sqlite3");
     if let Some(parent) = db_path.parent() {

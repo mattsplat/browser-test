@@ -13,8 +13,11 @@ use blitz_dom::{BaseDocument, local_name};
 
 use crate::StdNetProvider;
 use crate::dart_document::DartDocument;
+use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::host::{self, TraceEntry};
+use crate::prompt;
+use crate::settings::{self, Grant};
 use crate::history::{BrowserNavProvider, History, SyncStore};
 
 pub enum DocumentLoaderStatus {
@@ -206,26 +209,82 @@ async fn build_page_document(
         .unwrap_or_default();
     let favicon_url = document.favicon_url();
 
-    let Some(wasm_url) = dart_script_url(&document) else {
+    let Some(src) = dart_script_url(&document) else {
         return (SubDocumentAttr::new(document), title, favicon_url);
     };
-    match fetch_dart_program(&wasm_url, net_provider, signal).await {
-        Ok(wasm) => match DartDocument::start(document, &wasm) {
-            Ok(dart) => (SubDocumentAttr::new(dart), title, favicon_url),
-            // Loading failed partway; the document it was given is gone, so show the error.
-            Err(e) => (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url),
-        },
-        Err(e) => {
-            host::record(TraceEntry {
-                pack: "dart",
-                call: "load".into(),
-                args: wasm_url.to_string(),
-                result: format!("ERROR {e:#}"),
-                micros: 0,
-            });
-            (SubDocumentAttr::new(document), title, favicon_url)
+    let wasm = if src.path().ends_with(".dart") {
+        let origin = settings::origin_of(document.url());
+        match dev_mode_compile(&src, &origin, net_provider, signal).await {
+            Ok(Some(wasm)) => wasm,
+            Ok(None) => return (SubDocumentAttr::new(document), title, favicon_url),
+            // Compile errors are for the developer: show them on the page.
+            Err(e) => return (error_document(&format!("Compiling {src} failed:\n\n{e:#}")), title, favicon_url),
         }
+    } else {
+        match fetch_dart_program(&src, net_provider, signal).await {
+            Ok(wasm) => wasm,
+            Err(e) => {
+                trace_load(&src, format!("ERROR {e:#}"));
+                return (SubDocumentAttr::new(document), title, favicon_url);
+            }
+        }
+    };
+    match DartDocument::start(document, &wasm) {
+        Ok(dart) => (SubDocumentAttr::new(dart), title, favicon_url),
+        // Loading failed partway; the document it was given is gone, so show the error.
+        Err(e) => (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url),
     }
+}
+
+fn trace_load(src: &Url, result: String) {
+    host::record(TraceEntry { pack: "dart", call: "load".into(), args: src.to_string(), result, micros: 0 });
+}
+
+#[derive(Debug, PartialEq)]
+enum DevDecision {
+    Skip(String),
+    Ask,
+    Compile,
+}
+
+/// Dev mode's rules, separate from any I/O so they can be tested.
+fn dev_mode_decision(settings: &settings::Settings, origin: &str) -> DevDecision {
+    if !settings.dev_mode {
+        return DevDecision::Skip("Dart source needs dev mode, which is off".into());
+    }
+    match settings.dev_grants.get(origin) {
+        Some(Grant::Allow) => DevDecision::Compile,
+        Some(Grant::Block) => DevDecision::Skip(format!("compiling source is blocked for {origin}")),
+        None => DevDecision::Ask,
+    }
+}
+
+/// Dev mode's rules for a page whose Dart script is source (`.dart`): never compile when dev
+/// mode is off, respect a remembered Block, and otherwise ask once per site before compiling.
+/// `Ok(None)` means the page renders without its script.
+async fn dev_mode_compile(
+    src: &Url,
+    origin: &str,
+    net_provider: &Arc<StdNetProvider>,
+    signal: &AbortSignal,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match dev_mode_decision(&settings::get(), origin) {
+        DevDecision::Skip(reason) => {
+            trace_load(src, format!("skipped: {reason}"));
+            return Ok(None);
+        }
+        DevDecision::Ask => {
+            if prompt::ask(origin).await == prompt::Answer::Block {
+                trace_load(src, format!("skipped: compiling source is blocked for {origin}"));
+                return Ok(None);
+            }
+        }
+        DevDecision::Compile => {}
+    }
+    let started = std::time::Instant::now();
+    let wasm = dev_compile::compile(src, net_provider, signal).await?;
+    trace_load(src, format!("compiled from source in {} ms", started.elapsed().as_millis()));
+    Ok(Some(wasm))
 }
 
 /// The `src` of the page's Dart script, resolved against the page URL.
@@ -253,4 +312,36 @@ fn error_document(message: &str) -> SubDocumentAttr {
         message.replace('&', "&amp;").replace('<', "&lt;")
     );
     SubDocumentAttr::new(HtmlDocument::from_html(&html, DocumentConfig::default()).into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use settings::Settings;
+
+    #[test]
+    fn dev_mode_off_never_compiles_or_asks() {
+        let mut s = Settings::default();
+        s.dev_grants.insert("file://".into(), Grant::Allow);
+        assert!(matches!(dev_mode_decision(&s, "file://"), DevDecision::Skip(_)));
+    }
+
+    #[test]
+    fn dev_mode_on_asks_for_unknown_sites_and_respects_grants() {
+        let mut s = Settings { dev_mode: true, ..Default::default() };
+        s.dev_grants.insert("https://ok.test".into(), Grant::Allow);
+        s.dev_grants.insert("https://no.test".into(), Grant::Block);
+        assert_eq!(dev_mode_decision(&s, "https://new.test"), DevDecision::Ask);
+        assert_eq!(dev_mode_decision(&s, "https://ok.test"), DevDecision::Compile);
+        assert!(matches!(dev_mode_decision(&s, "https://no.test"), DevDecision::Skip(_)));
+    }
+
+    #[test]
+    fn grants_are_per_origin() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        assert_eq!(settings::origin_of(&url("https://myapp.test/a/b.html")), "https://myapp.test");
+        assert_ne!(settings::origin_of(&url("https://api.myapp.test/")), "https://myapp.test");
+        assert_eq!(settings::origin_of(&url("http://localhost:8080/x")), "http://localhost:8080");
+        assert_eq!(settings::origin_of(&url("file:///Users/me/page.html")), "file://");
+    }
 }
