@@ -3,8 +3,9 @@
 //! Dart's wasm treats strings and other values as opaque host references (externref) and
 //! calls small JS snippets for helpers. We provide those in Rust: values are `HostValue`s
 //! inside externrefs, and each dart2wasm import is recognised by its snippet in the import
-//! table (read as data, never executed). Calls to `globalThis.host.<name>(...)` go to the
-//! `Host`; unknown snippets trap with their text.
+//! table (read as data, never executed). DOM access comes from `package:web`, whose snippets
+//! have four shapes - read a global, call a method, get or set a property - which go to the
+//! `Host` by name. Unknown snippets trap with their text.
 //!
 //! The wasm must be built with `packs/dart/build.sh`, which converts dart2wasm's legacy
 //! exception instructions into the standard ones wasmtime implements, and embeds the import
@@ -24,12 +25,18 @@ pub enum HostValue {
     Num(f64),
     Bool(bool),
     Undefined,
+    /// JavaScript `null`: a null reference.
+    Null,
     /// A Dart closure wrapped so the host can call it later: (trampoline, closure).
-    /// The host never sees this: it is swapped for a callback id before `Host::call`.
+    /// The host never sees this: it is swapped for a `CallbackId` before reaching the `Host`.
     Callback(Func, OwnedRooted<AnyRef>),
+    /// A callback as the host sees it; fire it with `DartRuntime::fire_callback`.
+    CallbackId(usize),
     /// A Dart object passed out by reference. The host can hold it and hand it back,
     /// but not look inside, just as a JS engine treats it.
     Opaque(OwnedRooted<AnyRef>),
+    /// A host object (document, element, event...), by handle. Only the host knows what it is.
+    Object(u32),
 }
 
 impl HostValue {
@@ -43,8 +50,34 @@ impl HostValue {
             HostValue::Num(n) => format_number(*n),
             HostValue::Bool(b) => b.to_string(),
             HostValue::Undefined => "undefined".into(),
+            HostValue::Null => "null".into(),
             HostValue::Callback(..) => "function".into(),
-            HostValue::Opaque(_) => "[object]".into(),
+            HostValue::CallbackId(id) => format!("function#{id}"),
+            HostValue::Opaque(_) => "[dart object]".into(),
+            HostValue::Object(h) => format!("#{h}"),
+        }
+    }
+
+    /// JavaScript truthiness (`!!value`).
+    fn truthy(&self) -> bool {
+        match self {
+            HostValue::Undefined | HostValue::Null => false,
+            HostValue::Bool(b) => *b,
+            HostValue::Num(n) => *n != 0.0 && !n.is_nan(),
+            HostValue::Str(s) => !s.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// JavaScript `===`.
+    fn strict_equals(&self, other: &HostValue) -> bool {
+        match (self, other) {
+            (HostValue::Undefined, HostValue::Undefined) | (HostValue::Null, HostValue::Null) => true,
+            (HostValue::Bool(a), HostValue::Bool(b)) => a == b,
+            (HostValue::Num(a), HostValue::Num(b)) => a == b,
+            (HostValue::Str(a), HostValue::Str(b)) => a == b,
+            (HostValue::Object(a), HostValue::Object(b)) => a == b,
+            _ => false,
         }
     }
 
@@ -60,10 +93,17 @@ fn format_number(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e21 { format!("{}", n as i64) } else { format!("{n}") }
 }
 
-/// What the pack can reach outside its sandbox. Every call goes through here.
+/// What the pack can reach outside its sandbox. Every call goes through here, named the way
+/// the web platform names it (`document`, `querySelector`, `textContent`...).
 pub trait Host {
-    /// A `host.<name>(...)` call. Callback arguments arrive as their callback id.
-    fn call(&mut self, name: &str, args: &[HostValue]) -> Result<HostValue>;
+    /// `globalThis.<name>`, e.g. `document`.
+    fn global(&mut self, name: &str) -> Result<HostValue>;
+    /// `target.<prop>`.
+    fn get(&mut self, target: &HostValue, prop: &str) -> Result<HostValue>;
+    /// `target.<prop> = value`.
+    fn set(&mut self, target: &HostValue, prop: &str, value: &HostValue) -> Result<()>;
+    /// `target.<method>(args)`. Callback arguments arrive as `HostValue::CallbackId`.
+    fn call(&mut self, target: &HostValue, method: &str, args: &[HostValue]) -> Result<HostValue>;
     /// Dart's `print`.
     fn console(&mut self, text: &str);
 }
@@ -78,6 +118,8 @@ struct State {
     host: Box<dyn Host>,
     /// Callbacks the page registered, by id, so the host can fire them later.
     callbacks: Vec<HostValue>,
+    /// Work Dart queued with `queueMicrotask`; run after every entry into Dart.
+    microtasks: std::collections::VecDeque<HostValue>,
 }
 
 fn engine() -> &'static Engine {
@@ -94,7 +136,7 @@ impl DartRuntime {
     pub fn load(wasm: &[u8], host: Box<dyn Host>) -> Result<Self> {
         let table = read_import_table(&embedded_import_table(wasm)?)?;
         let module = Module::new(engine(), wasm)?;
-        let mut store = Store::new(engine(), State { host, callbacks: Vec::new() });
+        let mut store = Store::new(engine(), State { host, callbacks: Vec::new(), microtasks: Default::default() });
 
         let mut imports: Vec<Extern> = Vec::new();
         for import in module.imports() {
@@ -111,7 +153,7 @@ impl DartRuntime {
                     Func::new(&mut store, ty, move |mut caller, params, results| {
                         let outcome = match (m.as_str(), &helper) {
                             ("dart2wasm", Some(h)) => call_helper(h, &mut caller, params, results, &fty)
-                                .with_context(|| format!("in dart2wasm.{name} ({h:?})")),
+                                .with_context(|| format!("in {h:?}")),
                             ("wasm:js-string", _) => js_string(&name, &mut caller, params, results, &fty),
                             _ => Err(anyhow!("unsupported import {m}.{name}")),
                         };
@@ -140,24 +182,41 @@ impl DartRuntime {
         let main = self.instance.get_func(&mut self.store, "$invokeMain").context("no $invokeMain export")?;
         let args = ExternRef::new(&mut self.store, HostValue::Undefined)?;
         main.call(&mut self.store, &[Val::ExternRef(Some(args))], &mut [])?;
-        Ok(())
+        self.run_microtasks()
     }
 
-    /// Invoke a callback the page registered, e.g. on a click.
-    pub fn fire_callback(&mut self, id: usize) -> Result<()> {
+    /// Invoke a callback the page registered, e.g. an event listener, with `args`.
+    pub fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
         let Some(HostValue::Callback(func, closure)) = self.store.data().callbacks.get(id).cloned() else {
             bail!("no callback {id}");
         };
-        // The trampoline is `wasmFunction(f, arguments.length)`: closure plus argument count,
-        // converted to whatever types the trampoline declares.
+        // The trampoline is `wasmFunction(f, arguments.length, x0, ...)`: closure, argument
+        // count, then the arguments, converted to whatever types the trampoline declares.
         let ty = func.ty(&self.store);
-        let values = [HostValue::Opaque(closure), HostValue::Num(0.0)];
-        let mut args = Vec::new();
-        for (value, pty) in values.into_iter().zip(ty.params()) {
-            args.push(from_host(&mut self.store, value, &pty)?);
+        let mut values = vec![HostValue::Opaque(closure), HostValue::Num(args.len() as f64)];
+        values.extend(args.iter().cloned());
+        let params: Vec<ValType> = ty.params().collect();
+        let mut call_args = Vec::new();
+        for (i, pty) in params.iter().enumerate() {
+            let value = values.get(i).cloned().unwrap_or(HostValue::Undefined);
+            call_args.push(from_host(&mut self.store, value, pty)?);
         }
         let mut out: Vec<Val> = ty.results().map(|_| Val::null_extern_ref()).collect();
-        func.call(&mut self.store, &args, &mut out)?;
+        func.call(&mut self.store, &call_args, &mut out)?;
+        self.run_microtasks()
+    }
+
+    /// Run everything Dart queued with `queueMicrotask`, including work queued meanwhile.
+    fn run_microtasks(&mut self) -> Result<()> {
+        let invoke = self
+            .instance
+            .get_func(&mut self.store, "$invokeCallback")
+            .context("no $invokeCallback export")?;
+        let pty = invoke.ty(&self.store).params().next().context("$invokeCallback takes no arguments")?;
+        while let Some(task) = self.store.data_mut().microtasks.pop_front() {
+            let arg = from_host(&mut self.store, task, &pty)?;
+            invoke.call(&mut self.store, &[arg], &mut [])?;
+        }
         Ok(())
     }
 }
@@ -165,7 +224,18 @@ impl DartRuntime {
 /// What a dart2wasm import does, recognised from its JS snippet.
 #[derive(Clone, Debug)]
 enum Helper {
-    Host(String),
+    /// `() => globalThis.name`
+    Global(String),
+    /// `(x0, ...) => x0.name(x1, ...)`
+    Method(String),
+    /// `x0 => x0.name`
+    Get(String),
+    /// `(x0,x1) => { x0.name = x1 }`
+    Set(String),
+    Truthy,
+    StrictEquals,
+    LastIndexOf,
+    QueueMicrotask,
     Print,
     NumToString,
     IndexOf,
@@ -180,13 +250,27 @@ enum Helper {
 }
 
 fn classify(body: &str) -> Helper {
-    static HOST_CALL: OnceLock<Regex> = OnceLock::new();
-    let host_call = HOST_CALL.get_or_init(|| Regex::new(r"=> globalThis\.host\.(\w+)\(").unwrap());
+    // The four shapes package:web's generated bindings compile to.
+    static SHAPES: OnceLock<[(Regex, fn(String) -> Helper); 4]> = OnceLock::new();
+    let shapes = SHAPES.get_or_init(|| {
+        [
+            (Regex::new(r"^\(\) => globalThis\.(\w+)$").unwrap(), Helper::Global as fn(String) -> Helper),
+            (Regex::new(r"^\(?x0(?:,x\d+)*\)? => x0\.(\w+)\((?:x\d+(?:,x\d+)*)?\)$").unwrap(), Helper::Method),
+            (Regex::new(r"^x0 => x0\.(\w+)$").unwrap(), Helper::Get),
+            (Regex::new(r"^\(x0,x1\) => \{ x0\.(\w+) = x1 \}$").unwrap(), Helper::Set),
+        ]
+    });
     let b = body.trim().trim_end_matches(',');
-    if let Some(c) = host_call.captures(b) {
-        return Helper::Host(c[1].to_string());
+    for (shape, helper) in shapes {
+        if let Some(c) = shape.captures(b) {
+            return helper(c[1].to_string());
+        }
     }
     match b {
+        "b => !!b" => Helper::Truthy,
+        "(l, r) => l === r" => Helper::StrictEquals,
+        "(s, p, i) => s.lastIndexOf(p, i)" => Helper::LastIndexOf,
+        _ if b.contains("queueMicrotask(") => Helper::QueueMicrotask,
         "s => printToConsole(s)" => Helper::Print,
         "Function.prototype.call.bind(Number.prototype.toString)"
         | "Function.prototype.call.bind(BigInt.prototype.toString)" => Helper::NumToString,
@@ -272,7 +356,7 @@ fn to_host(store: &mut impl AsContextMut, val: &Val) -> Result<HostValue> {
         Val::I64(x) => HostValue::Num(*x as f64),
         Val::F32(x) => HostValue::Num(f32::from_bits(*x) as f64),
         Val::F64(x) => HostValue::Num(f64::from_bits(*x)),
-        Val::ExternRef(None) => HostValue::Undefined,
+        Val::ExternRef(None) => HostValue::Null,
         Val::ExternRef(Some(r)) => match r.data(&mut *store)? {
             Some(data) => data.downcast_ref::<HostValue>().context("externref is not a HostValue")?.clone(),
             // No host data: a Dart value converted with extern.convert_any.
@@ -281,7 +365,7 @@ fn to_host(store: &mut impl AsContextMut, val: &Val) -> Result<HostValue> {
                 any_to_host(store, &any)?
             }
         },
-        Val::AnyRef(None) => HostValue::Undefined,
+        Val::AnyRef(None) => HostValue::Null,
         Val::AnyRef(Some(r)) => any_to_host(store, r)?,
         other => bail!("cannot convert {other:?} to a host value"),
     })
@@ -308,6 +392,7 @@ fn from_host(store: &mut impl AsContextMut, value: HostValue, ty: &ValType) -> R
         ValType::F32 => Val::F32((num(&value) as f32).to_bits()),
         ValType::F64 => Val::F64(num(&value).to_bits()),
         ValType::Ref(r) if r.heap_type().is_extern() => match value {
+            HostValue::Null => Val::ExternRef(None),
             HostValue::Opaque(a) => {
                 let a = a.to_rooted(&mut *store);
                 Val::ExternRef(Some(ExternRef::convert_any(&mut *store, a)?))
@@ -316,7 +401,7 @@ fn from_host(store: &mut impl AsContextMut, value: HostValue, ty: &ValType) -> R
         },
         ValType::Ref(_) => match value {
             HostValue::Opaque(a) => Val::AnyRef(Some(a.to_rooted(&mut *store))),
-            HostValue::Undefined => Val::AnyRef(None),
+            HostValue::Undefined | HostValue::Null => Val::AnyRef(None),
             other => bail!("cannot return {other:?} as {ty:?}"),
         },
         other => bail!("cannot return a host value as {other:?}"),
@@ -395,21 +480,54 @@ fn js_string(name: &str, caller: &mut Caller<'_, State>, params: &[Val], results
     set_result(caller, results, ty, value)
 }
 
+/// Convert arguments for the host. Callbacks are kept here and handed over as ids.
+fn host_args(caller: &mut Caller<'_, State>, params: &[Val]) -> Result<Vec<HostValue>> {
+    let mut args = Vec::new();
+    for p in params {
+        args.push(match to_host(caller, p)? {
+            cb @ HostValue::Callback(..) => {
+                caller.data_mut().callbacks.push(cb);
+                HostValue::CallbackId(caller.data().callbacks.len() - 1)
+            }
+            other => other,
+        });
+    }
+    Ok(args)
+}
+
 fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], results: &mut [Val], ty: &FuncType) -> Result<()> {
     let value = match h {
-        Helper::Host(name) => {
-            let mut args = Vec::new();
-            for p in params {
-                // Callbacks are kept here and handed to the host as ids.
-                args.push(match to_host(caller, p)? {
-                    cb @ HostValue::Callback(..) => {
-                        caller.data_mut().callbacks.push(cb);
-                        HostValue::Num((caller.data().callbacks.len() - 1) as f64)
-                    }
-                    other => other,
-                });
-            }
-            caller.data_mut().host.call(name, &args)?
+        Helper::Global(name) => caller.data_mut().host.global(name)?,
+        Helper::Get(prop) => {
+            let target = to_host(caller, &params[0])?;
+            caller.data_mut().host.get(&target, prop)?
+        }
+        Helper::Set(prop) => {
+            let args = host_args(caller, params)?;
+            caller.data_mut().host.set(&args[0], prop, &args[1])?;
+            HostValue::Undefined
+        }
+        Helper::Method(method) => {
+            let args = host_args(caller, params)?;
+            caller.data_mut().host.call(&args[0], method, &args[1..])?
+        }
+        Helper::Truthy => HostValue::Bool(to_host(caller, &params[0])?.truthy()),
+        Helper::StrictEquals => {
+            let (l, r) = (to_host(caller, &params[0])?, to_host(caller, &params[1])?);
+            HostValue::Bool(l.strict_equals(&r))
+        }
+        Helper::LastIndexOf => {
+            let hay: Vec<u16> = to_host(caller, &params[0])?.display().encode_utf16().collect();
+            let needle: Vec<u16> = to_host(caller, &params[1])?.display().encode_utf16().collect();
+            let from = to_host(caller, &params[2])?.as_num().unwrap_or(f64::INFINITY);
+            let last_start = hay.len().saturating_sub(needle.len()).min(from.max(0.0) as usize);
+            let found = (0..=last_start).rev().find(|&i| hay[i..].starts_with(&needle));
+            HostValue::Num(found.map(|i| i as f64).unwrap_or(-1.0))
+        }
+        Helper::QueueMicrotask => {
+            let task = to_host(caller, &params[0])?;
+            caller.data_mut().microtasks.push_back(task);
+            HostValue::Undefined
         }
         Helper::Print => {
             let text = to_host(caller, &params[0])?.display();
@@ -434,7 +552,7 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
         Helper::JsonStringify => HostValue::str(&format!("{:?}", to_host(caller, &params[0])?.display())),
         Helper::Identity => to_host(caller, &params[0])?,
         Helper::ClassifyNumber => HostValue::Num(match to_host(caller, &params[0])? {
-            HostValue::Undefined => 0.0,
+            HostValue::Undefined | HostValue::Null => 0.0,
             HostValue::Num(_) => 1.0,
             _ => 2.0,
         }),
@@ -473,66 +591,6 @@ fn to_radix(mut n: i64, radix: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    /// Records host calls and plays a tiny DOM: every query and create returns a new handle.
-    struct FakeHost {
-        calls: Arc<Mutex<Vec<String>>>,
-        next_handle: f64,
-    }
-
-    impl Host for FakeHost {
-        fn call(&mut self, name: &str, args: &[HostValue]) -> Result<HostValue> {
-            let shown: Vec<String> = args.iter().map(|a| a.display()).collect();
-            self.calls.lock().unwrap().push(format!("{name}({})", shown.join(", ")));
-            Ok(match name {
-                "domQuery" | "domCreate" => {
-                    self.next_handle += 1.0;
-                    HostValue::Num(self.next_handle)
-                }
-                _ => HostValue::Undefined,
-            })
-        }
-        fn console(&mut self, text: &str) {
-            self.calls.lock().unwrap().push(format!("console({text})"));
-        }
-    }
-
-    /// Runs the real counter example (build it first with packs/dart/build.sh).
-    #[test]
-    fn counter_example_runs_and_handles_clicks() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/counter");
-        let Ok(wasm) = std::fs::read(dir.join("main.wasm")) else {
-            panic!("build the example first: packs/dart/build.sh examples/counter/main.dart");
-        };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let host = FakeHost { calls: calls.clone(), next_handle: 0.0 };
-        let mut runtime = DartRuntime::load(&wasm, Box::new(host)).unwrap();
-
-        runtime.run_main().unwrap();
-        runtime.fire_callback(0).unwrap();
-        runtime.fire_callback(0).unwrap();
-
-        assert_eq!(
-            *calls.lock().unwrap(),
-            [
-                "domQuery(#status)",
-                "domSetText(1, Dart is running. No JavaScript on this page.)",
-                "domQuery(#count)",
-                "domQuery(#log)",
-                "domQuery(#increment)",
-                "domOnClick(4, 0)",
-                "domSetText(2, 1)",
-                "domCreate(li)",
-                "domSetText(5, Click 1, handled in Dart)",
-                "domAppend(3, 5)",
-                "domSetText(2, 2)",
-                "domCreate(li)",
-                "domSetText(6, Click 2, handled in Dart)",
-                "domAppend(3, 6)",
-            ]
-        );
-    }
 
     #[test]
     fn wasm_without_embedded_table_is_rejected_with_a_hint() {
@@ -543,9 +601,24 @@ mod tests {
     }
 
     #[test]
-    fn recognises_host_calls_and_traps_unknown_snippets() {
-        assert!(matches!(classify("(x0,x1) => globalThis.host.domAppend(x0,x1),"), Helper::Host(n) if n == "domAppend"));
+    fn recognises_package_web_shapes() {
+        assert!(matches!(classify("() => globalThis.document,"), Helper::Global(n) if n == "document"));
+        assert!(matches!(classify("(x0,x1) => x0.querySelector(x1),"), Helper::Method(n) if n == "querySelector"));
+        assert!(matches!(classify("x0 => x0.random(),"), Helper::Method(n) if n == "random"));
+        assert!(matches!(classify("(x0,x1,x2,x3) => x0.addEventListener(x1,x2,x3),"), Helper::Method(n) if n == "addEventListener"));
+        assert!(matches!(classify("x0 => x0.textContent,"), Helper::Get(n) if n == "textContent"));
+        assert!(matches!(classify("(x0,x1) => { x0.textContent = x1 },"), Helper::Set(n) if n == "textContent"));
+        assert!(matches!(classify("b => !!b,"), Helper::Truthy));
         assert!(matches!(classify("o => o"), Helper::Identity));
-        assert!(matches!(classify("x0 => document.cookie"), Helper::Unsupported(_)));
+        assert!(matches!(classify("x0 => eval(x0)"), Helper::Unsupported(_)));
+    }
+
+    #[test]
+    fn js_semantics_for_truthiness_and_equality() {
+        assert!(!HostValue::Null.truthy() && !HostValue::Undefined.truthy());
+        assert!(!HostValue::Num(0.0).truthy() && !HostValue::str("").truthy());
+        assert!(HostValue::Object(1).truthy() && HostValue::str("a").truthy());
+        assert!(HostValue::Object(2).strict_equals(&HostValue::Object(2)));
+        assert!(!HostValue::Null.strict_equals(&HostValue::Undefined));
     }
 }

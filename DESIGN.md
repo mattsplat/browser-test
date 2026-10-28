@@ -188,19 +188,27 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 - `browser/src/dart_pack.rs`: the Dart runtime (wasmtime). Knows nothing about the DOM; it
   talks to the page only through the `Host` trait.
 - `browser/src/host.rs`: the host dispatcher (`PageHost`) and the boundary tracer. Packs hold
-  small integer **handles**, never Blitz node ids. Host API so far: `domQuery`, `domCreate`,
-  `domAppend`, `domSetText`, `domOnClick`.
-- `browser/src/dart_document.rs`: wraps the page so clicks fire Dart listeners, in bubbling
-  order.
+  small integer **handles** to typed web objects (`Document`, `Element`, `Event`, `Math`),
+  never Blitz node ids. The host API is the web platform's own names: `global`, `get`, `set`
+  and `call` (e.g. `Document.querySelector`, `Element.textContent =`). Unimplemented members
+  fail with "`Element.foo` is not supported yet".
+- `browser/src/dart_document.rs`: delivers DOM events to `addEventListener` listeners, in
+  bubbling order, each with an event object.
 - `browser/src/trace_panel.rs`: the Trace panel (toolbar button) showing every host call.
-- `packs/dart/dom.dart`: the Dart-side API (`query`, `create`, `Element.text`,
-  `append`, `onClick`). `packs/dart/build.sh`: compile plus the exnref step.
+- **Dart pages use the standard `package:web` API.** Its generated bindings compile to four
+  snippet shapes (read a global, call a method, get or set a property), which the pack routes to
+  the host by name, so the API surface comes from WebIDL without writing a generator. Supported
+  so far: `document`, `Math.random`, `querySelector`, `createElement`, `appendChild`, `remove`,
+  `textContent`, `id`, `className`, `tagName`, `body`, attributes, `addEventListener`
+  (any event type Blitz reports), `event.type`, `event.target`. Dart streams work through a
+  microtask queue the pack drains after every entry into Dart.
+- `packs/dart/build.sh`: compile plus the exnref step.
 - Pages opt in with `<script type="application/dart" src="app.wasm">`, fetched through the
   gate. A page ships only the `.wasm`: `build.sh` moves dart2wasm's import table into a
   `dart2wasm-imports` custom section (`packs/dart/embed_imports.dart`) and deletes the
   generated `.mjs` and `.support.js`.
-- Known gaps: only click events; no way to remove
-  listeners; Dart's `print` goes to the trace, not a console view; the source map is not
+- Known gaps: no `removeEventListener`; event objects are never freed (one handle per
+  delivery); no mouse/keyboard event details; Dart's `print` goes to the trace, not a console view; the source map is not
   used yet, so errors show wasm function numbers rather than Dart lines.
 
 ## Known local setup notes

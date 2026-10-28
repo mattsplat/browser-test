@@ -1,15 +1,16 @@
-import '../../packs/dart/dom.dart';
+import 'package:web/web.dart';
 
 void main() {
-  query('#status')?.text = 'Dart is running. No JavaScript on this page.';
+  document.querySelector('#status')!.textContent = 'Dart is running. No JavaScript on this page.';
 
-  final count = query('#count')!;
-  final log = query('#log')!;
+  final count = document.querySelector('#count')!;
+  final log = document.querySelector('#log')!;
   var clicks = 0;
 
-  query('#increment')!.onClick(() {
+  document.querySelector('#increment')!.onClick.listen((event) {
     clicks++;
-    count.text = '$clicks';
-    log.append(create('li')..text = 'Click $clicks, handled in Dart');
+    count.textContent = '$clicks';
+    final item = document.createElement('li')..textContent = 'Click $clicks, handled in Dart (${event.type})';
+    log.appendChild(item);
   });
 }
