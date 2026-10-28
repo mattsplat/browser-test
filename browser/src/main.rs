@@ -38,6 +38,7 @@ mod page_document;
 mod prompt;
 mod request_panel;
 mod settings;
+mod site_panel;
 mod source_map;
 mod trace_panel;
 mod browser_history;
@@ -64,6 +65,15 @@ use toolbar::Toolbar;
 use url_suggestions::provide_url_suggester;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::WinIcon;
+
+/// The side panel open next to the page; they share a spot, so at most one is open.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Panel {
+    None,
+    Requests,
+    Trace,
+    Site,
+}
 
 static BROWSER_UI_STYLES: &str = local_asset!("browser.css");
 pub(crate) const IS_MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
@@ -182,8 +192,7 @@ fn app() -> Element {
     };
 
     let show_fps: Signal<bool> = use_signal(|| false);
-    let show_requests: Signal<bool> = use_signal(|| false);
-    let show_trace: Signal<bool> = use_signal(|| false);
+    let open_panel: Signal<Panel> = use_signal(|| Panel::None);
 
     let fps_overlay_el = rsx!(if show_fps() {
         fps_overlay::FpsOverlay {}
@@ -211,8 +220,7 @@ fn app() -> Element {
                 active_tab_id,
                 open_new_tab,
                 show_fps,
-                show_requests,
-                show_trace,
+                open_panel,
             }
             prompt::PromptBar {}
             for tab in tabs.iter() {
@@ -224,11 +232,11 @@ fn app() -> Element {
                 }
             }
             {fps_overlay_el}
-            if show_requests() {
-                request_panel::RequestPanel {}
-            }
-            if show_trace() {
-                trace_panel::TracePanel {}
+            match open_panel() {
+                Panel::Requests => rsx!(request_panel::RequestPanel {}),
+                Panel::Trace => rsx!(trace_panel::TracePanel {}),
+                Panel::Site => rsx!(site_panel::SitePanel { tabs, active_tab_id }),
+                Panel::None => rsx!(),
             }
             StatusBar { tabs, active_tab_id }
         }

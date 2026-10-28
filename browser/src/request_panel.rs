@@ -67,7 +67,10 @@ pub fn RequestPanel() -> Element {
                         key: "{i}",
                         class: if entry.allowed { "request-row" } else { "request-row blocked" },
                         span { class: "request-status", if entry.allowed { "ALLOWED" } else { "BLOCKED" } }
-                        span { class: "request-url", "{entry.url}" }
+                        span { class: "request-url",
+                            "{entry.url}"
+                            if let Some(reason) = &entry.reason { "  ({reason})" }
+                        }
                     }
                 }
             }

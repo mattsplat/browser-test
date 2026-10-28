@@ -497,3 +497,39 @@ body,
     color: white;
   }
 }
+
+/* Step 6: Site panel (per-site policy) */
+
+.site-section {
+  padding: 8px 12px;
+  border-bottom: 1px solid #E8E8E8;
+}
+
+.site-heading {
+  font-weight: bold;
+  margin-bottom: 6px;
+}
+
+.site-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.site-note {
+  color: #777;
+  padding: 4px 0;
+}
+
+.site-footer {
+  border-bottom: none;
+  padding-top: 10px;
+}
+
+.request-toggle.allowed {
+  background: #2E7D32;
+  border-color: #2E7D32;
+  color: white;
+}

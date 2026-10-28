@@ -37,7 +37,7 @@ fn hash_of(value: impl Hash) -> String {
 }
 
 /// Compile the Dart source at `src` and return the wasm.
-pub async fn compile(src: &Url, net: &Arc<StdNetProvider>, signal: &AbortSignal) -> Result<Vec<u8>> {
+pub async fn compile(src: &Url, page: &Url, net: &Arc<StdNetProvider>, signal: &AbortSignal) -> Result<Vec<u8>> {
     let (source, out) = match src.scheme() {
         "file" => {
             let source = src.to_file_path().ok().context("bad file URL")?;
@@ -46,7 +46,7 @@ pub async fn compile(src: &Url, net: &Arc<StdNetProvider>, signal: &AbortSignal)
         }
         "http" | "https" => {
             let request = Request::get(src.clone()).signal(signal.clone());
-            let (_, bytes) = net.fetch_async(request).await.map_err(|e| anyhow::anyhow!("fetching {src}: {e:?}"))?;
+            let (_, bytes) = net.fetch_for_page(request, page).await.map_err(|e| anyhow::anyhow!("fetching {src}: {e:?}"))?;
             let dir = cache_dir()?.join("http").join(hash_of(&bytes[..]));
             std::fs::create_dir_all(&dir)?;
             let source = dir.join("main.dart");
@@ -157,7 +157,7 @@ mod tests {
         let url = Url::from_file_path(&src).unwrap();
         let gate = Arc::new(StdNetProvider::new(Arc::new(blitz_net::Provider::new(None))));
         let signal = blitz_traits::net::AbortController::default().signal;
-        let wasm = compile(&url, &gate, &signal).await.unwrap();
+        let wasm = compile(&url, &url, &gate, &signal).await.unwrap();
         assert_eq!(&wasm[..4], b"\0asm");
         // The import table is embedded, so the Dart pack can load it as-is.
         assert!(wasm.windows(17).any(|w| w == b"dart2wasm-imports"));

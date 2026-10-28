@@ -1,0 +1,190 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use dioxus_native::prelude::*;
+
+use crate::gate::Gate;
+use crate::settings::{self, Grant};
+use crate::tab::{Tab, TabId, TabStoreImplExt, active_tab};
+use crate::history::HistoryNav;
+
+/// A third-party site the page tried to reach.
+#[derive(Clone, PartialEq)]
+struct SeenSite {
+    requests: usize,
+    blocked: usize,
+}
+
+/// Per-site policy for the page in the active tab: which packs run, the dev-mode grant, and
+/// which other sites it may reach. Changes apply on reload.
+#[component]
+pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element {
+    let gate = use_context::<Arc<Gate>>();
+    // Bumped after every settings change so the panel re-reads them.
+    let changes = use_signal(|| 0u64);
+    let mut seen: Signal<BTreeMap<String, SeenSite>> = use_signal(BTreeMap::new);
+
+    let tab = active_tab(tabs, active_tab_id());
+    let page = tab.nav_history().current_url().read().url.clone();
+    let origin = settings::origin_of(&page);
+
+    // Third-party sites the active tab's origin asked for, from the gate log (polled like
+    // the other panels). The tab can navigate while the panel is open, so the origin is
+    // re-read on every pass.
+    {
+        let gate = gate.clone();
+        use_hook(move || {
+            spawn(async move {
+                let mut last = (u64::MAX, String::new());
+                loop {
+                    let page = active_tab(tabs, active_tab_id()).nav_history().current_url().read().url.clone();
+                    let origin = settings::origin_of(&page);
+                    if (gate.version(), origin.clone()) != last {
+                        last = (gate.version(), origin.clone());
+                        let mut sites: BTreeMap<String, SeenSite> = BTreeMap::new();
+                        for entry in gate.log() {
+                            if entry.page.as_deref() != Some(origin.as_str()) {
+                                continue;
+                            }
+                            if let Some(site) = entry.third_party {
+                                let s = sites.entry(site).or_insert(SeenSite { requests: 0, blocked: 0 });
+                                s.requests += 1;
+                                s.blocked += usize::from(!entry.allowed);
+                            }
+                        }
+                        seen.set(sites);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            });
+        });
+    }
+
+    let _ = changes();
+    let current = settings::get();
+    let dart_on = !current.dart_blocked.contains(&origin);
+    let js_on = current.js_sites.contains(&origin);
+    let grant = current.dev_grants.get(&origin).copied();
+    let allowed_sites = current.allowed_third_party.get(&origin).cloned().unwrap_or_default();
+
+    let o = origin.clone();
+    let toggle_dart = move |_| {
+        let o = o.clone();
+        apply(changes, Box::new(move |s| {
+            if !s.dart_blocked.remove(&o) {
+                s.dart_blocked.insert(o);
+            }
+        }))
+    };
+    let o = origin.clone();
+    let toggle_js = move |_| {
+        let o = o.clone();
+        apply(changes, Box::new(move |s| {
+            if !s.js_sites.remove(&o) {
+                s.js_sites.insert(o);
+            }
+        }))
+    };
+    let o = origin.clone();
+    let reset_grant = move |_| {
+        let o = o.clone();
+        apply(changes, Box::new(move |s| {
+            s.dev_grants.remove(&o);
+        }))
+    };
+    let toggle_third_party = move |_| apply(changes, Box::new(|s| s.block_third_party = !s.block_third_party));
+    let reload = move |_| active_tab(tabs, active_tab_id()).reload();
+
+    let grant_text = match grant {
+        Some(Grant::Allow) => "allowed",
+        Some(Grant::Block) => "blocked",
+        None => "not asked yet",
+    };
+    let sites = seen.read();
+
+    rsx!(
+        div { class: "request-panel",
+            div { class: "request-panel-header",
+                span { class: "request-panel-title", "Site" }
+                span { class: "request-panel-counts", "{origin}" }
+            }
+            div { class: "site-section",
+                div { class: "site-heading", "Languages" }
+                div { class: "site-row",
+                    span { "Dart" }
+                    div { class: if dart_on { "request-toggle" } else { "request-toggle on" }, onclick: toggle_dart,
+                        if dart_on { "Allowed" } else { "Blocked" }
+                    }
+                }
+                div { class: "site-row",
+                    span { "JavaScript (off by default)" }
+                    div { class: if js_on { "request-toggle allowed" } else { "request-toggle" }, onclick: toggle_js,
+                        if js_on { "Allowed" } else { "Off" }
+                    }
+                }
+                div { class: "site-row",
+                    span { "Dev mode: compile Dart source ({grant_text})" }
+                    if grant.is_some() {
+                        div { class: "request-clear", onclick: reset_grant, "Ask again" }
+                    }
+                }
+            }
+            div { class: "site-section",
+                div { class: "site-heading", "Third-party sites" }
+                div { class: "site-row",
+                    span { "Block third-party requests (all sites)" }
+                    div { class: if current.block_third_party { "request-toggle on" } else { "request-toggle" }, onclick: toggle_third_party,
+                        if current.block_third_party { "ON" } else { "OFF" }
+                    }
+                }
+                if sites.is_empty() {
+                    div { class: "site-note", "This page hasn't requested anything from another site." }
+                }
+                for (site, info) in sites.iter() {
+                    ThirdPartyRow {
+                        key: "{site}",
+                        origin: origin.clone(),
+                        site: site.clone(),
+                        requests: info.requests,
+                        blocked: info.blocked,
+                        allowed: allowed_sites.contains(site),
+                        changes,
+                    }
+                }
+            }
+            div { class: "request-panel-controls site-footer",
+                div { class: "request-clear", onclick: reload, "Reload to apply" }
+            }
+        }
+    )
+}
+
+#[component]
+fn ThirdPartyRow(origin: String, site: String, requests: usize, blocked: usize, allowed: bool, mut changes: Signal<u64>) -> Element {
+    let label = format!("{site}  ({requests} requests, {blocked} blocked)");
+    let flip = move |_| {
+        let (origin, site) = (origin.clone(), site.clone());
+        settings::update(move |s| {
+            let list = s.allowed_third_party.entry(origin).or_default();
+            if !list.remove(&site) {
+                list.insert(site);
+            }
+        });
+        *changes.write() += 1;
+    };
+    rsx!(
+        div { class: if blocked > 0 { "site-row request-row blocked" } else { "site-row request-row" },
+            span { class: "request-url", "{label}" }
+            div { class: if allowed { "request-toggle allowed" } else { "request-toggle" }, onclick: flip,
+                if allowed { "Allowed" } else { "Allow" }
+            }
+        }
+    )
+}
+
+/// Save a settings change and re-render the panel.
+fn apply(mut changes: Signal<u64>, change: Box<dyn FnOnce(&mut settings::Settings)>) {
+    settings::update(change);
+    *changes.write() += 1;
+}

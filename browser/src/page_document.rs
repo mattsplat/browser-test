@@ -122,7 +122,7 @@ mod tests {
         let url = blitz_traits::net::Url::from_file_path(&src).unwrap();
         let gate = std::sync::Arc::new(crate::gate::Gate::new(std::sync::Arc::new(blitz_net::Provider::new(None))));
         let signal = blitz_traits::net::AbortController::default().signal;
-        crate::dev_compile::compile(&url, &gate, &signal).await.unwrap()
+        crate::dev_compile::compile(&url, &url, &gate, &signal).await.unwrap()
     }
 
     fn listener(page: &PackDocument, selector: &str, kind: &str) -> (NodeId, usize) {

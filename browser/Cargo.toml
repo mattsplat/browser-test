@@ -66,3 +66,7 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6.0.0"
+
+# Step 6: third-party checks use registrable domains
+psl = "2"
+url = "2"

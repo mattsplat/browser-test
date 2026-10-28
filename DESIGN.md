@@ -3,8 +3,9 @@
 An experimental browser where JavaScript is no longer the default language of the web.
 Dart is first-class; JS is just one more language pack, off by default.
 
-Status: experiment. Phases 0 and 1 built in `browser/` (started from Blitz's reference
-browser). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+Status: experiment. Phases 0–3 built in `browser/` (started from Blitz's reference
+browser): the gate, the Dart pack (with dev mode and source maps), the JS pack, and the
+per-site policy screen. Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -265,6 +266,25 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 - Known gaps: the prelude needs a list of which member names are methods (kept in step with
   `host.rs`), so calling an unknown method reports it as an unknown property; no timers
   (`setTimeout`), no `window`; a page runs one pack (Dart wins if both are present).
+
+## Step 6 notes: per-site policy (Phase 3)
+
+- **Site** panel (toolbar) for the page in the active tab: Dart allowed/blocked, JavaScript
+  off/allowed, the dev-mode grant (with "Ask again"), and every third-party site the page
+  tried to reach, each with Allow. Changes apply on reload ("Reload to apply").
+- **Third-party requests are blocked by default**, as designed: a page's requests to another
+  site (registrable domain via the public suffix list, so `cdn.example.com` is first-party on
+  `www.example.com`) are refused unless allowed for that page's origin. A global switch in
+  the panel turns the rule off. Navigations are never third-party; `file:` pages and local
+  schemes are exempt.
+- The gate now knows which page asked: each page document gets a `PageGate` carrying its
+  URL, and scripts, wasm and dev-mode source are fetched with `fetch_for_page`. The
+  Requests panel shows why a request was blocked.
+- **Cost of default-deny:** many sites load images, fonts or CSS from another domain (BBC
+  News from `bbci.co.uk`, Wikipedia images from `wikimedia.org`), so they render with gaps
+  until those sites are allowed in the Site panel. Turn the global switch off to browse
+  without the rule.
+- Policy logic is a pure function (`gate::decide`), tested without touching saved settings.
 
 ## Known local setup notes
 

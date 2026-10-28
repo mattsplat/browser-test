@@ -15,6 +15,7 @@ use crate::StdNetProvider;
 use crate::page_document::PackDocument;
 use crate::dev_compile;
 use crate::favicon::favicon_candidate;
+use crate::gate::PageGate;
 use crate::host::{self, TraceEntry};
 use crate::prompt;
 use crate::settings::{self, Grant};
@@ -56,10 +57,12 @@ pub fn make_doc_config(
     font_ctx: FontContext,
     abort_signal: Option<AbortSignal>,
 ) -> DocumentConfig {
+    // The page's own view of the gate, so its requests are checked as coming from it.
+    let page = base_url.as_deref().and_then(|u| Url::parse(u).ok());
     DocumentConfig {
         viewport: None,
         base_url,
-        net_provider: Some(net_provider as _),
+        net_provider: Some(Arc::new(PageGate { gate: net_provider, page }) as _),
         navigation_provider: Some(Arc::new(BrowserNavProvider { history })),
         shell_provider: Some(consume_context::<Arc<dyn ShellProvider>>()),
         html_parser_provider: Some(Arc::new(HtmlProvider)),
@@ -209,9 +212,10 @@ async fn build_page_document(
         .unwrap_or_default();
     let favicon_url = document.favicon_url();
 
+    let origin = settings::origin_of(document.url());
+    let page_url = document.url().clone();
     let Some(src) = dart_script_url(&document) else {
         // No Dart: the page's JS, if any, runs only where JS is allowed.
-        let origin = settings::origin_of(document.url());
         let scripts = js_scripts(&document);
         if scripts.is_empty() {
             return (SubDocumentAttr::new(document), title, favicon_url);
@@ -220,22 +224,25 @@ async fn build_page_document(
             trace_pack_load("js", document.url(), format!("skipped {} script(s): JS is off for {origin}", scripts.len()));
             return (SubDocumentAttr::new(document), title, favicon_url);
         }
-        let sources = fetch_js_sources(&scripts, net_provider, signal).await;
+        let sources = fetch_js_sources(&scripts, &page_url, net_provider, signal).await;
         return match PackDocument::start_js(document, &sources) {
             Ok(js) => (SubDocumentAttr::new(js), title, favicon_url),
             Err(e) => (error_document(&format!("JS pack failed: {e:#}")), title, favicon_url),
         };
     };
+    if settings::get().dart_blocked.contains(&origin) {
+        trace_load(&src, format!("skipped: Dart is blocked for {origin}"));
+        return (SubDocumentAttr::new(document), title, favicon_url);
+    }
     let wasm = if src.path().ends_with(".dart") {
-        let origin = settings::origin_of(document.url());
-        match dev_mode_compile(&src, &origin, net_provider, signal).await {
+        match dev_mode_compile(&src, &page_url, &origin, net_provider, signal).await {
             Ok(Some(wasm)) => wasm,
             Ok(None) => return (SubDocumentAttr::new(document), title, favicon_url),
             // Compile errors are for the developer: show them on the page.
             Err(e) => return (error_document(&format!("Compiling {src} failed:\n\n{e:#}")), title, favicon_url),
         }
     } else {
-        match fetch_dart_program(&src, net_provider, signal).await {
+        match fetch_dart_program(&src, &page_url, net_provider, signal).await {
             Ok(wasm) => wasm,
             Err(e) => {
                 trace_load(&src, format!("ERROR {e:#}"));
@@ -290,12 +297,12 @@ fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
 
 /// Script sources in order. External scripts come through the gate; one that fails to load
 /// is reported and skipped, as a browser would.
-async fn fetch_js_sources(scripts: &[JsScript], net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<String> {
+async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<String> {
     let mut sources = Vec::new();
     for script in scripts {
         match script {
             JsScript::Inline(text) => sources.push(text.clone()),
-            JsScript::External(url) => match net_provider.fetch_async(Request::get(url.clone()).signal(signal.clone())).await {
+            JsScript::External(url) => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
                 Ok((_, bytes)) => sources.push(String::from_utf8_lossy(&bytes).into_owned()),
                 Err(e) => trace_pack_load("js", url, format!("ERROR could not load: {e:?}")),
             },
@@ -328,6 +335,7 @@ fn dev_mode_decision(settings: &settings::Settings, origin: &str) -> DevDecision
 /// `Ok(None)` means the page renders without its script.
 async fn dev_mode_compile(
     src: &Url,
+    page: &Url,
     origin: &str,
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
@@ -346,7 +354,7 @@ async fn dev_mode_compile(
         DevDecision::Compile => {}
     }
     let started = std::time::Instant::now();
-    let wasm = dev_compile::compile(src, net_provider, signal).await?;
+    let wasm = dev_compile::compile(src, page, net_provider, signal).await?;
     trace_load(src, format!("compiled from source in {} ms", started.elapsed().as_millis()));
     Ok(Some(wasm))
 }
@@ -362,11 +370,12 @@ fn dart_script_url(document: &BaseDocument) -> Option<Url> {
 /// `packs/dart/build.sh`. It goes through the gate like any other request.
 async fn fetch_dart_program(
     wasm_url: &Url,
+    page: &Url,
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
 ) -> anyhow::Result<Vec<u8>> {
     let request = Request::get(wasm_url.clone()).signal(signal.clone());
-    let (_, wasm) = net_provider.fetch_async(request).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (_, wasm) = net_provider.fetch_for_page(request, page).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(wasm.to_vec())
 }
 

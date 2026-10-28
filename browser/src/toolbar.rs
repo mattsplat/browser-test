@@ -11,7 +11,7 @@ use crate::icons::{self, IconButton};
 use crate::nav::{is_enter_key, open_in_external_browser, req_from_string};
 use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt, active_tab};
 use crate::url_suggestions::{Suggestion, SuggestionKind, UrlSuggester, UrlSuggestions};
-use crate::{IS_MOBILE, StdNetProvider, settings};
+use crate::{IS_MOBILE, Panel, StdNetProvider, settings};
 
 fn with_sub_doc(tab: Store<Tab>, mut cb: impl FnMut(&mut BaseDocument)) {
     let node_handle_lens = tab.node_handle();
@@ -32,8 +32,7 @@ pub fn Toolbar(
     active_tab_id: Signal<TabId>,
     open_new_tab: Callback<Url>,
     mut show_fps: Signal<bool>,
-    mut show_requests: Signal<bool>,
-    mut show_trace: Signal<bool>,
+    open_panel: Signal<Panel>,
 ) -> Element {
     let home_url = use_hook(|| AboutPage::NewTab.parsed_url());
     let mut is_focused = use_signal(|| false);
@@ -410,23 +409,9 @@ pub fn Toolbar(
                     }
                 }
             }
-            // The two panels share a spot, so opening one closes the other.
-            div {
-                class: if show_requests() { "requests-button active" } else { "requests-button" },
-                onclick: move |_| {
-                    show_requests.toggle();
-                    show_trace.set(false);
-                },
-                "Requests"
-            }
-            div {
-                class: if show_trace() { "requests-button active" } else { "requests-button" },
-                onclick: move |_| {
-                    show_trace.toggle();
-                    show_requests.set(false);
-                },
-                "Trace"
-            }
+            PanelButton { open_panel, panel: Panel::Site, label: "Site" }
+            PanelButton { open_panel, panel: Panel::Requests, label: "Requests" }
+            PanelButton { open_panel, panel: Panel::Trace, label: "Trace" }
             div { class: "menu-wrapper",
                 IconButton {
                     icon: icons::MENU_ICON,
@@ -468,6 +453,19 @@ pub fn Toolbar(
                     }
                 }
             }
+        }
+    )
+}
+
+/// Opens its panel, or closes it if it's already open.
+#[component]
+fn PanelButton(mut open_panel: Signal<Panel>, panel: Panel, label: &'static str) -> Element {
+    let active = open_panel() == panel;
+    rsx!(
+        div {
+            class: if active { "requests-button active" } else { "requests-button" },
+            onclick: move |_| open_panel.set(if active { Panel::None } else { panel }),
+            "{label}"
         }
     )
 }

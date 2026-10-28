@@ -14,7 +14,7 @@ pub enum Grant {
     Block,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Global dev switch. Off: source scripts are never compiled and never prompt.
@@ -23,6 +23,26 @@ pub struct Settings {
     pub dev_grants: BTreeMap<String, Grant>,
     /// Origins where the JS pack may run. JS is off everywhere else (principle 1).
     pub js_sites: BTreeSet<String>,
+    /// Origins where the Dart pack may not run. Dart is on everywhere else.
+    pub dart_blocked: BTreeSet<String>,
+    /// Refuse requests a page makes to other sites, unless allowed for that page's origin.
+    pub block_third_party: bool,
+    /// Other sites (registrable domains) each origin may reach.
+    pub allowed_third_party: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            dev_mode: false,
+            dev_grants: BTreeMap::new(),
+            js_sites: BTreeSet::new(),
+            dart_blocked: BTreeSet::new(),
+            // Default-deny for third-party requests, as the design says.
+            block_third_party: true,
+            allowed_third_party: BTreeMap::new(),
+        }
+    }
 }
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
