@@ -173,6 +173,22 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 | 3 | Per-site policy UI: allowed packs and allowed domains | The security and language model works end to end |
 | Later | Python pack, reload by replay, shared runtime cache, MCP server | |
 
+## Feature list
+
+Candidate features beyond the phases. Value and complexity are as given; the notes say how
+each relates to what's built.
+
+| Feature | Value to users | Engineering complexity | Notes |
+|---|---|---|---|
+| Vertical tabs | High | Low–medium | Browser UI only; the tab strip is Dioxus in `browser/src/tab_strip.rs` |
+| Spaces and profiles | Very high | Medium–high | Needs separate cookies, storage, history and settings per profile; today all of these are global |
+| Command palette | High | Low | Browser UI only; could reuse the URL bar's suggestion list (`url_suggestions.rs`) |
+| Split View | High | Medium–high | Two page documents side by side in one window; each already gets its own gate view and pack |
+| Automatic tab management | High | Low–medium | Browser UI over the existing tab store (e.g. grouping, closing idle tabs) |
+| Website CSS customization | Medium | Medium | Per-site user stylesheets; would sit alongside the Site panel's per-site settings |
+| Rust/WASM scripting | Specialized | Very high | Partly built: the Dart pack already runs Wasm on the host dispatcher. A Rust pack would need its own way to describe host calls (Rust has no dart2wasm-style import table) |
+| Replaceable scripting engine | Specialized | Extremely high | Largely built: language packs (Dart, JS) behind one `Host` interface and `PackRuntime` trait. Swapping or adding an engine is a new pack, not an engine change |
+
 ## Phase 0 notes
 
 - `browser/src/gate.rs` is the network chokepoint. It replaces the real provider everywhere
