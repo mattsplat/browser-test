@@ -1,0 +1,16 @@
+[package]
+name = "blitz-shot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blitz-dom = { path = "../../vendor/blitz/packages/blitz-dom", features = ["default"] }
+blitz-html = { path = "../../vendor/blitz/packages/blitz-html" }
+blitz-net = { path = "../../vendor/blitz/packages/blitz-net" }
+blitz-paint = { path = "../../vendor/blitz/packages/blitz-paint" }
+blitz-traits = { path = "../../vendor/blitz/packages/blitz-traits" }
+anyrender = "0.14.0"
+anyrender_vello_cpu = { version = "0.18.0", features = ["multithreading"] }
+peniko = "0.6.0"
+png = "0.18"
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }

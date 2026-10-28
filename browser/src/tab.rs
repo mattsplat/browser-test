@@ -1,0 +1,343 @@
+use std::{
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use blitz_traits::net::{Request, Url};
+use dioxus_native::{NodeHandle, SubDocumentAttr, prelude::*};
+
+use crate::StdNetProvider;
+use crate::about_pages::{AboutPage, AboutPageView};
+use crate::browser_history::{HistoryEntry, HistoryService};
+use crate::document_loader::{DocumentLoader, DocumentLoaderStatus, LoadedDocument};
+use crate::favicon::probe_favicon_cached;
+use crate::history::{History, HistoryNav, SyncStore};
+
+pub type TabId = u64;
+
+static TAB_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn next_tab_id() -> TabId {
+    TAB_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Store)]
+pub struct Tab {
+    pub id: TabId,
+    pub history: SyncStore<History>,
+    pub loader: Option<Rc<DocumentLoader>>,
+    pub document: Option<SubDocumentAttr>,
+    pub node_handle: Option<NodeHandle>,
+    pub html_source: String,
+    pub title: String,
+    pub favicon_url: Option<Url>,
+}
+
+#[store(pub)]
+impl<Lens> Store<Tab, Lens> {
+    pub(crate) fn nav_history(&self) -> SyncStore<History> {
+        *self.history().read()
+    }
+
+    pub(crate) fn loader_rc(&self) -> Rc<DocumentLoader> {
+        // `open_tab` always assigns Some(loader) immediately after pushing the
+        // tab, so by the time any view code can call this the loader is set.
+        #[allow(clippy::expect_used)]
+        self.loader().cloned().expect("loader uninitialized")
+    }
+
+    pub(crate) fn tab_id(&self) -> TabId {
+        *self.id().read()
+    }
+
+    pub(crate) fn navigate(&self, req: Request) {
+        self.nav_history().navigate(req);
+    }
+
+    pub(crate) fn reload(&self) {
+        self.loader_rc().reload();
+    }
+
+    pub(crate) fn go_back(&self) {
+        self.nav_history().go_back();
+    }
+
+    pub(crate) fn go_forward(&self) {
+        self.nav_history().go_forward();
+    }
+
+    // Chrome state (title, favicon) for about pages. About URLs never go
+    // through the document loader, so this is the only place their title is
+    // set and the only place a stale favicon from a previous real page gets
+    // cleared.
+    pub(crate) fn commit_about_chrome(&self, page: AboutPage)
+    where
+        Lens: Writable,
+    {
+        *self.title().write_unchecked() = page.title().to_string();
+        *self.favicon_url().write_unchecked() = None;
+    }
+}
+
+pub fn open_tab(
+    mut tabs: Store<Vec<Tab>>,
+    url: Url,
+    net_provider: Arc<StdNetProvider>,
+) -> Store<Tab, impl Writable<Target = Tab> + Copy> {
+    let id = next_tab_id();
+    let initial_request = Request::get(url);
+    let history: SyncStore<History> = Store::new_maybe_sync(History::new(initial_request));
+
+    tabs.push(Tab {
+        id,
+        history,
+        loader: None,
+        document: None,
+        node_handle: None,
+        html_source: String::new(),
+        title: String::new(),
+        favicon_url: None,
+    });
+
+    // We just pushed; the last element is the tab we want.
+    #[allow(clippy::expect_used)]
+    let tab_lens = tabs.iter().last().expect("just pushed");
+
+    let loader = Rc::new(DocumentLoader::new(net_provider, history));
+
+    *tab_lens.loader().write() = Some(loader);
+
+    tab_lens
+}
+
+pub fn active_tab(tabs: Store<Vec<Tab>>, active_id: TabId) -> Store<Tab> {
+    // The app always keeps at least one tab open and only switches `active_id`
+    // to ids that exist; closing a tab updates `active_id` first.
+    #[allow(clippy::expect_used)]
+    tabs.iter()
+        .find(|tab| tab.tab_id() == active_id)
+        .expect("tabs vec is never empty")
+        .into()
+}
+
+// Chrome writes run as a straight-line block (nothing yields between them) so
+// a render can't sample a half-applied state where the new document is showing
+// under the previous page's icon; the favicon is refilled asynchronously by
+// the spawned probe.
+fn commit_loaded_document<Lens>(
+    tab: Store<Tab, Lens>,
+    history: HistoryService,
+    loaded: LoadedDocument,
+) where
+    Lens: Writable<Target = Tab> + Copy + 'static,
+{
+    let page_url = tab.nav_history().current_url().read().url.clone();
+    let candidate = loaded.favicon_candidate.clone();
+
+    // Synthesized error pages (404 / network failure) skip history and the
+    // favicon probe; the document loader leaves their `favicon_candidate`
+    // None so the let-else below also short-circuits the spawn.
+    let entry_id = (!loaded.is_error).then(|| {
+        history.record_visit(HistoryEntry::new(
+            page_url.clone(),
+            display_title(&loaded.title, &page_url),
+            None,
+        ))
+    });
+
+    *tab.html_source().write_unchecked() = loaded.html_source;
+    *tab.title().write_unchecked() = loaded.title;
+    *tab.favicon_url().write_unchecked() = None;
+    *tab.document().write_unchecked() = Some(loaded.document);
+
+    let (Some(candidate), Some(entry_id)) = (candidate, entry_id) else {
+        return;
+    };
+    let net_provider = Arc::clone(&tab.loader_rc().net_provider);
+    spawn(async move {
+        let Some(resolved) = probe_favicon_cached(candidate, &net_provider).await else {
+            return;
+        };
+        // A → B → A: the probe for the first A may resolve while a second A
+        // entry already exists (non-consecutive revisits don't fold). The
+        // URL check passes (URL is A again), but `entry_id` points at the
+        // *first* A entry. The service patches the in-memory row by id and
+        // every still-NULL on-disk row by URL; both rows want the same icon.
+        if tab.nav_history().current_url().read().url == page_url {
+            *tab.favicon_url().write_unchecked() = Some(resolved.clone());
+        }
+        history.set_favicon(entry_id, page_url, resolved);
+    });
+}
+
+#[component]
+pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<TabId>) -> Element {
+    #[allow(clippy::expect_used)]
+    let tab = tabs
+        .iter()
+        .find(|tab| tab.tab_id() == tab_id)
+        .expect("tab exists while mounted");
+    let about = use_memo(move || AboutPage::from_url(&tab.nav_history().current_url().read().url));
+
+    let loader = tab.loader_rc();
+    let loaded_document = use_resource(move || {
+        let req = (*tab.nav_history().current_url().read()).clone();
+        let _reload_generation = loader.reload_generation();
+        let loader = loader.clone();
+        let is_about = about().is_some();
+        async move {
+            if is_about {
+                None
+            } else {
+                Some(loader.load_document(req).await)
+            }
+        }
+    });
+
+    use_effect(move || {
+        let loader = tab.loader_rc();
+        let mut status = loader.status;
+        match loaded_document.state().cloned() {
+            UseResourceState::Pending => status.set(DocumentLoaderStatus::Loading),
+            UseResourceState::Ready | UseResourceState::Stopped | UseResourceState::Paused => {
+                status.set(DocumentLoaderStatus::Idle)
+            }
+        }
+    });
+
+    let history = use_context::<HistoryService>();
+
+    use_effect(move || {
+        if loaded_document.read().is_some() {
+            if let Some(loaded) = loaded_document.write_unchecked().take().flatten() {
+                commit_loaded_document(tab, history.clone(), loaded);
+            }
+        }
+    });
+
+    use_effect(move || {
+        if let Some(page) = about() {
+            tab.commit_about_chrome(page);
+        }
+    });
+
+    let id = tab.tab_id();
+    let document = tab.document().cloned();
+    let mut node_handle_lens = tab.node_handle();
+    let visibility = if id == active_tab_id() {
+        "display: block"
+    } else {
+        "display: none"
+    };
+
+    let on_navigate = use_callback(move |req: Request| {
+        tab.navigate(req);
+    });
+
+    rsx!(
+        if let Some(page) = about() {
+            div {
+                key: "{id}",
+                class: "tab-content",
+                style: visibility,
+                AboutPageView { page, on_navigate }
+            }
+        } else {
+            web-view {
+                key: "{id}",
+                class: "tab-content",
+                style: visibility,
+                "__webview_document": document,
+                onmounted: move |evt: Event<MountedData>| {
+                    let node_handle = evt.downcast::<NodeHandle>().unwrap();
+                    node_handle_lens.set(Some(node_handle.clone()));
+                },
+            }
+        }
+    )
+}
+
+pub fn tab_display_title<L>(tab: Store<Tab, L>) -> String
+where
+    L: Copy + Readable<Target = Tab> + 'static,
+{
+    let title = tab.title().cloned();
+    let url = tab.nav_history().current_url().read().url.clone();
+    display_title(&title, &url)
+}
+
+fn display_title(title: &str, url: &Url) -> String {
+    if title.trim().is_empty() {
+        url.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+#[component]
+pub fn Favicon(url: Option<Url>, class: &'static str) -> Element {
+    rsx! {
+        if let Some(url) = url {
+            img {
+                class: class,
+                src: "{url}",
+                width: "16",
+                height: "16",
+                alt: "",
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dioxus_core::Properties;
+
+    use super::*;
+
+    #[test]
+    fn tab_lens_survives_webview_props_replacement() {
+        fn app() -> Element {
+            let tabs = use_store(|| {
+                vec![Tab {
+                    id: 0,
+                    history: Store::new_maybe_sync(History::new(Request::get(
+                        Url::parse("https://example.com").unwrap(),
+                    ))),
+                    loader: None,
+                    document: None,
+                    node_handle: None,
+                    html_source: String::new(),
+                    title: String::new(),
+                    favicon_url: None,
+                }]
+            });
+            let active_tab_id = use_signal(|| 0);
+            let props = || TabWebViewProps {
+                tabs,
+                tab_id: 0,
+                active_tab_id,
+            };
+            let mut initial = props();
+            let captured_tab = initial.tabs.iter().next().unwrap();
+            let replacement = props();
+            initial.memoize(&replacement);
+            drop(replacement);
+
+            // Resources and favicon tasks retain the lens across parent renders.
+            assert_eq!(
+                captured_tab.nav_history().current_url().read().url.as_str(),
+                "https://example.com/"
+            );
+            *captured_tab.favicon_url().write() =
+                Some(Url::parse("https://example.com/favicon.ico").unwrap());
+            assert!(tabs.iter().next().unwrap().favicon_url().read().is_some());
+            VNode::empty()
+        }
+
+        VirtualDom::new(app).rebuild_in_place();
+    }
+}

@@ -1,0 +1,12 @@
+example       https://example.com/
+wikipedia     https://en.wikipedia.org/wiki/Dart_(programming_language)
+hn            https://news.ycombinator.com/
+rustbook      https://doc.rust-lang.org/book/ch01-00-getting-started.html
+mdn           https://developer.mozilla.org/en-US/docs/Web/HTML
+dartdev       https://dart.dev/
+simonw        https://simonwillison.net/
+github        https://github.com/servo/servo
+bbc           https://www.bbc.com/news
+excalidraw    https://excalidraw.com/
+herd-vector   https://vector-workflow.test/
+herd-pallet   https://pallet-pal.test/

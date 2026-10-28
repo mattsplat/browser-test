@@ -1,0 +1,9 @@
+[package]
+name = "dart-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wasmtime = "50"
+anyhow = "1"
+regex = "1"
