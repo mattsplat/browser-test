@@ -3,7 +3,7 @@
 An experimental browser where JavaScript is no longer the default language of the web.
 Dart is first-class; JS is just one more language pack, off by default.
 
-Status: experiment. Phases 0–3 built in `browser/` (started from Blitz's reference
+Status: experiment. Current plan: "Roadmap (2026-10-28)". Phases 0–3 built in `browser/` (started from Blitz's reference
 browser): the gate, the Dart pack (with dev mode and source maps), the JS pack, and the
 per-site policy screen. Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
@@ -169,6 +169,9 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 
 ## Phases
 
+The original phases below are done. The current plan is "Roadmap (2026-10-28)" after this
+table.
+
 | Phase | Goal | Proves |
 |---|---|---|
 | 0 | Blitz shell that renders a URL, plus the network chokepoint with block-all mode and a live request log | Existing pages render; security works from day one |
@@ -176,6 +179,105 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 | 2 | JS pack (Boa compiled to Wasm) on the same interface | JS is "just a pack" |
 | 3 | Per-site policy UI: allowed packs and allowed domains | The security and language model works end to end |
 | Later | Python pack, reload by replay, shared runtime cache, MCP server | |
+
+## Roadmap (2026-10-28)
+
+Adopted from a plan drafted with ChatGPT, checked against the code and corrected where it
+didn't match how things work. Corrections are marked **Correction**; open questions are
+marked **Decision needed**.
+
+### Architecture
+
+- Many languages, one browser API. JS stays for compatibility but isn't privileged; Wasm is
+  a first-class execution environment. Packs handle language runtimes, never duplicate
+  browser functionality, and adding a language doesn't touch the rendering engine. (Already
+  true: Blitz is unmodified; Dart and JS share `Host`.)
+- Web IDL is the reference for DOM behaviour. (Already true in practice: Dart uses
+  `package:web`, generated from Web IDL, and the host uses the same member names for JS.)
+- **Correction (WIT):** WIT / the component model can't be *the* common host interface,
+  because dart2wasm can't produce components: it emits core Wasm whose imports are JS
+  snippets. The common interface stays the internal `Host` (global/get/set/call with Web
+  IDL names). WIT can be one binding *onto* it for languages that compile to components
+  (Rust, Python via componentize-py).
+- Don't compromise JS compatibility to promote other languages.
+
+### Order
+
+**Phase A: reliability and compatibility (now)**
+- Timers: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` (plus
+  `requestAnimationFrame`), host-owned so time comes from the host (principle 4).
+- `removeEventListener` with correct listener identity and cleanup.
+- Keyboard and mouse event properties.
+- Fix the event-object leak: release handles when the pack no longer holds them.
+- Error types, messages and stack traces.
+  **Limitation:** for Dart, the host can't call `toString`, so the error's class name
+  (e.g. `StateError`) may only be recoverable from the wasm name section, if dart2wasm
+  keeps type names. To investigate.
+- JS ES modules (`<script type="module">`, imports, execution order). Imports are fetched
+  through the gate, so the module graph is loaded by the host before Boa links it.
+- JS permission prompt and default policy (see below).
+- Tests show the same DOM behaviour across packs (one test, run against Dart and JS).
+
+**Phase B: developer tooling and AI**
+- Stabilize the Trace panel.
+- Read-only MCP server (AI access), on the same inspection infrastructure as the dev tools.
+- A shared internal debugging protocol, consumed by the browser UI and MCP; DAP for VS Code.
+- **Correction (breakpoints):** real breakpoints are high risk here. wasmtime's guest
+  debugging is limited and Boa has few debugger hooks. Start with source-mapped tracing and
+  pause-on-exception, then breakpoints.
+
+**Phase C: browser productivity**
+Command palette (keyboard navigation), vertical tabs, automatic tab management (pinned and
+temporary tabs), spaces and profiles. Profiles get genuinely separate cookies, storage,
+sessions and permissions; spaces only organise.
+
+**Phase D: language extensibility**
+Document exactly what a pack implements (initialisation, module loading, imports, DOM
+bindings, callbacks, memory ownership, error reporting, shutdown), then add Python to prove
+a third language needs no core changes. Validate isolation and lifecycle.
+
+**Phase E: advanced**
+Split View, per-site CSS (stored per site, no JS needed), hot reload and state restoration,
+handle inspector and profiler, shared compiled-runtime cache, time-travel replay.
+- **Correction (hot reload):** "hot module replacement where the runtime supports it" doesn't
+  apply to Dart: dart2wasm has no HMR. For Dart it's restart plus state restoration.
+- Replay must record timers, network responses, nondeterministic values and external events,
+  not just user input (principle 4 already routes all of these through the host).
+- Shared cache: share compiled modules and immutable assets only, never mutable state across
+  origins. (Already the JS engine's model: one compiled module, a fresh instance per page.)
+
+### JS permission
+
+- When a page has scripts and JS isn't allowed, it renders without JS immediately and a
+  **non-blocking** bar offers: allow for this visit, always allow for this site, keep off.
+  (Unlike the dev-mode prompt, it never holds up the page.) Choices persist and are editable
+  in the Site panel.
+- A global default JS policy.
+  **Decision needed:** the shipped default. Off (principle 1 as written), Ask (the bar), or
+  Allow (compatibility). "Ask" on every site with scripts would interrupt constantly, since
+  almost every site has scripts, so the bar must be quiet and dismissible.
+- **Correction (third-party):** JS permission is per *page* origin. Scripts from other sites
+  are already governed by the third-party request rule, so allowing JS for a page never
+  unblocks a third-party site that's blocked. That stays true.
+
+### AI access (MCP)
+
+- A separate permission from dev mode; off by default; read-only first (tabs, URLs, runtime
+  info, DOM, console and exceptions, requests with secrets redacted, traces, packs and their
+  status). Control (navigate, click, type, run code) later, as a separate permission.
+- Never exposes cookies, authorization headers, passwords or credentials by default; visibly
+  on and easy to revoke.
+- **Correction (transport):** a GUI browser the user launches can't offer stdio to an agent
+  directly. Use authenticated loopback (localhost + token), with an optional small stdio shim
+  that connects to it, for MCP clients that only speak stdio.
+- **Note:** the gate logs requests, not responses. Showing responses is new work.
+
+### Manual verification
+
+Before adding features: dev-mode prompts, every Site panel toggle, JS after permission,
+reload and persistence, third-party script blocking, and representative real sites.
+Automate where possible: event-level tests can drive pages headlessly; the browser's own
+Dioxus UI is harder to drive.
 
 ## Feature list
 
