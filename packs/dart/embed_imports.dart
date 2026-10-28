@@ -1,18 +1,20 @@
 /// Moves dart2wasm's import table from the generated `.mjs` into the `.wasm` itself, as a
-/// custom section named `dart2wasm-imports`, so a page ships one file and no JS.
+/// custom section named `dart2wasm-imports`, so a page ships one file and no JS. With a
+/// source map, it is embedded too, as `dart2wasm-sourcemap`.
 ///
-/// usage: dart run packs/dart/embed_imports.dart main.wasm main.mjs
+/// usage: dart run packs/dart/embed_imports.dart main.wasm main.mjs [main.wasm.map]
 library;
 
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-const sectionName = 'dart2wasm-imports';
+const importsSection = 'dart2wasm-imports';
+const sourceMapSection = 'dart2wasm-sourcemap';
 
 void main(List<String> args) {
-  if (args.length != 2) {
-    stderr.writeln('usage: embed_imports.dart <app.wasm> <app.mjs>');
+  if (args.length < 2 || args.length > 3) {
+    stderr.writeln('usage: embed_imports.dart <app.wasm> <app.mjs> [app.wasm.map]');
     exit(2);
   }
   final wasmFile = File(args[0]);
@@ -27,12 +29,19 @@ void main(List<String> args) {
   }
   final table = mjs.substring(start, end + '\n    };'.length);
 
-  // A custom section is: id 0, payload size, name length, name, payload.
-  final name = utf8.encode(sectionName);
-  final payload = [..._leb128(name.length), ...name, ...utf8.encode(table)];
-  final section = [0, ..._leb128(payload.length), ...payload];
+  final sections = [..._customSection(importsSection, utf8.encode(table))];
+  if (args.length == 3) {
+    sections.addAll(_customSection(sourceMapSection, File(args[2]).readAsBytesSync()));
+  }
+  // Appended after the code, so code offsets (and the source map) are unchanged.
+  wasmFile.writeAsBytesSync(Uint8List.fromList([...wasmFile.readAsBytesSync(), ...sections]));
+}
 
-  wasmFile.writeAsBytesSync(Uint8List.fromList([...wasmFile.readAsBytesSync(), ...section]));
+/// A custom section is: id 0, payload size, name length, name, payload.
+List<int> _customSection(String name, List<int> data) {
+  final nameBytes = utf8.encode(name);
+  final payload = [..._leb128(nameBytes.length), ...nameBytes, ...data];
+  return [0, ..._leb128(payload.length), ...payload];
 }
 
 List<int> _leb128(int value) {

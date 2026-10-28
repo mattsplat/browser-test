@@ -37,6 +37,7 @@ mod host;
 mod prompt;
 mod request_panel;
 mod settings;
+mod source_map;
 mod trace_panel;
 mod browser_history;
 #[cfg(any(feature = "screenshot", feature = "capture"))]

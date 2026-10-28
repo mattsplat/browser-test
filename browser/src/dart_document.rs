@@ -85,31 +85,63 @@ mod tests {
         doc.get_node(doc.query_selector(selector).unwrap().unwrap()).unwrap().text_content()
     }
 
+    /// Compile a Dart file with the dev-mode compiler (cached, so only the first run is slow).
+    async fn compile(path: &str) -> Vec<u8> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path).canonicalize().unwrap();
+        let url = blitz_traits::net::Url::from_file_path(&src).unwrap();
+        let gate = std::sync::Arc::new(crate::gate::Gate::new(std::sync::Arc::new(blitz_net::Provider::new(None))));
+        let signal = blitz_traits::net::AbortController::default().signal;
+        crate::dev_compile::compile(&url, &gate, &signal).await.unwrap()
+    }
+
+    fn listener(page: &DartDocument, selector: &str, kind: &str) -> (NodeId, usize) {
+        let node = page.inner.borrow().query_selector(selector).unwrap().unwrap();
+        let ids = page.objects.borrow().listeners[&(node, kind.to_string())].clone();
+        assert_eq!(ids.len(), 1);
+        (node, ids[0])
+    }
+
     /// The real counter example, end to end: its HTML in Blitz, its compiled package:web Dart
-    /// in the pack, the real host. Build it first with packs/dart/build.sh.
-    #[test]
-    fn counter_example_runs_and_handles_clicks() {
+    /// in the pack, the real host.
+    #[tokio::test]
+    async fn counter_example_runs_and_handles_clicks() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/counter");
         let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
-        let Ok(wasm) = std::fs::read(dir.join("main.wasm")) else {
-            panic!("build the example first: packs/dart/build.sh examples/counter/main.dart");
-        };
+        let wasm = compile("../examples/counter/main.dart").await;
         let doc = HtmlDocument::from_html(&html, DocumentConfig::default()).into_inner();
         let mut page = DartDocument::start(doc, &wasm).unwrap();
         assert_eq!(text_of(&page.inner.borrow(), "#status"), "Dart is running. No JavaScript on this page.");
 
         // Deliver two clicks the way the event handler does: the button's click listeners,
         // each called with a fresh event object.
-        let button = page.inner.borrow().query_selector("#increment").unwrap().unwrap();
-        let ids = page.objects.borrow().listeners[&(button, "click".to_string())].clone();
-        assert_eq!(ids.len(), 1);
+        let (button, id) = listener(&page, "#increment", "click");
         for _ in 0..2 {
             let event = page.objects.borrow_mut().event("click", button);
-            page.runtime.fire_callback(ids[0], &[event]).unwrap();
+            page.runtime.fire_callback(id, &[event]).unwrap();
         }
 
         let doc = page.inner.borrow();
         assert_eq!(text_of(&doc, "#count"), "2");
         assert_eq!(text_of(&doc, "#log"), "Click 1, handled in Dart (click)Click 2, handled in Dart (click)");
+    }
+
+    /// Errors and stack traces read in Dart source lines, via the embedded source map.
+    #[tokio::test]
+    async fn errors_and_stack_traces_show_dart_lines() {
+        let wasm = compile("tests/fixtures/throws.dart").await;
+        let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
+        let mut page = DartDocument::start(doc, &wasm).unwrap();
+
+        // main() printed StackTrace.current, from line 4.
+        let printed = host::trace().into_iter().find(|e| e.call == "console" && e.args.starts_with("stack:")).unwrap();
+        assert!(printed.args.contains("throws.dart:4:"), "{}", printed.args);
+
+        // A click throws from explode(), line 9: the message and that line are reported.
+        let (button, id) = listener(&page, "#go", "click");
+        let event = page.objects.borrow_mut().event("click", button);
+        let err = format!("{:#}", page.runtime.fire_callback(id, &[event]).unwrap_err());
+        assert!(err.starts_with("Uncaught Dart error: boom from a click"), "{err}");
+        assert!(err.contains("at throws.dart:9:3"), "{err}");
+        assert!(!err.contains("_internal"), "SDK capture frames are trimmed: {err}");
     }
 }

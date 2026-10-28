@@ -22,9 +22,12 @@ dart compile wasm "$src" -o "$out"
   --enable-gc --enable-reference-types --enable-exception-handling \
   --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
   --enable-mutable-globals --enable-multivalue --enable-tail-call \
-  --translate-to-exnref -o "$out"
+  --translate-to-exnref \
+  --input-source-map "$out.map" --output-source-map "$out.map" \
+  -o "$out"
 
-# Move the import table into the .wasm and drop the JS loader files: pages ship one file.
-dart run "$(dirname "$0")/embed_imports.dart" "$out" "${out%.wasm}.mjs"
-rm -f "${out%.wasm}.mjs" "${out%.wasm}.support.js"
+# Move the import table and source map into the .wasm and drop the loader files:
+# pages ship one file. (wasm-opt above kept the map's offsets in step with its rewrite.)
+dart run "$(dirname "$0")/embed_imports.dart" "$out" "${out%.wasm}.mjs" "$out.map"
+rm -f "${out%.wasm}.mjs" "${out%.wasm}.support.js" "$out.map"
 echo "built $out"

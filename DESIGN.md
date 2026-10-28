@@ -208,8 +208,7 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
   `dart2wasm-imports` custom section (`packs/dart/embed_imports.dart`) and deletes the
   generated `.mjs` and `.support.js`.
 - Known gaps: no `removeEventListener`; event objects are never freed (one handle per
-  delivery); no mouse/keyboard event details; Dart's `print` goes to the trace, not a console view; the source map is not
-  used yet, so errors show wasm function numbers rather than Dart lines.
+  delivery); no mouse/keyboard event details; Dart's `print` goes to the trace, not a console view.
 
 ## Step 3 notes: dev mode
 
@@ -228,6 +227,22 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 - Compile errors are shown on the page. Packages resolve with `dart pub get --offline`, so a
   project needs `dart pub get` run once with network.
 - Not yet: stateful hot reload; multi-file apps over http.
+
+## Step 4 notes: source maps
+
+- `build.sh` passes dart2wasm's source map through `wasm-opt` (so offsets match the rewritten
+  binary) and embeds it as a `dart2wasm-sourcemap` custom section. Pages still ship one file.
+- `browser/src/source_map.rs` decodes it; `dart_pack.rs` uses it in two places:
+  - **Dart's own stack traces** (`StackTrace.current`, and the trace captured when an error is
+    thrown): the stack helper returns the wasmtime backtrace mapped to Dart lines, shaped like
+    a JS engine's `Error().stack` so dart2wasm's trimming works unchanged.
+  - **Uncaught errors** out of `main`, event listeners or microtasks: the message strings held
+    by the thrown Dart error, then its stack, e.g.
+    `Uncaught Dart error: boom from a click` / `at throws.dart:9:3`. They appear in the Trace
+    panel (listeners) or on the page (`main`).
+- The message is best effort: the host collects strings inside the error object, since it
+  can't call Dart's `toString`, so the class name (e.g. `StateError`) isn't shown.
+- Compiler-generated wrappers have no source and show as `wasm-function[N]:0x...`.
 
 ## Known local setup notes
 

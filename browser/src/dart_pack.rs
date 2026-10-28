@@ -18,6 +18,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use wasmtime::*;
 
+use crate::source_map::SourceMap;
+
 /// A JS-like value as seen by the host. Lives inside a wasm externref.
 #[derive(Clone, Debug)]
 pub enum HostValue {
@@ -120,6 +122,8 @@ struct State {
     callbacks: Vec<HostValue>,
     /// Work Dart queued with `queueMicrotask`; run after every entry into Dart.
     microtasks: std::collections::VecDeque<HostValue>,
+    /// From the `dart2wasm-sourcemap` section, when the build embedded one.
+    source_map: Option<SourceMap>,
 }
 
 fn engine() -> &'static Engine {
@@ -135,8 +139,12 @@ impl DartRuntime {
     /// Compile and instantiate a Dart program. Does not run `main`.
     pub fn load(wasm: &[u8], host: Box<dyn Host>) -> Result<Self> {
         let table = read_import_table(&embedded_import_table(wasm)?)?;
+        // A broken map only costs readable stack traces, so don't fail the page over it.
+        let source_map = custom_section(wasm, "dart2wasm-sourcemap")?
+            .and_then(|json| SourceMap::parse(&String::from_utf8_lossy(json)).inspect_err(|e| tracing::warn!("{e:#}")).ok());
         let module = Module::new(engine(), wasm)?;
-        let mut store = Store::new(engine(), State { host, callbacks: Vec::new(), microtasks: Default::default() });
+        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map };
+        let mut store = Store::new(engine(), state);
 
         let mut imports: Vec<Extern> = Vec::new();
         for import in module.imports() {
@@ -181,7 +189,8 @@ impl DartRuntime {
     pub fn run_main(&mut self) -> Result<()> {
         let main = self.instance.get_func(&mut self.store, "$invokeMain").context("no $invokeMain export")?;
         let args = ExternRef::new(&mut self.store, HostValue::Undefined)?;
-        main.call(&mut self.store, &[Val::ExternRef(Some(args))], &mut [])?;
+        let ran = main.call(&mut self.store, &[Val::ExternRef(Some(args))], &mut []);
+        ran.map_err(|e| self.explain(e))?;
         self.run_microtasks()
     }
 
@@ -202,7 +211,8 @@ impl DartRuntime {
             call_args.push(from_host(&mut self.store, value, pty)?);
         }
         let mut out: Vec<Val> = ty.results().map(|_| Val::null_extern_ref()).collect();
-        func.call(&mut self.store, &call_args, &mut out)?;
+        let ran = func.call(&mut self.store, &call_args, &mut out);
+        ran.map_err(|e| self.explain(e))?;
         self.run_microtasks()
     }
 
@@ -215,10 +225,97 @@ impl DartRuntime {
         let pty = invoke.ty(&self.store).params().next().context("$invokeCallback takes no arguments")?;
         while let Some(task) = self.store.data_mut().microtasks.pop_front() {
             let arg = from_host(&mut self.store, task, &pty)?;
-            invoke.call(&mut self.store, &[arg], &mut [])?;
+            let ran = invoke.call(&mut self.store, &[arg], &mut []);
+            ran.map_err(|e| self.explain(e))?;
         }
         Ok(())
     }
+
+    /// Turn an error out of Dart into something a developer can act on: the thrown Dart
+    /// error's message and a stack trace in Dart source lines.
+    fn explain(&mut self, err: wasmtime::Error) -> anyhow::Error {
+        let mut strings = Vec::new();
+        if err.downcast_ref::<ThrownException>().is_some() {
+            if let Some(exn) = self.store.take_pending_exception() {
+                // The host can't call Dart's toString, so collect the strings the error object
+                // holds: its message, and the stack trace Dart captured when it was thrown.
+                for i in 0..4 {
+                    match exn.field(&mut self.store, i) {
+                        Ok(field) => collect_strings(&mut self.store, &field, 0, &mut strings),
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        let (stacks, messages): (Vec<String>, Vec<String>) = strings.into_iter().partition(|s| s.contains("    at "));
+        let stack = stacks.into_iter().next().map(|s| trim_js_stack(&s)).or_else(|| {
+            let map = self.store.data().source_map.as_ref();
+            err.downcast_ref::<WasmBacktrace>().map(|bt| format_stack(map, bt))
+        });
+        let headline = match messages.is_empty() {
+            true => format!("Dart error: {}", err.root_cause()),
+            false => format!("Uncaught Dart error: {}", messages.join(" | ")),
+        };
+        anyhow!("{headline}\n{}", stack.unwrap_or_default())
+    }
+}
+
+/// Collect host strings inside a Dart value: the strings an error object holds.
+fn collect_strings(store: &mut Store<State>, value: &Val, depth: usize, out: &mut Vec<String>) {
+    if depth > 3 || out.len() > 8 {
+        return;
+    }
+    match value {
+        Val::ExternRef(Some(_)) => {
+            if let Ok(HostValue::Str(s)) = to_host(store, value) {
+                let s = String::from_utf16_lossy(&s);
+                if !s.is_empty() && !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        Val::AnyRef(Some(any)) => {
+            let Ok(Some(object)) = any.as_struct(&*store) else { return };
+            let count = object.ty(&*store).map(|t| t.fields().len()).unwrap_or(0);
+            for i in 0..count {
+                if let Ok(field) = object.field(&mut *store, i) {
+                    collect_strings(store, &field, depth + 1, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What dart2wasm's stack helper does to `new Error().stack`: drop the first four frames
+/// (the capture helpers), plus the leading "Error" line. Then drop Dart's own error-throwing
+/// frames, which JS engines don't show either.
+fn trim_js_stack(stack: &str) -> String {
+    let lines: Vec<&str> = stack.lines().collect();
+    let drop = if lines.first().is_some_and(|l| l.starts_with("Error")) { 5 } else { 4 };
+    lines
+        .into_iter()
+        .skip(drop)
+        .skip_while(|l| l.contains("dart-sdk/_internal/"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A backtrace as Dart source lines, like a JS engine's `Error().stack`.
+fn format_stack(map: Option<&SourceMap>, backtrace: &WasmBacktrace) -> String {
+    let mut lines = Vec::new();
+    for frame in backtrace.frames() {
+        let location = frame.module_offset().and_then(|o| map?.lookup(o as u32));
+        let line = match location {
+            Some(loc) => format!("    at {loc}"),
+            None => format!("    at wasm-function[{}]:{:#x}", frame.func_index(), frame.module_offset().unwrap_or(0)),
+        };
+        // Inlined helpers can map several frames to one line; show it once.
+        if lines.last() != Some(&line) {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
 }
 
 /// What a dart2wasm import does, recognised from its JS snippet.
@@ -239,7 +336,12 @@ enum Helper {
     Print,
     NumToString,
     IndexOf,
+    /// `new Error().stack`: the current stack, used for Dart's `StackTrace.current`.
     Stack,
+    /// Dart's trimming of a captured stack: drop the "Error" line and capture frames.
+    TrimStack,
+    /// Stack of a JS error object; there are none here.
+    ExnStack,
     IsUndefined,
     ToStr,
     JsonStringify,
@@ -280,7 +382,8 @@ fn classify(body: &str) -> Helper {
         "o => String(o)" => Helper::ToStr,
         "s => JSON.stringify(s)" => Helper::JsonStringify,
         "o => o" => Helper::Identity,
-        _ if b.starts_with("(exn) =>") => Helper::Stack,
+        _ if b.starts_with("(exn) =>") && b.contains("frames.slice(drop)") => Helper::TrimStack,
+        _ if b.starts_with("(exn) =>") => Helper::ExnStack,
         _ if b.starts_with("(wasmFunction,f) => finalizeWrapper") => Helper::WrapCallback,
         _ if b.contains("typeof o === 'number'") => Helper::ClassifyNumber,
         _ => Helper::Unsupported(b.to_string()),
@@ -289,7 +392,14 @@ fn classify(body: &str) -> Helper {
 
 /// The import table `packs/dart/embed_imports.dart` stored in the wasm's custom section.
 fn embedded_import_table(wasm: &[u8]) -> Result<String> {
-    const SECTION: &[u8] = b"dart2wasm-imports";
+    match custom_section(wasm, "dart2wasm-imports")? {
+        Some(table) => Ok(String::from_utf8_lossy(table).into_owned()),
+        None => bail!("no dart2wasm-imports section: build this page's Dart with packs/dart/build.sh"),
+    }
+}
+
+/// The contents of the custom section called `name`, if the module has one.
+fn custom_section<'a>(wasm: &'a [u8], name: &str) -> Result<Option<&'a [u8]>> {
     let leb = |i: &mut usize| -> Result<usize> {
         let (mut value, mut shift) = (0usize, 0);
         loop {
@@ -312,14 +422,13 @@ fn embedded_import_table(wasm: &[u8]) -> Result<String> {
         if id == 0 {
             let mut j = i;
             let name_len = leb(&mut j)?;
-            if wasm.get(j..j + name_len) == Some(SECTION) {
-                let payload = wasm.get(j + name_len..end).context("truncated custom section")?;
-                return Ok(String::from_utf8_lossy(payload).into_owned());
+            if wasm.get(j..j + name_len) == Some(name.as_bytes()) {
+                return wasm.get(j + name_len..end).context("truncated custom section").map(Some);
             }
         }
         i = end;
     }
-    bail!("no dart2wasm-imports section: build this page's Dart with packs/dart/build.sh")
+    Ok(None)
 }
 
 /// Read `const dart2wasm = { X: body, ... }`, the import table dart2wasm writes.
@@ -546,7 +655,15 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
             let needle = to_host(caller, &params[1])?.display();
             HostValue::Num(hay.find(&needle).map(|i| hay[..i].encode_utf16().count() as f64).unwrap_or(-1.0))
         }
-        Helper::Stack => HostValue::str(""),
+        Helper::Stack => {
+            // Shaped like a JS engine's: an "Error" line and the helper's own frames, which
+            // Dart's stack trimming (`TrimStack`) expects to drop.
+            let backtrace = WasmBacktrace::capture(&*caller);
+            let frames = format_stack(caller.data().source_map.as_ref(), &backtrace);
+            HostValue::str(&format!("Error\n    at <host stack helper>\n    at <host import>\n{frames}"))
+        }
+        Helper::TrimStack => HostValue::str(&trim_js_stack(&to_host(caller, &params[0])?.display())),
+        Helper::ExnStack => HostValue::Null,
         Helper::IsUndefined => HostValue::Bool(matches!(to_host(caller, &params[0])?, HostValue::Undefined)),
         Helper::ToStr => HostValue::str(&to_host(caller, &params[0])?.display()),
         Helper::JsonStringify => HostValue::str(&format!("{:?}", to_host(caller, &params[0])?.display())),
