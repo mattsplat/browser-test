@@ -22,6 +22,10 @@ per-site policy screen. Run it with `cd browser && cargo run --release -- <url>`
    time-travel replay possible, so it is a hard rule from day one.
 5. **Source is primary, Wasm is how it runs.** The console, debugger and stack traces show
    the real source, never raw Wasm.
+6. **Wasm can do everything JS can do on the web.** Anything a page's JS can do in a normal
+   browser, a Wasm pack (e.g. Dart via `package:web`) can do here, through the same host and
+   subject to the same policy (the gate, per-site settings). Principle 1 stops JS getting
+   more; this one stops Wasm getting less. See "Web platform parity" for what's missing.
 
 ## Architecture
 
@@ -187,7 +191,25 @@ each relates to what's built.
 | Automatic tab management | High | Low–medium | Browser UI over the existing tab store (e.g. grouping, closing idle tabs) |
 | Website CSS customization | Medium | Medium | Per-site user stylesheets; would sit alongside the Site panel's per-site settings |
 | Rust/WASM scripting | Specialized | Very high | Partly built: the Dart pack already runs Wasm on the host dispatcher. A Rust pack would need its own way to describe host calls (Rust has no dart2wasm-style import table) |
+| `document.cookie` for Wasm and JS | High | Low–medium | See "Web platform parity": expose the existing cookie jar per origin, hiding `HttpOnly` cookies |
 | Replaceable scripting engine | Specialized | Extremely high | Largely built: language packs (Dart, JS) behind one `Host` interface and `PackRuntime` trait. Swapping or adding an engine is a new pack, not an engine change |
+
+## Web platform parity
+
+What JS can do in a normal browser that the packs can't do here yet (principle 6). Each is
+implemented once in the host (`browser/src/host.rs`), so Dart and JS get it together.
+
+| Capability | Status | Notes |
+|---|---|---|
+| `document.cookie` (read and write) | Missing | The network layer already keeps a cookie jar; expose it per page origin, hiding `HttpOnly` cookies from page code as browsers do, and applying third-party rules |
+| Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | Missing | Needs the event loop to wake the pack; time comes from the host (principle 4) |
+| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Missing | Must go through the gate with the page's URL (`fetch_for_page`), so third-party rules apply |
+| Storage: `localStorage`, `sessionStorage`, IndexedDB | Missing | Per origin, and per profile once profiles exist |
+| Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
+| DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
+| `window` and `location`: URL, navigation, `history`, viewport size | Missing | |
+| `console.*` with objects, `print` to a console view | Partly | Both packs log to the Trace panel as text |
+| Canvas, WebGL, audio, media | Missing | Large; depends on what Blitz can render |
 
 ## Phase 0 notes
 
