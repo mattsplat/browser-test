@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>JS counter</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+    #status { color: #1565C0; }
+    .counter { display: flex; align-items: center; gap: 16px; margin: 24px 0; }
+    #count { font-size: 48px; font-weight: bold; min-width: 64px; }
+    button { font-size: 16px; padding: 8px 16px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    #log { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>JS counter</h1>
+  <p>The same counter as the Dart example, in plain JavaScript. It runs only if JS is allowed
+  for this site: JS is a language pack like any other, and off by default.</p>
+  <p id="status">JavaScript is off for this site.</p>
+  <div class="counter">
+    <span id="count">0</span>
+    <button id="increment">Add one</button>
+  </div>
+  <ul id="log"></ul>
+  <script>
+    document.querySelector('#status').textContent = 'JavaScript is running, as a pack in WebAssembly.';
+    const count = document.querySelector('#count');
+    const log = document.querySelector('#log');
+    let clicks = 0;
+    document.querySelector('#increment').addEventListener('click', (event) => {
+      clicks++;
+      count.textContent = String(clicks);
+      const item = document.createElement('li');
+      item.textContent = `Click ${clicks}, handled in JS (${event.type})`;
+      log.appendChild(item);
+    });
+  </script>
+</body>
+</html>

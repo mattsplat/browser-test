@@ -168,7 +168,7 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 |---|---|---|
 | 0 | Blitz shell that renders a URL, plus the network chokepoint with block-all mode and a live request log | Existing pages render; security works from day one |
 | 1 | Pack interface, host dispatcher with the boundary tracer, and a Dart pack with a minimal DOM (query, create, text, events) | Dart runs as a first-class language |
-| 2 | JS pack (QuickJS compiled to Wasm) on the same interface | JS is "just a pack" |
+| 2 | JS pack (Boa compiled to Wasm) on the same interface | JS is "just a pack" |
 | 3 | Per-site policy UI: allowed packs and allowed domains | The security and language model works end to end |
 | Later | Python pack, reload by replay, shared runtime cache, MCP server | |
 
@@ -243,6 +243,28 @@ Spike in `spike/dart-host` (wasmtime 50, Dart 3.13.7):
 - The message is best effort: the host collects strings inside the error object, since it
   can't call Dart's `toString`, so the class name (e.g. `StateError`) isn't shown.
 - Compiler-generated wrappers have no source and show as `wasm-function[N]:0x...`.
+
+## Step 5 notes: the JS pack (Phase 2)
+
+- **Engine:** Boa, compiled to `wasm32-wasip1` from `packs/js` (`packs/js/build.sh`, ~5 MB).
+  It runs in wasmtime with the **same `Host`** as the Dart pack, so JS gets the same web API
+  names and nothing more (principle 1). Compiled engine code is cached on disk (first JS page
+  ~7 s once, then ~1 s).
+- **Bridge:** one import, `host.request`, carrying JSON (`global`/`get`/`set`/`call`/`console`).
+  `packs/js/src/prelude.js` wraps host handles in Proxies so pages write ordinary JS
+  (`document.querySelector('#x').textContent = ...`, `addEventListener`).
+- **No side doors:** the engine's only other imports are 8 WASI functions, implemented in
+  `js_pack.rs` (not a WASI runtime): clock and randomness come from the host, there is no
+  environment, no files, no network. `fetch`, `XMLHttpRequest`, `require` etc. don't exist
+  (tested). `Math.random` goes through the host, as for Dart.
+- **Off by default:** a page's classic `<script>`s (inline or `src`, fetched through the gate)
+  run only if its origin is in `js_sites`; otherwise the trace says how many were skipped.
+  One script failing doesn't stop the next. Module scripts are not supported yet.
+- `page_document.rs` (was `dart_document.rs`) serves both packs through a small
+  `PackRuntime` trait, so event delivery is identical for Dart and JS.
+- Known gaps: the prelude needs a list of which member names are methods (kept in step with
+  `host.rs`), so calling an unknown method reports it as an unknown property; no timers
+  (`setTimeout`), no `window`; a page runs one pack (Dart wins if both are present).
 
 ## Known local setup notes
 

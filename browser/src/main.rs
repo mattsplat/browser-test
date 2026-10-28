@@ -29,11 +29,12 @@ macro_rules! local_asset {
 }
 
 mod about_pages;
-mod dart_document;
 mod dart_pack;
 mod dev_compile;
 mod gate;
 mod host;
+mod js_pack;
+mod page_document;
 mod prompt;
 mod request_panel;
 mod settings;

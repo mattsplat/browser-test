@@ -1,7 +1,7 @@
 //! Browser settings that persist between runs: dev mode and per-site decisions.
 //! Stored as JSON in the app's config folder.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -21,6 +21,8 @@ pub struct Settings {
     pub dev_mode: bool,
     /// Dev-mode compile grants, by origin (e.g. "https://myapp.test", "file://").
     pub dev_grants: BTreeMap<String, Grant>,
+    /// Origins where the JS pack may run. JS is off everywhere else (principle 1).
+    pub js_sites: BTreeSet<String>,
 }
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);

@@ -126,7 +126,8 @@ struct State {
     source_map: Option<SourceMap>,
 }
 
-fn engine() -> &'static Engine {
+/// The wasmtime engine every pack runs on (GC and exceptions enabled).
+pub(crate) fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::new();

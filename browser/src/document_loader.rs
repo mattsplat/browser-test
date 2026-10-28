@@ -12,7 +12,7 @@ use linebender_resource_handle::Blob;
 use blitz_dom::{BaseDocument, local_name};
 
 use crate::StdNetProvider;
-use crate::dart_document::DartDocument;
+use crate::page_document::PackDocument;
 use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::host::{self, TraceEntry};
@@ -210,7 +210,21 @@ async fn build_page_document(
     let favicon_url = document.favicon_url();
 
     let Some(src) = dart_script_url(&document) else {
-        return (SubDocumentAttr::new(document), title, favicon_url);
+        // No Dart: the page's JS, if any, runs only where JS is allowed.
+        let origin = settings::origin_of(document.url());
+        let scripts = js_scripts(&document);
+        if scripts.is_empty() {
+            return (SubDocumentAttr::new(document), title, favicon_url);
+        }
+        if !settings::get().js_sites.contains(&origin) {
+            trace_pack_load("js", document.url(), format!("skipped {} script(s): JS is off for {origin}", scripts.len()));
+            return (SubDocumentAttr::new(document), title, favicon_url);
+        }
+        let sources = fetch_js_sources(&scripts, net_provider, signal).await;
+        return match PackDocument::start_js(document, &sources) {
+            Ok(js) => (SubDocumentAttr::new(js), title, favicon_url),
+            Err(e) => (error_document(&format!("JS pack failed: {e:#}")), title, favicon_url),
+        };
     };
     let wasm = if src.path().ends_with(".dart") {
         let origin = settings::origin_of(document.url());
@@ -229,7 +243,7 @@ async fn build_page_document(
             }
         }
     };
-    match DartDocument::start(document, &wasm) {
+    match PackDocument::start_dart(document, &wasm) {
         Ok(dart) => (SubDocumentAttr::new(dart), title, favicon_url),
         // Loading failed partway; the document it was given is gone, so show the error.
         Err(e) => (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url),
@@ -237,7 +251,57 @@ async fn build_page_document(
 }
 
 fn trace_load(src: &Url, result: String) {
-    host::record(TraceEntry { pack: "dart", call: "load".into(), args: src.to_string(), result, micros: 0 });
+    trace_pack_load("dart", src, result);
+}
+
+fn trace_pack_load(pack: &'static str, src: &Url, result: String) {
+    host::record(TraceEntry { pack, call: "load".into(), args: src.to_string(), result, micros: 0 });
+}
+
+enum JsScript {
+    Inline(String),
+    External(Url),
+}
+
+/// The page's classic scripts, in document order. Module scripts aren't supported yet.
+fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
+    let Ok(nodes) = document.query_selector_all("script") else { return Vec::new() };
+    let mut scripts = Vec::new();
+    for id in nodes {
+        let Some(node) = document.get_node(id) else { continue };
+        match node.attr(local_name!("type")).map(str::trim) {
+            None | Some("") | Some("text/javascript") | Some("application/javascript") => {}
+            Some("module") => {
+                trace_pack_load("js", document.url(), "skipped a module script: not supported yet".into());
+                continue;
+            }
+            _ => continue,
+        }
+        scripts.push(match node.attr(local_name!("src")) {
+            Some(src) => match document.url().join(src) {
+                Ok(url) => JsScript::External(url),
+                Err(_) => continue,
+            },
+            None => JsScript::Inline(node.text_content()),
+        });
+    }
+    scripts
+}
+
+/// Script sources in order. External scripts come through the gate; one that fails to load
+/// is reported and skipped, as a browser would.
+async fn fetch_js_sources(scripts: &[JsScript], net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<String> {
+    let mut sources = Vec::new();
+    for script in scripts {
+        match script {
+            JsScript::Inline(text) => sources.push(text.clone()),
+            JsScript::External(url) => match net_provider.fetch_async(Request::get(url.clone()).signal(signal.clone())).await {
+                Ok((_, bytes)) => sources.push(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(e) => trace_pack_load("js", url, format!("ERROR could not load: {e:?}")),
+            },
+        }
+    }
+    sources
 }
 
 #[derive(Debug, PartialEq)]

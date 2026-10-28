@@ -1,0 +1,17 @@
+# The JS language pack's engine: Boa compiled to wasm32-wasip1, run by the browser in
+# wasmtime with the same host as the Dart pack. Build: packs/js/build.sh
+[package]
+name = "js_pack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+boa_engine = { version = "0.22.0", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
