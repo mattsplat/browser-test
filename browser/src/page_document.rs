@@ -35,6 +35,15 @@ impl PackRuntime for DartRuntime {
     }
 }
 
+/// A page script for the JS pack: its name (URL, or the page and a position for inline
+/// scripts), its source, and whether it's a module.
+#[derive(Clone, Debug)]
+pub struct JsSource {
+    pub name: String,
+    pub source: String,
+    pub module: bool,
+}
+
 pub struct PackDocument {
     inner: Rc<RefCell<BaseDocument>>,
     runtime: Box<dyn PackRuntime>,
@@ -65,14 +74,49 @@ impl PackDocument {
         Ok(Self::new(inner, Box::new(runtime), objects, "dart"))
     }
 
-    /// Run a page's scripts, as (name, source), in order with the JS pack. Like a browser,
-    /// an error in one script is reported (in the trace) and the next still runs.
-    pub fn start_js(doc: BaseDocument, scripts: &[(String, String)]) -> Result<Self> {
+    /// Run a page's scripts with the JS pack: classic scripts in order, then module scripts
+    /// in order (as browsers run deferred modules). A module's imports are fetched with
+    /// `fetch` (the gate, for real pages) until its graph is complete. Like a browser, an
+    /// error in one script is reported (in the trace) and the next still runs.
+    pub async fn start_js<F, Fut>(doc: BaseDocument, scripts: &[JsSource], mut fetch: F) -> Result<Self>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
         let (inner, objects, host) = Self::host(doc, "js");
         let mut runtime = JsRuntime::load(Box::new(host))?;
-        for (name, source) in scripts {
-            if let Err(e) = runtime.run(name, source) {
-                record_error("js", "script".into(), name.clone(), &e);
+        for script in scripts.iter().filter(|s| !s.module) {
+            if let Err(e) = runtime.run(&script.name, &script.source) {
+                record_error("js", "script".into(), script.name.clone(), &e);
+            }
+        }
+        'modules: for module in scripts.iter().filter(|s| s.module) {
+            runtime.add_module(&module.name, &module.source)?;
+            // Each round fetches every import the engine found missing; a graph is rarely
+            // more than a few levels deep, so this bound only stops a runaway.
+            for _ in 0..64 {
+                let missing = match runtime.discover(&module.name) {
+                    Ok(missing) => missing,
+                    Err(e) => {
+                        record_error("js", "module".into(), module.name.clone(), &e);
+                        continue 'modules;
+                    }
+                };
+                if missing.is_empty() {
+                    break;
+                }
+                for url in missing {
+                    match fetch(url.clone()).await {
+                        Ok(source) => runtime.add_module(&url, &source)?,
+                        Err(e) => {
+                            record_error("js", "import".into(), url, &e);
+                            continue 'modules;
+                        }
+                    }
+                }
+            }
+            if let Err(e) = runtime.run_module(&module.name) {
+                record_error("js", "module".into(), module.name.clone(), &e);
             }
         }
         Ok(Self::new(inner, Box::new(runtime), objects, "js"))
@@ -341,9 +385,28 @@ mod tests {
     }
 
     fn js_page(html: &str, scripts: &[&str]) -> PackDocument {
+        let scripts: Vec<JsSource> = scripts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| JsSource { name: format!("test-{}.js", i + 1), source: s.to_string(), module: false })
+            .collect();
+        js_page_with(html, &scripts, &[])
+    }
+
+    /// A JS page whose module imports resolve from `files` (URL → source).
+    fn js_page_with(html: &str, scripts: &[JsSource], files: &[(&str, &str)]) -> PackDocument {
         let doc = HtmlDocument::from_html(html, DocumentConfig::default()).into_inner();
-        let scripts: Vec<(String, String)> = scripts.iter().enumerate().map(|(i, s)| (format!("test-{}.js", i + 1), s.to_string())).collect();
-        PackDocument::start_js(doc, &scripts).expect("JS engine missing? run packs/js/build.sh")
+        let files: std::collections::HashMap<String, String> = files.iter().map(|(u, s)| (u.to_string(), s.to_string())).collect();
+        let fetch = |url: String| {
+            let found = files.get(&url).cloned().ok_or_else(|| anyhow::anyhow!("404 {url}"));
+            async move { found }
+        };
+        futures_lite_block_on(PackDocument::start_js(doc, scripts, fetch)).expect("JS engine missing? run packs/js/build.sh")
+    }
+
+    /// Drive a future that never actually waits (test fetches resolve immediately).
+    fn futures_lite_block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(fut)
     }
 
     /// The JS counter example, end to end: its inline script in the JS pack (Boa in wasm),
@@ -414,7 +477,10 @@ mod tests {
         let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig::default()).into_inner();
         match pack {
             "dart" => PackDocument::start_dart(doc, &compile("tests/fixtures/events.dart").await).unwrap(),
-            _ => PackDocument::start_js(doc, &[("events.js".into(), include_str!("../tests/fixtures/events.js").to_string())]).unwrap(),
+            _ => {
+                let script = JsSource { name: "events.js".into(), source: include_str!("../tests/fixtures/events.js").into(), module: false };
+                PackDocument::start_js(doc, &[script], |_| async { anyhow::bail!("no imports") }).await.unwrap()
+            }
         }
     }
 
@@ -531,5 +597,52 @@ mod tests {
         assert!(err.contains("at inner (test-1.js:1:"), "{err}");
         assert!(err.contains("at outer (test-1.js:2:"), "{err}");
         assert!(text_of(&page.inner.borrow(), "#out").contains("test-2.js:1:"));
+    }
+
+    fn module(name: &str, source: &str) -> JsSource {
+        JsSource { name: name.into(), source: source.into(), module: true }
+    }
+
+    fn classic(name: &str, source: &str) -> JsSource {
+        JsSource { name: name.into(), source: source.into(), module: false }
+    }
+
+    /// Imports resolve relative to the importing module, every module in the graph is
+    /// evaluated once in dependency order, and modules run after classic scripts.
+    #[test]
+    fn js_modules_load_imports_once_and_run_after_classic_scripts() {
+        let add = "document.querySelector('#out').textContent +=";
+        let page = js_page_with(
+            "<p id=out></p>",
+            &[
+                // The module comes first in the page but runs after the classic script.
+                module("https://site.test/app/main.js", &format!("import {{ count }} from './shared.js'; import './b.js'; import './c.js'; {add} ` main:${{count()}}`;")),
+                classic("inline", "document.querySelector('#out').textContent = 'classic';"),
+            ],
+            &[
+                ("https://site.test/app/shared.js", &format!("let n = 0; export const count = () => ++n; {add} ' shared';")),
+                ("https://site.test/app/b.js", &format!("import {{ count }} from './shared.js'; count(); {add} ' b';")),
+                ("https://site.test/app/c.js", &format!("import {{ count }} from '../app/shared.js'; count(); {add} ' c';")),
+            ],
+        );
+        assert_eq!(text_of(&page.inner.borrow(), "#out"), "classic shared b c main:3");
+    }
+
+    /// A missing import and a bare specifier are reported; the rest of the page still runs.
+    #[test]
+    fn js_module_errors_are_reported() {
+        let page = js_page_with(
+            "<p id=out>start</p>",
+            &[
+                module("https://site.test/missing.js", "import './nope.js';"),
+                module("https://site.test/bare.js", "import 'lodash';"),
+                module("https://site.test/ok.js", "document.querySelector('#out').textContent = 'ok';"),
+            ],
+            &[],
+        );
+        assert_eq!(text_of(&page.inner.borrow(), "#out"), "ok");
+        let trace = host::trace();
+        assert!(trace.iter().any(|e| e.pack == "js" && e.args == "https://site.test/nope.js" && e.result.contains("404")));
+        assert!(trace.iter().any(|e| e.pack == "js" && e.args == "https://site.test/bare.js" && e.result.contains("import map")));
     }
 }

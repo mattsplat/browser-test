@@ -12,7 +12,7 @@ use linebender_resource_handle::Blob;
 use blitz_dom::{BaseDocument, local_name};
 
 use crate::StdNetProvider;
-use crate::page_document::PackDocument;
+use crate::page_document::{JsSource, PackDocument};
 use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
@@ -225,7 +225,16 @@ async fn build_page_document(
             return (SubDocumentAttr::new(document), title, favicon_url);
         }
         let sources = fetch_js_sources(&scripts, &page_url, net_provider, signal).await;
-        return match PackDocument::start_js(document, &sources) {
+        // Module imports come through the gate too, as requests from this page.
+        let fetch_import = |url: String| {
+            let (net, page, signal) = (Arc::clone(net_provider), page_url.clone(), signal.clone());
+            async move {
+                let url = Url::parse(&url)?;
+                let (_, bytes) = net.fetch_for_page(Request::get(url).signal(signal), &page).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        return match PackDocument::start_js(document, &sources, fetch_import).await {
             Ok(js) => (SubDocumentAttr::new(js), title, favicon_url),
             Err(e) => (error_document(&format!("JS pack failed: {e:#}")), title, favicon_url),
         };
@@ -266,30 +275,27 @@ fn trace_pack_load(pack: &'static str, src: &Url, result: String) {
 }
 
 enum JsScript {
-    Inline(String),
-    External(Url),
+    Inline { source: String, module: bool },
+    External { url: Url, module: bool },
 }
 
-/// The page's classic scripts, in document order. Module scripts aren't supported yet.
+/// The page's classic and module scripts, in document order.
 fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
     let Ok(nodes) = document.query_selector_all("script") else { return Vec::new() };
     let mut scripts = Vec::new();
     for id in nodes {
         let Some(node) = document.get_node(id) else { continue };
-        match node.attr(local_name!("type")).map(str::trim) {
-            None | Some("") | Some("text/javascript") | Some("application/javascript") => {}
-            Some("module") => {
-                trace_pack_load("js", document.url(), "skipped a module script: not supported yet".into());
-                continue;
-            }
+        let module = match node.attr(local_name!("type")).map(str::trim) {
+            None | Some("") | Some("text/javascript") | Some("application/javascript") => false,
+            Some("module") => true,
             _ => continue,
-        }
+        };
         scripts.push(match node.attr(local_name!("src")) {
             Some(src) => match document.url().join(src) {
-                Ok(url) => JsScript::External(url),
+                Ok(url) => JsScript::External { url, module },
                 Err(_) => continue,
             },
-            None => JsScript::Inline(node.text_content()),
+            None => JsScript::Inline { source: node.text_content(), module },
         });
     }
     scripts
@@ -297,17 +303,22 @@ fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
 
 /// Script sources in order. External scripts come through the gate; one that fails to load
 /// is reported and skipped, as a browser would.
-async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<(String, String)> {
+async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<JsSource> {
     let mut sources = Vec::new();
     let mut inline = 0;
     for script in scripts {
         match script {
-            JsScript::Inline(text) => {
+            JsScript::Inline { source, module } => {
                 inline += 1;
-                sources.push((format!("{page} (inline script {inline})"), text.clone()));
+                // Inline modules need a URL to resolve relative imports against.
+                let name = match module {
+                    true => format!("{}#inline-module-{inline}", page.as_str().split('#').next().unwrap_or_default()),
+                    false => format!("{page} (inline script {inline})"),
+                };
+                sources.push(JsSource { name, source: source.clone(), module: *module });
             }
-            JsScript::External(url) => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
-                Ok((_, bytes)) => sources.push((url.to_string(), String::from_utf8_lossy(&bytes).into_owned())),
+            JsScript::External { url, module } => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
+                Ok((_, bytes)) => sources.push(JsSource { name: url.to_string(), source: String::from_utf8_lossy(&bytes).into_owned(), module: *module }),
                 Err(e) => trace_pack_load("js", url, format!("ERROR could not load: {e:?}")),
             },
         }

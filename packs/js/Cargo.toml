@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 boa_engine = { version = "0.22.0", default-features = false }
+url = "2"
 
 [profile.release]
 opt-level = "s"

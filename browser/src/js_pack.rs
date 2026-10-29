@@ -98,6 +98,38 @@ impl JsRuntime {
         self.check(status)
     }
 
+    /// Give the engine module `url`'s source.
+    pub fn add_module(&mut self, url: &str, source: &str) -> Result<()> {
+        let (u, ul) = write_str(&mut self.store, &self.instance, url)?;
+        let (s, sl) = write_str(&mut self.store, &self.instance, source)?;
+        let add = self.instance.get_typed_func::<(u32, u32, u32, u32), ()>(&mut self.store, "js_add_module")?;
+        add.call(&mut self.store, (u, ul, s, sl))?;
+        Ok(())
+    }
+
+    /// The imports of module graph `url` that aren't loaded yet (empty when complete).
+    pub fn discover(&mut self, url: &str) -> Result<Vec<String>> {
+        let (u, ul) = write_str(&mut self.store, &self.instance, url)?;
+        let discover = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_discover")?;
+        let status = discover.call(&mut self.store, (u, ul))?;
+        if status == 0 {
+            return Ok(Vec::new());
+        }
+        let reply: Value = serde_json::from_str(&take_str(&mut self.store, &self.instance, status)?)?;
+        if let Some(error) = reply.get("error").and_then(|e| e.as_str()) {
+            bail!("{error}");
+        }
+        Ok(reply["missing"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect())
+    }
+
+    /// Link and evaluate module graph `url` (once `discover` reports it complete).
+    pub fn run_module(&mut self, url: &str) -> Result<()> {
+        let (u, ul) = write_str(&mut self.store, &self.instance, url)?;
+        let run = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_run_module")?;
+        let status = run.call(&mut self.store, (u, ul))?;
+        self.check(status)
+    }
+
     /// 0 is success; anything else is a packed error message.
     fn check(&mut self, status: u64) -> Result<()> {
         if status == 0 {

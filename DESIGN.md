@@ -230,14 +230,21 @@ runs the same page in Dart and JS and expects identical output):
     are now named (their URL, or `page (inline script N)`) so locations read `app.js:1:25`.
     `error.stack` works in page code.
   - The dev-mode compile cache now also goes stale when the build tooling changes.
+- ES modules (`<script type="module">`, inline or `src`): classic scripts run first, then
+  module scripts in document order. Imports resolve relative to the importing module and are
+  fetched **through the gate** as requests from the page (so third-party rules apply). The
+  host loads each graph before it runs: a scratch Boa context with no page access reports
+  missing imports, the host fetches them, and repeats; then the page's context links and
+  evaluates it, each module once. Not supported yet: import maps (bare specifiers like
+  `import "lodash"` error clearly), `import()` from classic scripts. Demo:
+  `examples/js-modules`.
 - Timers: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` (plus
   `requestAnimationFrame`), host-owned so time comes from the host (principle 4).
 - `removeEventListener` with correct listener identity and cleanup.
 - Keyboard and mouse event properties.
 - Fix the event-object leak: release handles when the pack no longer holds them.
 - Error types, messages and stack traces. (Done: see above.)
-- JS ES modules (`<script type="module">`, imports, execution order). Imports are fetched
-  through the gate, so the module graph is loaded by the host before Boa links it.
+- JS ES modules (`<script type="module">`, imports, execution order). (Done: see above.)
 - JS permission prompt and default policy (see below).
 - Tests show the same DOM behaviour across packs (one test, run against Dart and JS).
 
