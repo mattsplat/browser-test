@@ -236,7 +236,7 @@ fn app() -> Element {
             {fps_overlay_el}
             match open_panel() {
                 Panel::Requests => rsx!(request_panel::RequestPanel {}),
-                Panel::Trace => rsx!(trace_panel::TracePanel {}),
+                Panel::Trace => rsx!(trace_panel::TracePanel { tabs, active_tab_id }),
                 Panel::Site => rsx!(site_panel::SitePanel { tabs, active_tab_id }),
                 Panel::None => rsx!(),
             }

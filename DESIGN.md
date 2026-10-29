@@ -255,7 +255,9 @@ runs the same page in Dart and JS and expects identical output):
 - Tests show the same DOM behaviour across packs (one test, run against Dart and JS).
 
 **Phase B: developer tooling and AI**
-- Stabilize the Trace panel.
+- Stabilize the Trace panel. **Done:** every entry records its page URL and kind (call,
+  console, error, load); the panel shows the active tab's site by default (or all tabs) and
+  filters to Console or Errors. Pack start failures now reach the trace, not only the page.
 - Read-only MCP server (AI access), on the same inspection infrastructure as the dev tools.
 - A shared internal debugging protocol, consumed by the browser UI and MCP; DAP for VS Code.
 - **Correction (breakpoints):** real breakpoints are high risk here. wasmtime's guest

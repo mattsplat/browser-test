@@ -252,6 +252,8 @@ impl Objects {
 /// The page as a pack sees it.
 pub struct PageHost {
     pub pack: &'static str,
+    /// The page's URL, for the trace.
+    pub page: String,
     pub doc: Rc<RefCell<BaseDocument>>,
     pub objects: Rc<RefCell<Objects>>,
     rng: u64,
@@ -261,23 +263,19 @@ impl PageHost {
     pub fn new(pack: &'static str, doc: Rc<RefCell<BaseDocument>>, objects: Rc<RefCell<Objects>>) -> Self {
         // Randomness comes from the host so a recording can replay it (principle 4).
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-        Self { pack, doc, objects, rng: seed | 1 }
+        let page = doc.borrow().url().to_string();
+        Self { pack, page, doc, objects, rng: seed | 1 }
     }
 
     /// Run `f` and record it in the trace as `label(args)`.
     fn traced<T>(&mut self, label: String, args: String, f: impl FnOnce(&mut Self) -> Result<T>, show: impl Fn(&T) -> String) -> Result<T> {
         let started = Instant::now();
         let result = f(self);
-        record(TraceEntry {
-            pack: self.pack,
-            call: label,
-            args,
-            result: match &result {
-                Ok(v) => show(v),
-                Err(e) => format!("ERROR {e:#}"),
-            },
-            micros: started.elapsed().as_micros() as u64,
-        });
+        let (kind, shown) = match &result {
+            Ok(v) => (TraceKind::Call, show(v)),
+            Err(e) => (TraceKind::Error, format!("ERROR {e:#}")),
+        };
+        record(TraceEntry { pack: self.pack, kind, page: self.page.clone(), call: label, args, result: shown, micros: started.elapsed().as_micros() as u64 });
         result
     }
 
@@ -534,7 +532,7 @@ impl Host for PageHost {
     }
 
     fn console(&mut self, text: &str) {
-        record(TraceEntry { pack: self.pack, call: "console".into(), args: text.to_string(), result: String::new(), micros: 0 });
+        record(TraceEntry { pack: self.pack, kind: TraceKind::Console, page: self.page.clone(), call: "console".into(), args: text.to_string(), result: String::new(), micros: 0 });
     }
 
     fn now(&mut self) -> f64 {
@@ -545,9 +543,24 @@ impl Host for PageHost {
 /// How many trace entries are kept; older ones are dropped.
 const TRACE_CAPACITY: usize = 2000;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TraceKind {
+    /// A call through the host.
+    Call,
+    /// Something the page logged (`console.log`, Dart's `print`).
+    Console,
+    /// A failed call, or an error the page didn't catch.
+    Error,
+    /// A pack loading, or being skipped.
+    Load,
+}
+
 #[derive(Clone, Debug)]
 pub struct TraceEntry {
     pub pack: &'static str,
+    pub kind: TraceKind,
+    /// The URL of the page that made the call.
+    pub page: String,
     pub call: String,
     pub args: String,
     pub result: String,

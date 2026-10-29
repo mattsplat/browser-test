@@ -16,7 +16,7 @@ use crate::page_document::{JsSource, PackDocument};
 use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
-use crate::host::{self, TraceEntry};
+use crate::host::{self, TraceEntry, TraceKind};
 use crate::js_permission;
 use crate::prompt;
 use crate::settings::{self, Grant};
@@ -224,7 +224,7 @@ async fn build_page_document(
         match js_permission::decide(&settings::get(), js_permission::allowed_this_visit(&origin), &origin) {
             js_permission::JsDecision::Run => {}
             js_permission::JsDecision::Skip { reason, offer } => {
-                trace_pack_load("js", document.url(), format!("skipped {} script(s): {reason}", scripts.len()));
+                trace_pack_load("js", &page_url, document.url(), format!("skipped {} script(s): {reason}", scripts.len()));
                 if offer {
                     js_permission::offer(&origin, scripts.len());
                 }
@@ -243,11 +243,14 @@ async fn build_page_document(
         };
         return match PackDocument::start_js(document, &sources, fetch_import).await {
             Ok(js) => (SubDocumentAttr::new(js), title, favicon_url),
-            Err(e) => (error_document(&format!("JS pack failed: {e:#}")), title, favicon_url),
+            Err(e) => {
+                trace_pack_load("js", &page_url, &page_url, format!("ERROR {e:#}"));
+                (error_document(&format!("JS pack failed: {e:#}")), title, favicon_url)
+            }
         };
     };
     if settings::get().dart_blocked.contains(&origin) {
-        trace_load(&src, format!("skipped: Dart is blocked for {origin}"));
+        trace_load(&page_url, &src, format!("skipped: Dart is blocked for {origin}"));
         return (SubDocumentAttr::new(document), title, favicon_url);
     }
     let wasm = if src.path().ends_with(".dart") {
@@ -261,7 +264,7 @@ async fn build_page_document(
         match fetch_dart_program(&src, &page_url, net_provider, signal).await {
             Ok(wasm) => wasm,
             Err(e) => {
-                trace_load(&src, format!("ERROR {e:#}"));
+                trace_load(&page_url, &src, format!("ERROR {e:#}"));
                 return (SubDocumentAttr::new(document), title, favicon_url);
             }
         }
@@ -269,16 +272,20 @@ async fn build_page_document(
     match PackDocument::start_dart(document, &wasm) {
         Ok(dart) => (SubDocumentAttr::new(dart), title, favicon_url),
         // Loading failed partway; the document it was given is gone, so show the error.
-        Err(e) => (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url),
+        Err(e) => {
+            trace_load(&page_url, &src, format!("ERROR {e:#}"));
+            (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url)
+        }
     }
 }
 
-fn trace_load(src: &Url, result: String) {
-    trace_pack_load("dart", src, result);
+fn trace_load(page: &Url, src: &Url, result: String) {
+    trace_pack_load("dart", page, src, result);
 }
 
-fn trace_pack_load(pack: &'static str, src: &Url, result: String) {
-    host::record(TraceEntry { pack, call: "load".into(), args: src.to_string(), result, micros: 0 });
+fn trace_pack_load(pack: &'static str, page: &Url, src: &Url, result: String) {
+    let kind = if result.starts_with("ERROR") { TraceKind::Error } else { TraceKind::Load };
+    host::record(TraceEntry { pack, kind, page: page.to_string(), call: "load".into(), args: src.to_string(), result, micros: 0 });
 }
 
 enum JsScript {
@@ -326,7 +333,7 @@ async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<S
             }
             JsScript::External { url, module } => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
                 Ok((_, bytes)) => sources.push(JsSource { name: url.to_string(), source: String::from_utf8_lossy(&bytes).into_owned(), module: *module }),
-                Err(e) => trace_pack_load("js", url, format!("ERROR could not load: {e:?}")),
+                Err(e) => trace_pack_load("js", page, url, format!("ERROR could not load: {e:?}")),
             },
         }
     }
@@ -364,12 +371,12 @@ async fn dev_mode_compile(
 ) -> anyhow::Result<Option<Vec<u8>>> {
     match dev_mode_decision(&settings::get(), origin) {
         DevDecision::Skip(reason) => {
-            trace_load(src, format!("skipped: {reason}"));
+            trace_load(page, src, format!("skipped: {reason}"));
             return Ok(None);
         }
         DevDecision::Ask => {
             if prompt::ask(origin).await == prompt::Answer::Block {
-                trace_load(src, format!("skipped: compiling source is blocked for {origin}"));
+                trace_load(page, src, format!("skipped: compiling source is blocked for {origin}"));
                 return Ok(None);
             }
         }
@@ -377,7 +384,7 @@ async fn dev_mode_compile(
     }
     let started = std::time::Instant::now();
     let wasm = dev_compile::compile(src, page, net_provider, signal).await?;
-    trace_load(src, format!("compiled from source in {} ms", started.elapsed().as_millis()));
+    trace_load(page, src, format!("compiled from source in {} ms", started.elapsed().as_millis()));
     Ok(Some(wasm))
 }
 

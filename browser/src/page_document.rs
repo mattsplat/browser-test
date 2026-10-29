@@ -15,7 +15,7 @@ use blitz_traits::events::{BlitzKeyEvent, BlitzPointerEvent, DomEvent, DomEventD
 use keyboard_types::Modifiers;
 
 use crate::dart_pack::{DartRuntime, HostValue};
-use crate::host::{self, EventDetails, Objects, PageHost, TraceEntry};
+use crate::host::{self, EventDetails, Objects, PageHost, TraceEntry, TraceKind};
 use crate::js_pack::JsRuntime;
 
 /// What the document needs from a pack.
@@ -49,6 +49,8 @@ pub struct PackDocument {
     runtime: Box<dyn PackRuntime>,
     objects: Rc<RefCell<Objects>>,
     pack: &'static str,
+    /// The page's URL, for the trace.
+    page: String,
     /// Wakes the event loop when the next timer is due (set from `poll`).
     waker: Arc<Mutex<Option<Waker>>>,
     timer_thread: Option<Sender<Instant>>,
@@ -56,7 +58,8 @@ pub struct PackDocument {
 
 impl PackDocument {
     fn new(inner: Rc<RefCell<BaseDocument>>, runtime: Box<dyn PackRuntime>, objects: Rc<RefCell<Objects>>, pack: &'static str) -> Self {
-        Self { inner, runtime, objects, pack, waker: Default::default(), timer_thread: None }
+        let page = inner.borrow().url().to_string();
+        Self { inner, runtime, objects, pack, page, waker: Default::default(), timer_thread: None }
     }
 
     fn host(doc: BaseDocument, pack: &'static str) -> (Rc<RefCell<BaseDocument>>, Rc<RefCell<Objects>>, PageHost) {
@@ -84,10 +87,11 @@ impl PackDocument {
         Fut: std::future::Future<Output = Result<String>>,
     {
         let (inner, objects, host) = Self::host(doc, "js");
+        let page = host.page.clone();
         let mut runtime = JsRuntime::load(Box::new(host))?;
         for script in scripts.iter().filter(|s| !s.module) {
             if let Err(e) = runtime.run(&script.name, &script.source) {
-                record_error("js", "script".into(), script.name.clone(), &e);
+                record_error("js", &page, "script".into(), script.name.clone(), &e);
             }
         }
         'modules: for module in scripts.iter().filter(|s| s.module) {
@@ -98,7 +102,7 @@ impl PackDocument {
                 let missing = match runtime.discover(&module.name) {
                     Ok(missing) => missing,
                     Err(e) => {
-                        record_error("js", "module".into(), module.name.clone(), &e);
+                        record_error("js", &page, "module".into(), module.name.clone(), &e);
                         continue 'modules;
                     }
                 };
@@ -109,14 +113,14 @@ impl PackDocument {
                     match fetch(url.clone()).await {
                         Ok(source) => runtime.add_module(&url, &source)?,
                         Err(e) => {
-                            record_error("js", "import".into(), url, &e);
+                            record_error("js", &page, "import".into(), url, &e);
                             continue 'modules;
                         }
                     }
                 }
             }
             if let Err(e) = runtime.run_module(&module.name) {
-                record_error("js", "module".into(), module.name.clone(), &e);
+                record_error("js", &page, "module".into(), module.name.clone(), &e);
             }
         }
         Ok(Self::new(inner, Box::new(runtime), objects, "js"))
@@ -127,7 +131,7 @@ impl PackDocument {
         let due = self.objects.borrow_mut().take_due_timers(Instant::now());
         for timer in &due {
             if let Err(e) = self.runtime.fire_callback(timer.callback, &timer.args) {
-                record_error(self.pack, "timer".into(), String::new(), &e);
+                record_error(self.pack, &self.page, "timer".into(), String::new(), &e);
             }
         }
         self.objects.borrow_mut().after_timers_ran(&due);
@@ -192,8 +196,8 @@ fn release_unused(objects: &Rc<RefCell<Objects>>, runtime: &mut dyn PackRuntime)
     }
 }
 
-fn record_error(pack: &'static str, call: String, args: String, e: &anyhow::Error) {
-    host::record(TraceEntry { pack, call, args, result: format!("ERROR {e:#}"), micros: 0 });
+fn record_error(pack: &'static str, page: &str, call: String, args: String, e: &anyhow::Error) {
+    host::record(TraceEntry { pack, kind: TraceKind::Error, page: page.to_string(), call, args, result: format!("ERROR {e:#}"), micros: 0 });
 }
 
 /// The mouse and keyboard details the DOM exposes for an event.
@@ -250,7 +254,7 @@ impl Document for PackDocument {
     }
 
     fn handle_ui_event(&mut self, event: UiEvent) {
-        let handler = PackEventHandler { runtime: self.runtime.as_mut(), objects: &self.objects, pack: self.pack };
+        let handler = PackEventHandler { runtime: self.runtime.as_mut(), objects: &self.objects, pack: self.pack, page: &self.page };
         let mut driver = EventDriver::new(&mut self.inner, handler);
         driver.handle_ui_event(event);
         // The pack may have changed the DOM or started timers.
@@ -275,6 +279,7 @@ struct PackEventHandler<'a> {
     runtime: &'a mut dyn PackRuntime,
     objects: &'a Rc<RefCell<Objects>>,
     pack: &'static str,
+    page: &'a str,
 }
 
 impl EventHandler for PackEventHandler<'_> {
@@ -295,7 +300,7 @@ impl EventHandler for PackEventHandler<'_> {
             }
             for id in ids {
                 if let Err(e) = self.runtime.fire_callback(id, &[HostValue::Object(handle)]) {
-                    record_error(self.pack, format!("{kind} listener"), format!("node {node:?}"), &e);
+                    record_error(self.pack, self.page, format!("{kind} listener"), format!("node {node:?}"), &e);
                 }
                 if self.objects.borrow_mut().event_mut(handle).is_some_and(|e| e.immediate_propagation_stopped) {
                     break 'nodes;
@@ -465,6 +470,20 @@ mod tests {
         assert!(host::trace().iter().any(|e| e.pack == "js" && e.result.contains("first script broke")));
     }
 
+    /// The trace says which page each entry came from and what kind it is, so the Trace panel
+    /// (and AI access later) can show one tab's console and errors.
+    #[test]
+    fn trace_entries_carry_their_page_and_kind() {
+        let page = js_page("<p></p>", &["console.log('hello from the trace test')", "throw new Error('trace test error')"]);
+        let trace = host::trace();
+        let logged = trace.iter().find(|e| e.args == "hello from the trace test").expect("console entry");
+        assert_eq!(logged.kind, TraceKind::Console);
+        assert_eq!(logged.page, page.page);
+        let error = trace.iter().find(|e| e.result.contains("trace test error")).expect("error entry");
+        assert_eq!(error.kind, TraceKind::Error);
+        assert_eq!(error.page, page.page);
+    }
+
     // ---- Cross-pack tests: the same page and behaviour in Dart and JS, through the real
     // ---- event dispatch and timer code. Each must produce identical output.
 
@@ -519,7 +538,7 @@ mod tests {
         let mut event = DomEvent::new(node, data);
         let mut state = EventState::default();
         let mut doc = page.inner.clone();
-        let mut handler = PackEventHandler { runtime: page.runtime.as_mut(), objects: &page.objects, pack: page.pack };
+        let mut handler = PackEventHandler { runtime: page.runtime.as_mut(), objects: &page.objects, pack: page.pack, page: &page.page };
         handler.handle_event(&chain, &mut event, &mut doc, &mut state);
         state.is_cancelled()
     }
