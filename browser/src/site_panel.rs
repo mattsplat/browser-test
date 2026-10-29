@@ -128,6 +128,20 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
             changes += 1;
         }
     };
+    // Local storage is kept per origin; the tab's session storage too.
+    let storage_size = crate::storage::local().read(&origin, |a| a.size());
+    let clear_site_data = {
+        let (site, origin) = (site.clone(), origin.clone());
+        move |_| {
+            if let Some(site) = &site {
+                crate::cookies::jar().clear_site(site);
+            }
+            let _ = crate::storage::local().write(&origin, |a| Ok(a.clear()));
+            active_tab(tabs, active_tab_id()).loader_rc().session.borrow_mut().remove(&origin);
+            let mut changes = changes;
+            changes += 1;
+        }
+    };
     let toggle_third_party = move |_| apply(changes, Box::new(|s| s.block_third_party = !s.block_third_party));
     let reload = move |_| active_tab(tabs, active_tab_id()).reload();
 
@@ -204,6 +218,11 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
                         div { class: "request-clear", onclick: clear_cookies, "Clear cookies" }
                     }
                 }
+                div { class: "site-row",
+                    span { "Local storage for {origin}: {storage_text(storage_size)}" }
+                    div { class: "request-clear", onclick: clear_site_data, "Clear site data" }
+                }
+                div { class: "site-note", "Clear site data removes this site's cookies, this origin's local storage and this tab's session storage." }
             }
             SiteCssSection { key: "{origin}", origin: origin.clone(), tabs }
             div { class: "request-panel-controls site-footer",
@@ -301,6 +320,16 @@ fn SiteCssSection(origin: String, tabs: Store<Vec<Tab>>) -> Element {
             div { class: "site-note", "Applied after the page's own styles, on this site only. No script runs." }
         }
     )
+}
+
+/// A storage size (UTF-16 code units, about two bytes each) for reading.
+fn storage_text(units: usize) -> String {
+    match units * 2 {
+        0 => "empty".into(),
+        b if b < 1024 => format!("{b} bytes"),
+        b if b < 1 << 20 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
+    }
 }
 
 /// Save a settings change and re-render the panel.

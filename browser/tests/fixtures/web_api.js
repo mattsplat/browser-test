@@ -15,6 +15,15 @@ add(`cookie:${document.cookie}`);
 document.cookie = 'a=; Max-Age=0';
 add(`cookie:${document.cookie}`);
 
+// Storage: localStorage per origin (kept), sessionStorage per tab. Values are strings.
+localStorage.clear();
+localStorage.setItem('k', 'v');
+localStorage.setItem('n', 2);
+add(`storage:${localStorage.getItem('k')},${localStorage.getItem('n')},${localStorage.getItem('missing')},${localStorage.length},${localStorage.key(0)}`);
+localStorage.removeItem('k');
+sessionStorage.setItem('s', 'tab');
+add(`storage:${localStorage.length},${localStorage.key(0)},${sessionStorage.getItem('s')},${sessionStorage.length}`);
+
 // fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect, a
 // blocked third party, and cross-origin reads that CORS allows (without cookies) or refuses.
 const cross = out.getAttribute('data-cross');

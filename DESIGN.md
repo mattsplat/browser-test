@@ -371,7 +371,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 | `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | Missing | Needs the event loop to wake the pack; time comes from the host (principle 4) |
 | Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). `XMLHttpRequest` and `WebSocket` deferred |
-| Storage: `localStorage`, `sessionStorage`, IndexedDB | Missing | Per origin, and per profile: keep it under `profile::dir()` |
+| Storage: `localStorage`, `sessionStorage`, IndexedDB | Partly | **`localStorage` and `sessionStorage` done** (`storage.rs`; see "Web platform parity notes"). IndexedDB deferred |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
 | `window` and `location`: URL, navigation, `history`, viewport size | Missing | |
@@ -1107,6 +1107,31 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   - A replayed page that then goes live has no network (it has no gate).
   - **XMLHttpRequest deferred:** it isn't cheap on top of fetch (synchronous mode can't work
     on the UI thread, and its event model is its own); new code uses fetch.
+
+**Storage** (`browser/src/storage.rs`, `Obj::Storage`).
+- **`localStorage`:** per profile and origin, one file per origin in the profile's
+  `local-storage/` folder (named by a SHA-256 of the origin, holding the origin to check
+  against), replaced whole on every change. Limit: 5 Mi UTF-16 code units of keys plus values
+  per origin; going over throws `QuotaExceededError` and stores nothing. All `file://` pages
+  share one origin, as for every other per-origin setting. Pages with an opaque origin
+  (about:blank, data:) get `SecurityError`.
+- **`sessionStorage`:** per tab and origin, in memory: the tab's `DocumentLoader` owns it and
+  passes it to each page in `PageEnv`, so it survives reloads and navigations within the tab
+  and goes with the tab. Not restored with the session after a restart.
+- `getItem`, `setItem` (values become strings), `removeItem`, `clear`, `key`, `length`. Keys
+  are kept sorted, so `key(n)` is stable (the order is up to the browser in the spec).
+- **Prelude change:** `key` is a Storage method but an event property, so a single
+  "which names are methods" list couldn't serve both. Storage objects get their own method
+  list in the JS and Python preludes (`STORAGE_METHODS`); everything else is unchanged.
+- **Replay:** every read (`getItem`, `key`, `length`) is on the tape as text; a replay never
+  writes to real storage.
+- **AI:** `Storage.*` calls are hidden in redacted views.
+- **Site panel → Site data:** the origin's local storage size, and "Clear site data", which
+  clears the site's cookies, the origin's local storage and the active tab's session storage.
+- **Limitations and deferred:** no `storage` event between tabs; no named-property access
+  (`localStorage.foo`; use `getItem`); IndexedDB and the Cache API deferred; a Dart page
+  can't catch host errors (a pre-existing gap: they aren't thrown as Dart exceptions), so
+  `QuotaExceededError` ends its current task there.
 
 ## Known local setup notes
 

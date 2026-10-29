@@ -16,6 +16,8 @@ METHODS = {
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
     'fetch', 'then', 'text', 'json', 'get', 'has',
 }
+# Storage's methods. Kept apart because `key` is also a property (of keyboard events).
+STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}
 # Methods that return a host promise, wrapped in `Promise` (below).
 PROMISES = {'fetch', 'text', 'json'}
 
@@ -71,6 +73,7 @@ def request(message, error=RuntimeError):
 class HostObject:
     """A web platform object (window, document, an element, an event) the host holds."""
     __slots__ = ('_handle',)
+    _methods = METHODS
 
     def __init__(self, handle):
         object.__setattr__(self, '_handle', handle)
@@ -80,7 +83,9 @@ class HostObject:
         if name.startswith('_'):
             raise AttributeError(name)
         h = self._handle
-        if name in METHODS:
+        if name in ('localStorage', 'sessionStorage'):
+            return Storage(request({'op': 'get', 'target': h, 'name': name})._handle)
+        if name in self._methods:
             def call(*args):
                 result = request({'op': 'call', 'target': h, 'name': name, 'args': [encode(a) for a in args]})
                 return Promise(result) if name in PROMISES else result
@@ -100,6 +105,12 @@ class HostObject:
 
     def __repr__(self):
         return describe(self)
+
+
+class Storage(HostObject):
+    """localStorage or sessionStorage."""
+    __slots__ = ()
+    _methods = STORAGE_METHODS
 
 
 class Promise:
@@ -123,6 +134,8 @@ window = request({'op': 'global', 'name': 'window'})
 document = request({'op': 'global', 'name': 'document'})
 console = request({'op': 'global', 'name': 'console'})
 Math = request({'op': 'global', 'name': 'Math'})
+localStorage = window.localStorage
+sessionStorage = window.sessionStorage
 
 
 # Timers come from the host, as for every pack. Extra arguments are passed to the callback,
@@ -181,7 +194,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}

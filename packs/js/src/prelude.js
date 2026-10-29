@@ -19,6 +19,9 @@
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
     'fetch', 'text', 'json', 'get', 'has',
   ]);
+  // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
+  const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
+  const STORAGE = new Set(['localStorage', 'sessionStorage']);
   // Methods that return a host promise, which becomes a real JS Promise.
   const PROMISES = new Set(['fetch', 'text']);
 
@@ -70,7 +73,7 @@
   const forget = new FinalizationRegistry((h) => {
     if (wrappers.get(h)?.deref() === undefined) wrappers.delete(h);
   });
-  const wrap = (h) => {
+  const wrap = (h, methods = METHODS) => {
     const existing = wrappers.get(h)?.deref();
     if (existing !== undefined) return existing;
     const proxy = new Proxy({}, {
@@ -80,7 +83,13 @@
         if (typeof prop !== 'string' || prop === 'then') return undefined;
         // Response.json() parses in JS, so the page gets ordinary objects and arrays.
         if (prop === 'json') return () => promised(request({ op: 'call', target: h, name: 'text', args: [] })).then((t) => JSON.parse(t));
-        if (METHODS.has(prop)) {
+        if (STORAGE.has(prop)) {
+          // Wrapped with Storage's methods (not by `decode`, which would wrap it generically).
+          const reply = JSON.parse(__host(JSON.stringify({ op: 'get', target: h, name: prop })));
+          if (reply.err !== undefined) throw new Error(reply.err);
+          return wrap(reply.ok.o, STORAGE_METHODS);
+        }
+        if (methods.has(prop)) {
           return (...args) => {
             const result = request({ op: 'call', target: h, name: prop, args: args.map(encode) });
             return PROMISES.has(prop) ? promised(result) : result;
@@ -115,6 +124,8 @@
   globalThis.cancelAnimationFrame = (handle) => window.cancelAnimationFrame(handle);
   // The network, through the page's gate.
   globalThis.fetch = (input, init) => window.fetch(String(input), init);
+  globalThis.localStorage = window.localStorage;
+  globalThis.sessionStorage = window.sessionStorage;
 
   // Console results, formatted for reading: strings quoted, objects and arrays shown a few
   // levels deep, host objects by what they are. Element names cost two host calls (traced).

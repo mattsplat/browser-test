@@ -9,6 +9,15 @@ def add(line):
     out.textContent = '|'.join(lines)
 
 
+def js(v):
+    """A value as JS would print it."""
+    if v is None:
+        return 'null'
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    return str(v)
+
+
 # Cookies: the page's own, never HttpOnly ones (the test set one from the "server").
 document.cookie = 'a=1'
 document.cookie = 'b=2; Path=/'
@@ -16,6 +25,15 @@ document.cookie = 'sneaky=1; HttpOnly'
 add(f'cookie:{document.cookie}')
 document.cookie = 'a=; Max-Age=0'
 add(f'cookie:{document.cookie}')
+
+# Storage: localStorage per origin (kept), sessionStorage per tab. Values are strings.
+localStorage.clear()
+localStorage.setItem('k', 'v')
+localStorage.setItem('n', 2)
+add(f"storage:{localStorage.getItem('k')},{localStorage.getItem('n')},{js(localStorage.getItem('missing'))},{localStorage.length},{localStorage.key(0)}")
+localStorage.removeItem('k')
+sessionStorage.setItem('s', 'tab')
+add(f"storage:{localStorage.length},{localStorage.key(0)},{sessionStorage.getItem('s')},{sessionStorage.length}")
 
 # fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect, a
 # blocked third party, and cross-origin reads that CORS allows (without cookies) or refuses.
@@ -25,15 +43,6 @@ cross = out.getAttribute('data-cross')
 
 def error_name(e):
     return str(e).split(':')[0]
-
-
-def js(v):
-    """A value as JS would print it."""
-    if v is None:
-        return 'null'
-    if isinstance(v, bool):
-        return 'true' if v else 'false'
-    return str(v)
 
 
 def on_data(r):

@@ -41,12 +41,14 @@ pub enum Read {
     Pause,
     /// `document.cookie` (text: the value is an index into `Recording::texts`).
     Cookie,
+    /// A read of `localStorage` or `sessionStorage`, as JSON (text, like `Cookie`).
+    Storage,
 }
 
 impl Read {
     /// Whether the tape value is an index into the recording's texts.
     fn is_text(self) -> bool {
-        matches!(self, Read::Cookie)
+        matches!(self, Read::Cookie | Read::Storage)
     }
 }
 

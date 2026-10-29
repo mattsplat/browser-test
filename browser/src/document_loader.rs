@@ -62,6 +62,8 @@ pub struct DocumentLoader {
     /// Scroll and form values a hot reload saved, with the URL they belong to; taken by the
     /// tab's next commit (`hot_reload::restore_for`).
     pub restore: RefCell<Option<(Url, crate::hot_reload::PageState)>>,
+    /// The tab's `sessionStorage`, by origin: its pages share it, and it goes with the tab.
+    pub session: crate::storage::Session,
 }
 
 pub fn make_doc_config(
@@ -104,6 +106,7 @@ impl DocumentLoader {
             current_abort: Mutex::new(None),
             record_next: Cell::new(false),
             restore: RefCell::new(None),
+            session: Default::default(),
         }
     }
 
@@ -164,7 +167,7 @@ impl DocumentLoader {
 
                 let record = self.record_next.replace(false);
                 let ((document, page), parsed_title, favicon_url) =
-                    build_page_document(html, config, &net_provider, &signal, record).await;
+                    build_page_document(html, config, &net_provider, &signal, record, self.session.clone()).await;
                 // Armed only for this load: drop it if no pack started to take it.
                 if let (true, Ok(url)) = (record, Url::parse(&base_url)) {
                     replay::take_armed(url.as_str());
@@ -229,6 +232,7 @@ async fn build_page_document(
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
     recording: bool,
+    session: crate::storage::Session,
 ) -> ((SubDocumentAttr, Option<PageRef>), String, Option<String>) {
     let mut document = HtmlDocument::from_html(html, config).into_inner();
     // The site's own stylesheet, if the user gave it one: after the page's, before any script.
@@ -255,7 +259,7 @@ async fn build_page_document(
 
     let page_url = document.url().clone();
     // What the page's code reaches beyond its document: the network, through its gate.
-    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)) };
+    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)), session };
     let Some(src) = dart_script_url(&document) else {
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");

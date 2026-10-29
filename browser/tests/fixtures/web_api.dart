@@ -20,6 +20,16 @@ Future<void> main() async {
   document.cookie = 'a=; Max-Age=0';
   add('cookie:${document.cookie}');
 
+  // Storage: localStorage per origin (kept), sessionStorage per tab. Values are strings.
+  final local = window.localStorage, session = window.sessionStorage;
+  local.clear();
+  local.setItem('k', 'v');
+  local.setItem('n', '2');
+  add('storage:${local.getItem('k')},${local.getItem('n')},${local.getItem('missing')},${local.length},${local.key(0)}');
+  local.removeItem('k');
+  session.setItem('s', 'tab');
+  add('storage:${local.length},${local.key(0)},${session.getItem('s')},${session.length}');
+
   // fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect,
   // a blocked third party, and cross-origin reads that CORS allows (without cookies) or
   // refuses.

@@ -51,6 +51,7 @@ mod request_panel;
 mod settings;
 mod site_css;
 mod site_panel;
+mod storage;
 mod source_map;
 mod trace_panel;
 mod browser_history;

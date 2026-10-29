@@ -168,6 +168,8 @@ pub enum Obj {
     Headers(Rc<Vec<(String, String)>>),
     /// A plain data object or array: one the page built, or parsed JSON (`Response.json()`).
     Json(serde_json::Value),
+    /// `localStorage` (true) or `sessionStorage` (false).
+    Storage(bool),
 }
 
 impl Obj {
@@ -184,6 +186,7 @@ impl Obj {
             Obj::Headers(_) => "Headers",
             Obj::Json(v) if v.is_array() => "Array",
             Obj::Json(_) => "Object",
+            Obj::Storage(_) => "Storage",
         }
     }
 }
@@ -194,6 +197,8 @@ impl Obj {
 pub struct PageEnv {
     /// The gate the page's `fetch` goes through; None: the page has no network.
     pub gate: Option<std::sync::Arc<Gate>>,
+    /// The tab's `sessionStorage` (a fresh one: nothing is shared).
+    pub session: crate::storage::Session,
 }
 
 /// A promise's state: its outcome once settled, and the callbacks waiting for it.
@@ -615,6 +620,44 @@ impl PageHost {
         Self { pack, page, doc, objects, env, rng: seed | 1 }
     }
 
+    /// The origin the page's storage is kept under. Pages with an opaque origin (about:blank,
+    /// data:) have none; `file://` pages share one.
+    fn storage_origin(&self) -> Result<String> {
+        let doc = self.doc.borrow();
+        let url = doc.url();
+        if url.scheme() != "file" && !url.origin().is_tuple() {
+            bail!("SecurityError: storage isn't available on {url}");
+        }
+        Ok(crate::settings::origin_of(url))
+    }
+
+    /// A read of the page's storage, as JSON. It goes on the tape: another tab can change
+    /// local storage at any time.
+    fn storage_read(&mut self, local: bool, f: impl FnOnce(&crate::storage::Area) -> serde_json::Value) -> Result<HostValue> {
+        let origin = self.storage_origin()?;
+        let live = match local {
+            true => crate::storage::local().read(&origin, f),
+            false => f(self.env.session.borrow_mut().entry(origin).or_default()),
+        };
+        let mut objects = self.objects.borrow_mut();
+        let text = objects.tape.read_text(Read::Storage, live.to_string());
+        Ok(objects.from_json(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)))
+    }
+
+    /// A change to the page's storage. A replay changes nothing (its reads come from the tape).
+    fn storage_write(&mut self, local: bool, f: impl FnOnce(&mut crate::storage::Area) -> Result<(), String>) -> Result<HostValue> {
+        let origin = self.storage_origin()?;
+        if self.objects.borrow().tape.replaying() {
+            return Ok(HostValue::Undefined);
+        }
+        match local {
+            true => crate::storage::local().write(&origin, f),
+            false => f(self.env.session.borrow_mut().entry(origin).or_default()),
+        }
+        .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(HostValue::Undefined)
+    }
+
     /// `window.fetch(input, init)`: a promise, settled when the request through the gate
     /// finishes (`RunningPack` delivers it on the UI thread). Replaying, nothing is sent: the
     /// recorded response arrives as a step.
@@ -756,6 +799,9 @@ impl PageHost {
         Ok(match (&obj, prop) {
             (Obj::Window, "document") => self.objects.borrow_mut().singleton("document", Obj::Document),
             (Obj::Window, "console") => self.objects.borrow_mut().singleton("console", Obj::Console),
+            (Obj::Window, "localStorage") => self.objects.borrow_mut().singleton("localStorage", Obj::Storage(true)),
+            (Obj::Window, "sessionStorage") => self.objects.borrow_mut().singleton("sessionStorage", Obj::Storage(false)),
+            (Obj::Storage(local), "length") => self.storage_read(*local, |a| a.len().into())?,
             (Obj::Document, "body") => match self.doc.borrow().query_selector("body").ok().flatten() {
                 Some(id) => self.objects.borrow_mut().element(id),
                 None => HostValue::Null,
@@ -954,6 +1000,23 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Window, "fetch") => self.fetch(args)?,
+            (Obj::Storage(local), "getItem") => {
+                let key = text(0)?;
+                self.storage_read(*local, |a| a.get(&key).into())?
+            }
+            (Obj::Storage(local), "key") => {
+                let index = args.first().and_then(|v| v.as_num()).unwrap_or(0.0);
+                self.storage_read(*local, |a| if index >= 0.0 { a.key(index as usize).into() } else { serde_json::Value::Null })?
+            }
+            (Obj::Storage(local), "setItem") => {
+                let (key, value) = (text(0)?, text(1)?);
+                self.storage_write(*local, |a| a.set(&key, &value))?
+            }
+            (Obj::Storage(local), "removeItem") => {
+                let key = text(0)?;
+                self.storage_write(*local, |a| Ok(a.remove(&key)))?
+            }
+            (Obj::Storage(local), "clear") => self.storage_write(*local, |a| Ok(a.clear()))?,
             (Obj::Promise, "then") => {
                 let HostValue::Object(promise) = target else { bail!("not a promise") };
                 let function = |i: usize| match args.get(i) {

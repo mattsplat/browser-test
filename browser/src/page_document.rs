@@ -1112,6 +1112,8 @@ mod tests {
     const WEB_API_OUTPUT: &[&str] = &[
         "cookie:a=1; b=2",
         "cookie:b=2",
+        "storage:v,2,null,2,k",
+        "storage:1,n,tab,1",
         "fetch:200,true,application/json,null",
         "json:web,3",
         "cookie:b=2; fromserver=1",
@@ -1173,7 +1175,7 @@ mod tests {
 
             replay::arm(url.as_str());
             let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.to_string()), ..Default::default() }).into_inner();
-            let env = PageEnv { gate: Some(gate.clone()) };
+            let env = PageEnv { gate: Some(gate.clone()), ..Default::default() };
             let mut page = match pack {
                 "dart" => crate::dart_pack::start(doc, env, &wasm).unwrap(),
                 "python" => crate::python_pack::start(doc, env, &script("web_api.py", include_str!("../tests/fixtures/web_api.py"))).unwrap(),
@@ -1184,26 +1186,51 @@ mod tests {
             assert_eq!(output(&page).split('|').collect::<Vec<_>>(), WEB_API_OUTPUT, "{pack}: {:?}", errors_on(url.as_str()));
             let recording = page.pack.stop_recording().unwrap();
             assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Cookie), "{pack}: cookie reads are on the tape");
+            assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Storage), "{pack}: storage reads are on the tape");
             assert!(recording.steps.iter().any(|s| matches!(s, replay::Step::Fetch { .. })), "{pack}: responses are steps");
 
             // The jar changes afterwards; the replay still reads what the recording did, sends
             // nothing, and doesn't write to the real jar.
             crate::cookies::jar().set_document_cookie(&url, "b=changed; Path=/");
+            crate::storage::local().write(&origin, |a| a.set("n", "changed")).unwrap();
             let config = DocumentConfig { base_url: Some(url.to_string()), ..Default::default() };
             let (mut replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
             settle_timers(&mut replayed);
             assert_eq!(outcome.diverged, None, "{pack}");
             assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
             assert_eq!(crate::cookies::jar().document_cookie(&url), "b=changed; fromserver=1", "{pack}: the replay left the jar alone");
+            assert_eq!(crate::storage::local().read(&origin, |a| a.get("n")).as_deref(), Some("changed"), "{pack}: and storage");
 
             let full = debug::trace(&origin, debug::Privacy::Full, usize::MAX);
             assert!(full.iter().any(|e| e.call == "Document.cookie" && e.result.contains("b=2")), "{pack}: the user's trace shows it");
             let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
             assert!(redacted.iter().any(|e| e.call == "Document.cookie") && redacted.iter().any(|e| e.call == "Window.fetch"), "{pack}");
+            assert!(full.iter().any(|e| e.call == "Storage.getItem" && e.result == "v"), "{pack}");
             // (What the page itself writes into its DOM is the page's output, and isn't hidden.)
             let secret = |e: &&TraceEntry| debug::holds_secrets(&e.call);
             assert!(redacted.iter().filter(secret).all(|e| e.args == debug::HIDDEN && e.result == debug::HIDDEN), "{pack}: a secret reached the AI's view");
         }
+    }
+
+    /// Storage over the limit throws, as `QuotaExceededError`; a page with no origin has no
+    /// storage; sessionStorage is the tab's (another tab's is separate).
+    #[test]
+    fn storage_quota_origins_and_tabs() {
+        let script = r#"
+            let quota = 'stored';
+            try { localStorage.setItem('big', 'x'.repeat(6 * 1024 * 1024)); } catch (e) { quota = e.message.split(':')[0]; }
+            sessionStorage.setItem('mine', '1');
+            document.querySelector('#out').textContent = quota + ',' + localStorage.getItem('big');
+        "#;
+        let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some("https://quota.test/".into()), ..Default::default() }).into_inner();
+        let scripts = [Script { name: "quota.js".into(), source: script.into(), module: false }];
+        let tab: crate::storage::Session = Default::default();
+        let page = futures_lite_block_on(crate::js_pack::start(doc, PageEnv { session: tab.clone(), ..Default::default() }, &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        assert_eq!(output(&page), "QuotaExceededError,null");
+        assert_eq!(tab.borrow()["https://quota.test"].get("mine").as_deref(), Some("1"), "the tab's session storage");
+
+        let blank = js_page("<p id=out></p>", &["let r = ''; try { localStorage.getItem('x'); } catch (e) { r = e.message.split(':')[0]; } document.querySelector('#out').textContent = r;"]);
+        assert_eq!(output(&blank), "SecurityError");
     }
 
     // ---- Time-travel replay: record a session, replay it in a fresh pack, same DOM.
