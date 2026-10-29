@@ -1,4 +1,5 @@
-//! AI access: a read-only MCP server so an agent can read and debug the browser.
+//! AI access: an MCP server so an agent can read and debug the browser, and, with a separate
+//! permission, control dev-mode sites.
 //!
 //! - Off at every launch; turned on from the menu, and visibly on (a bar with "Turn off").
 //! - Listens on 127.0.0.1 only, and every request needs the token, which is new each time
@@ -7,7 +8,10 @@
 //! - Requests from web pages are refused: they carry an `Origin` header, MCP clients don't.
 //! - Read-only: tabs, a page's outline, console and errors, the trace, and requests. Form
 //!   field values, cookies, headers and URL query values and fragments are never returned.
-//! - Every call appears in the trace (pack "ai").
+//! - AI control is a second switch (menu, or the bar), off at every launch and whenever access
+//!   is turned off. With it on, `eval`, `click` and `reload` work on sites with a dev-mode
+//!   grant while dev mode is on (`control_decision`), and nowhere else.
+//! - Every call appears in the trace (pack "ai"), refused ones as errors.
 //!
 //! The server thread only speaks HTTP and JSON-RPC; each tool call is answered on the UI
 //! thread (the `AiAccess` component), where the tabs and their pages live.
@@ -25,7 +29,8 @@ use serde_json::{Value, json};
 use crate::debug::{self, redact};
 use crate::gate::Gate;
 use crate::host::{self, TraceEntry, TraceKind};
-use crate::tab::{Tab, TabId};
+use crate::settings::{self, Grant, Settings};
+use crate::tab::{Tab, TabId, TabStoreImplExt};
 
 pub const PORT: u16 = 7807;
 
@@ -42,11 +47,40 @@ struct Running {
 
 static QUERIES: OnceLock<tokio::sync::mpsc::UnboundedSender<Query>> = OnceLock::new();
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+/// AI control: write tools on dev-mode sites. Off at launch and whenever access turns off.
+static CONTROL: AtomicBool = AtomicBool::new(false);
 /// Why the server couldn't start, shown in the AI access bar.
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn is_on() -> bool {
     RUNNING.lock().unwrap().is_some()
+}
+
+pub fn control_on() -> bool {
+    CONTROL.load(Ordering::Relaxed)
+}
+
+pub fn set_control(on: bool) {
+    CONTROL.store(on, Ordering::Relaxed);
+}
+
+/// The tools that change a page; each needs `control_decision`'s approval.
+const CONTROL_TOOLS: &[&str] = &["eval", "click", "reload"];
+
+/// AI control's rules, apart from any I/O so they can be tested: a separate switch from
+/// read-only access, and only on sites with a dev-mode grant while dev mode is on (turning
+/// dev mode off disables grants without deleting them).
+fn control_decision(settings: &Settings, control_on: bool, origin: &str) -> Result<(), String> {
+    if !control_on {
+        return Err("AI control is off. The user can turn it on in the browser's menu (AI control).".into());
+    }
+    if !settings.dev_mode {
+        return Err("AI control works only on sites with a dev-mode grant, and dev mode is off.".into());
+    }
+    match settings.dev_grants.get(origin) {
+        Some(Grant::Allow) => Ok(()),
+        _ => Err(format!("AI control works only on sites with a dev-mode grant, and {origin} has none.")),
+    }
 }
 
 pub fn last_error() -> Option<String> {
@@ -88,6 +122,7 @@ pub fn turn_on() {
 
 /// Stop the server and delete the token; connected clients are cut off.
 pub fn turn_off() {
+    set_control(false);
     if let Some(r) = RUNNING.lock().unwrap().take() {
         r.stop.store(true, Ordering::Relaxed);
     }
@@ -234,8 +269,10 @@ fn rpc(message: &Value) -> Option<Value> {
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "browser-test", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "Read-only access to the browser: its tabs, page outlines, console and errors, \
-                the pack trace, and network requests. Form values, cookies, headers and URL query values are hidden.",
+            "instructions": "Read access to the browser: its tabs, page outlines, console and errors, \
+                the pack trace, and network requests. Form values, cookies, headers and URL query values are hidden. \
+                eval, click and reload need AI control, which the user turns on separately, and work only on sites \
+                the user has granted dev mode.",
         }),
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
@@ -266,6 +303,12 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "tab": tab, "limit": limit } } },
         { "name": "requests", "description": "Network requests a tab's site made: allowed or blocked, why, and the third-party site. Query values are hidden.",
           "inputSchema": { "type": "object", "properties": { "tab": tab, "limit": limit } } },
+        { "name": "eval", "description": "Needs AI control and a dev-mode site. Evaluate JavaScript in a tab's page (JS pages only; Dart can't evaluate) and return the result. It reaches the page only through the browser's host, like the page's own code.",
+          "inputSchema": { "type": "object", "properties": { "tab": tab, "expression": { "type": "string" } }, "required": ["expression"] } },
+        { "name": "click", "description": "Needs AI control and a dev-mode site. Click the element a CSS selector matches: the page's click listeners run, as for element.click() (links aren't followed).",
+          "inputSchema": { "type": "object", "properties": { "tab": tab, "selector": { "type": "string" } }, "required": ["selector"] } },
+        { "name": "reload", "description": "Needs AI control and a dev-mode site. Reload a tab (dev-mode Dart source is recompiled).",
+          "inputSchema": { "type": "object", "properties": { "tab": tab } } },
     ])
 }
 
@@ -284,6 +327,7 @@ pub fn AiAccess(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element 
     let gate = use_context::<Arc<Gate>>();
     let mut on = use_signal(is_on);
     let mut error = use_signal(last_error);
+    let mut control = use_signal(control_on);
 
     use_hook(move || {
         let (sender, mut queries) = tokio::sync::mpsc::unbounded_channel::<Query>();
@@ -302,6 +346,9 @@ pub fn AiAccess(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element 
                 if error() != last_error() {
                     error.set(last_error());
                 }
+                if control() != control_on() {
+                    control.set(control_on());
+                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         });
@@ -319,9 +366,18 @@ pub fn AiAccess(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element 
         return rsx!();
     }
     let file = connection_file().map(|p| p.display().to_string()).unwrap_or_default();
+    let control = control();
     rsx!(
         div { class: "prompt-bar ai-bar",
-            span { class: "prompt-text", "AI access is on (read-only) at {url()}. Token in {file}" }
+            span { class: "prompt-text",
+                if control { "AI access is on, with control of dev-mode sites (eval, click, reload)" } else { "AI access is on (read-only)" }
+                " at {url()}. Token in {file}"
+            }
+            div {
+                class: if control { "prompt-button primary" } else { "prompt-button" },
+                onclick: move |_| set_control(!control),
+                if control { "Turn off control" } else { "Allow control" }
+            }
             div { class: "prompt-button", onclick: move |_| turn_off(), "Turn off" }
         }
     )
@@ -340,8 +396,29 @@ fn answer(tool: &str, args: &Value, tabs: Store<Vec<Tab>>, active: TabId, gate: 
     let wanted = args["tab"].as_u64();
     let tab = debug::tab(tabs, active, wanted).ok_or_else(|| format!("no tab {}", wanted.unwrap_or(active)))?;
     let origin = tab.origin();
-    trace_call(tool, format!("tab {}", tab.id), tab.url.as_str());
+    let detail = [&args["expression"], &args["selector"]].iter().find_map(|v| v.as_str()).map(|v| format!(": {v}")).unwrap_or_default();
+    trace_call(tool, format!("tab {}{detail}", tab.id), tab.url.as_str());
+    if CONTROL_TOOLS.contains(&tool) {
+        if let Err(refused) = control_decision(&settings::get(), control_on(), &origin) {
+            host::record(TraceEntry { pack: "ai", kind: TraceKind::Error, page: tab.url.to_string(), call: tool.to_string(), args: format!("tab {}{detail}", tab.id), result: format!("ERROR refused: {refused}"), micros: 0 });
+            return Err(refused);
+        }
+    }
+    let pack = || tab.page.as_ref().and_then(|p| p.pack()).ok_or("no script runs on this page");
     match tool {
+        "eval" => {
+            let expression = args["expression"].as_str().ok_or("eval needs an expression")?;
+            pack()?.eval(expression, "ai").map(|result| json!({ "result": result })).map_err(|e| format!("{e:#}"))
+        }
+        "click" => {
+            let selector = args["selector"].as_str().ok_or("click needs a selector")?;
+            pack()?.click(selector).map(|clicked| json!({ "clicked": clicked })).map_err(|e| format!("{e:#}"))
+        }
+        "reload" => {
+            let store = tabs.iter().find(|t| t.tab_id() == tab.id).ok_or("the tab has closed")?;
+            store.reload();
+            Ok(json!({ "reloading": redact(tab.url.as_str()) }))
+        }
         "read_page" => {
             let page = tab.page.and_then(|p| p.doc()).ok_or("the tab has no page loaded")?;
             let outline = debug::outline(&page.borrow());
@@ -432,7 +509,7 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
         let json: Value = serde_json::from_str(reply.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(json["id"], 7);
-        assert_eq!(json["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(json["result"]["tools"].as_array().unwrap().len(), 8);
     }
 
     #[test]
@@ -442,6 +519,24 @@ mod tests {
         assert!(rpc(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
         let list = rpc(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_tabs", "read_page", "console", "trace", "requests"]);
+        assert_eq!(names, ["list_tabs", "read_page", "console", "trace", "requests", "eval", "click", "reload"]);
     }
+
+    /// Control is its own switch, needs dev mode, and works only where dev mode was granted.
+    #[test]
+    fn control_needs_its_own_switch_dev_mode_and_a_grant() {
+        let mut s = Settings { dev_mode: true, ..Default::default() };
+        s.dev_grants.insert("https://mine.test".into(), Grant::Allow);
+        s.dev_grants.insert("https://blocked.test".into(), Grant::Block);
+        assert!(control_decision(&s, true, "https://mine.test").is_ok());
+        // Off by default: read-only access alone never allows control.
+        assert!(control_decision(&s, false, "https://mine.test").unwrap_err().contains("AI control is off"));
+        // Production sites, blocked sites and sites never asked about are refused.
+        assert!(control_decision(&s, true, "https://bank.example").unwrap_err().contains("has none"));
+        assert!(control_decision(&s, true, "https://blocked.test").is_err());
+        // Dev mode off disables every grant.
+        s.dev_mode = false;
+        assert!(control_decision(&s, true, "https://mine.test").unwrap_err().contains("dev mode is off"));
+    }
+
 }

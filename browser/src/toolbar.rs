@@ -431,7 +431,15 @@ pub fn Toolbar(
                             if crate::ai_access::is_on() { crate::ai_access::turn_off() } else { crate::ai_access::turn_on() }
                             menu_open.set(false);
                         },
-                            if crate::ai_access::is_on() { "AI access: ON (read-only)" } else { "AI access: OFF" }
+                            if crate::ai_access::is_on() { "AI access: ON" } else { "AI access: OFF" }
+                        }
+                        if crate::ai_access::is_on() {
+                            div { class: "menu-item", onclick: move |_| {
+                                crate::ai_access::set_control(!crate::ai_access::control_on());
+                                menu_open.set(false);
+                            },
+                                if crate::ai_access::control_on() { "AI control: ON (dev-mode sites)" } else { "AI control: OFF" }
+                            }
                         }
                         div { class: "menu-item-separator" }
                         div { class: "menu-item", onclick: move |_| nav_about(AboutPage::Settings), "Settings" }

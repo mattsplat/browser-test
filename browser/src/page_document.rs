@@ -14,7 +14,9 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use blitz_dom::{BaseDocument, DocGuard, DocGuardMut, Document, EventDriver, EventHandler, NodeId};
-use blitz_traits::events::{BlitzKeyEvent, BlitzPointerEvent, DomEvent, DomEventData, EventState, UiEvent};
+use blitz_traits::events::{
+    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, DomEvent, DomEventData, EventState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
+};
 use keyboard_types::Modifiers;
 
 use crate::dart_pack::{DartRuntime, HostValue};
@@ -119,6 +121,23 @@ impl RunningPack {
 
     pub fn is_paused(&self) -> bool {
         self.paused.get()
+    }
+
+    /// Click the element `selector` matches, for AI control: the page's click listeners run
+    /// as for `element.click()`, with no default action (a link isn't followed).
+    pub fn click(&self, selector: &str) -> Result<String> {
+        if self.paused.get() {
+            bail!("the page is paused on an exception");
+        }
+        let found = self.doc.borrow().query_selector(selector).map_err(|e| anyhow!("bad selector {selector:?}: {e:?}"))?;
+        let node = found.ok_or_else(|| anyhow!("nothing matches {selector:?}"))?;
+        let chain = self.doc.borrow().node_chain(node);
+        // Like element.click(), a click with no position.
+        let mut event = DomEvent::new(node, click_at(0.0, 0.0, false));
+        let mut doc = self.doc.clone();
+        PackEventHandler { pack: self }.handle_event(&chain, &mut event, &mut doc, &mut EventState::default());
+        self.doc.borrow().shell_provider.request_redraw();
+        Ok(debug::describe(&self.doc.borrow(), node))
     }
 
     /// Let the pack run again after pausing on an exception.
@@ -323,6 +342,21 @@ fn snapshot_if_pausing(pack: &'static str, page: &str, doc: &RefCell<BaseDocumen
     let state = objects.borrow().summary();
     debug::snapshot_exception(pack, page, what, format!("{e:#}"), state, &doc.borrow());
     true
+}
+
+/// A primary-button click at (x, y), with Shift held if `shift`.
+fn click_at(x: f32, y: f32, shift: bool) -> DomEventData {
+    DomEventData::Click(BlitzPointerEvent {
+        id: BlitzPointerId::Mouse,
+        is_primary: true,
+        coords: PointerCoords { page_x: x, page_y: y, screen_x: x, screen_y: y, client_x: x, client_y: y },
+        button: MouseEventButton::Main,
+        buttons: MouseEventButtons::empty(),
+        mods: if shift { Modifiers::SHIFT } else { Modifiers::empty() },
+        details: PointerDetails::default(),
+        element: Default::default(),
+        active_pointers: Default::default(),
+    })
 }
 
 /// The mouse and keyboard details the DOM exposes for an event.
@@ -618,8 +652,8 @@ mod tests {
     // ---- Cross-pack tests: the same page and behaviour in Dart and JS, through the real
     // ---- event dispatch and timer code. Each must produce identical output.
 
-    use blitz_traits::events::{BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, KeyState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails};
-    use keyboard_types::{Code, Key, Location, Modifiers};
+    use blitz_traits::events::KeyState;
+    use keyboard_types::{Code, Key, Location};
 
     const EVENTS_HTML: &str = include_str!("../tests/fixtures/events.html");
 
@@ -632,20 +666,6 @@ mod tests {
                 PackDocument::start_js(doc, &[script], |_| async { anyhow::bail!("no imports") }).await.unwrap()
             }
         }
-    }
-
-    fn click_at(x: f32, y: f32, shift: bool) -> DomEventData {
-        DomEventData::Click(BlitzPointerEvent {
-            id: BlitzPointerId::Mouse,
-            is_primary: true,
-            coords: PointerCoords { page_x: x, page_y: y, screen_x: x, screen_y: y, client_x: x, client_y: y },
-            button: MouseEventButton::Main,
-            buttons: MouseEventButtons::empty(),
-            mods: if shift { Modifiers::SHIFT } else { Modifiers::empty() },
-            details: PointerDetails::default(),
-            element: Default::default(),
-            active_pointers: Default::default(),
-        })
     }
 
     fn key_down(key: &str, code: Code, ctrl: bool) -> DomEventData {
@@ -859,5 +879,20 @@ mod tests {
         page.pack.resume();
         dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
         assert_eq!(output(&page), "clicks 2");
+    }
+
+    /// AI control's click runs the page's listeners like element.click(); its eval is traced
+    /// as the AI's.
+    #[test]
+    fn click_and_eval_for_ai_control() {
+        let page = js_page("<button id=b>go</button><p id=out></p>", &[
+            "document.querySelector('#b').addEventListener('click', () => { document.querySelector('#out').textContent = 'clicked by ai'; });",
+        ]);
+        assert_eq!(page.pack.click("#b").unwrap(), "button#b");
+        assert_eq!(output(&page), "clicked by ai");
+        assert!(page.pack.click("#missing").unwrap_err().to_string().contains("nothing matches"));
+
+        assert_eq!(page.pack.eval("document.querySelector('#out').textContent", "ai").unwrap(), "\"clicked by ai\"");
+        assert!(host::trace().iter().any(|e| e.pack == "ai" && e.call == "eval" && e.result == "\"clicked by ai\""));
     }
 }
