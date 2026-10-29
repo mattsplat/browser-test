@@ -7,7 +7,8 @@ Status: experiment. Current plan: "Roadmap (2026-10-28)". Phases 0–3 built in 
 browser): the gate, the Dart pack (with dev mode and source maps), the JS pack, and the
 per-site policy screen. Phase A is done, Phase B is done apart from breakpoints and DAP
 (the Inspector, AI access and AI control; see "Step 7 notes"), and Phase C is done apart
-from bookmarks (see "Phase C notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+from bookmarks (see "Phase C notes"). Phase D is done: the pack contract is written down in
+`docs/packs.md` and Python is a third pack (see "Phase D notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -79,6 +80,9 @@ JS removed (see `spike/`, comparison images in `spike/out/compare/`).
   A plain `<script>` goes to the JS pack, which runs only if the site's policy allows JS.
 - Reference for wiring a script engine to Blitz's DOM: `blitz-vibey-script` (Boa-based JS)
   in the Blitz repo.
+- **What a pack implements and what the host guarantees** (loading, imports, DOM bindings,
+  callbacks, memory, errors, the time limit, pause and eval, shutdown, isolation) is in
+  `docs/packs.md`. As built, a page runs one pack: the first of Dart, Python and JS.
 
 ### Network chokepoint
 
@@ -292,6 +296,7 @@ palette has no bookmark results), and per-tab back/forward lists across restarts
 Document exactly what a pack implements (initialisation, module loading, imports, DOM
 bindings, callbacks, memory ownership, error reporting, shutdown), then add Python to prove
 a third language needs no core changes. Validate isolation and lifecycle.
+**Done**, see "Phase D notes" and `docs/packs.md`.
 
 **Phase E: advanced**
 Split View, per-site CSS (stored per site, no JS needed), hot reload and state restoration,
@@ -350,12 +355,12 @@ each relates to what's built.
 | Website CSS customization | Medium | Medium | Per-site user stylesheets; would sit alongside the Site panel's per-site settings |
 | Rust/WASM scripting | Specialized | Very high | Partly built: the Dart pack already runs Wasm on the host dispatcher. A Rust pack would need its own way to describe host calls (Rust has no dart2wasm-style import table) |
 | `document.cookie` for Wasm and JS | High | Low–medium | See "Web platform parity": expose the existing cookie jar per origin, hiding `HttpOnly` cookies |
-| Replaceable scripting engine | Specialized | Extremely high | Largely built: language packs (Dart, JS) behind one `Host` interface and `PackRuntime` trait. Swapping or adding an engine is a new pack, not an engine change |
+| Replaceable scripting engine | Specialized | Extremely high | Largely built: language packs (Dart, JS, Python) behind one `Host` interface and `PackRuntime` trait. Adding Python changed no core behaviour (see "Phase D notes") |
 
 ## Web platform parity
 
 What JS can do in a normal browser that the packs can't do here yet (principle 6). Each is
-implemented once in the host (`browser/src/host.rs`), so Dart and JS get it together.
+implemented once in the host (`browser/src/host.rs`), so every pack gets it together.
 
 | Capability | Status | Notes |
 |---|---|---|
@@ -709,6 +714,93 @@ the palette list profiles and open or create one, which starts a new process.
 the panic and checks the outcome after `rebuild_in_place`; the older
 `tab_lens_survives_webview_props_replacement` test in `tab.rs` asserts inside the render
 and so can't fail.
+
+## Phase D notes: the pack contract and a Python pack
+
+**The contract** is written down in `docs/packs.md`. The code now matches it. Each pack has
+one `start` (`dart_pack::start`, `js_pack::start`, `python_pack::start`), built from
+`PackDocument::starting` and `Startup` in `page_document.rs`, which knows no pack by name.
+
+**A Python pack** (`packs/python`, `browser/src/python_pack.rs`):
+- **What it is:** RustPython 0.6 compiled to `wasm32-wasip1`, on the same bridge as JS (one
+  `host.request` JSON import, the same ABI under a `py_` prefix).
+- **The prelude:** `prelude.py` wraps host handles in a `HostObject` with attribute access
+  and method calls. It defines `window`, `document`, `console`, `Math`, the timer functions
+  and `print`.
+- **Pages:** `<script type="text/python">`, inline (dedented) or `src`. All scripts share
+  one namespace.
+- **What works:** errors read as Python tracebacks with file and line. Console eval works
+  (the last statement's `repr`), and so do AI eval, the time limit, pause on exceptions and
+  the trace.
+- **Demo:** `examples/python-counter`.
+
+**Size and speed:**
+- The pack is 13.4 MB of Wasm (Boa is 5.4 MB). Compiled, it's a 28 MB cache file, written
+  atomically and keyed by wasmtime's compatibility hash, like JS's.
+- Compiling it the first time took about 0.5 s on this Mac. After that, a page's
+  interpreter starts in about 25 ms.
+
+**What had to change in the core, and why.** No behaviour changed for Dart or JS, and no
+host operation or dispatch rule changed (`host.rs`'s `PageHost` is untouched). The changes
+are generalisations:
+- **`page_document.rs`:**
+  - `start_dart` and `start_js` became `PackDocument::starting` and `Startup` (`uncaught`,
+    `report`, `snapshot`, `finish`), and each pack's start moved into its own module. Before,
+    a new language meant a new `start_<lang>` in the document code; now it means none.
+  - `PackRuntime` gained `can_eval` (default true; Dart false). It replaces the Inspector's
+    `pack.name == "js"` check, which would have hidden Python's console.
+  - The wasmtime engine and time limit moved here from `dart_pack.rs`, since every pack uses
+    them.
+- **`host.rs`:** `Host` and `HostValue` moved here from `dart_pack.rs`, unchanged.
+- **`interpreter.rs`** (new) is the JS pack's bridge, WASI and module cache, taken out of
+  `js_pack.rs` on the third use, parameterised by a `Language` (label, export prefix,
+  path).
+  - The WASI table gained deny-only functions RustPython's standard Rust library links:
+    `args_*`, `clock_res_get`, and file calls that fail with EBADF, with no preopened
+    directory. They grant nothing; JS doesn't import them.
+- **Registering Python** (outside the core): a branch and script type in
+  `document_loader.rs`, `python_blocked` in settings, a Site panel row, and the Inspector's
+  language name.
+
+**Decisions:**
+- **Python is first-class, like Dart:** it runs by default and is blocked per site in the
+  Site panel ("Python: Allowed/Blocked"). There's no prompt. Principle 1 keeps JS off by
+  default so that the web's incumbent language gets no privilege. Python has no existing
+  pages to run unexpectedly: a page runs Python only because its author wrote
+  `type="text/python"`.
+- **RustPython, not CPython's WASI build:** it builds from crates.io with the same toolchain
+  as the JS pack (no downloaded binaries). It needs no WASI files to start, since it has no
+  stdlib on disk, and links into the same single-import shape. The cost is that RustPython
+  isn't CPython: it's slower, and some behaviour differs.
+- **One pack per page:** Dart first, then Python, then JS. Pages mixing languages would need
+  the host to separate callback ids per pack. Nothing needs it yet.
+- **The interpreter ABI keeps per-language export prefixes** (`js_run`, `py_run`), so the
+  JS engine didn't need rebuilding.
+- **No wrapper cache in Python:** host objects compare with `==`, so nothing holds wrappers
+  alive. JS needs `WeakRef` for the same.
+- **Strict callback arity:** Python listeners must accept the event argument. Python reports
+  a mismatch rather than ignoring it as JS does.
+
+**Isolation and lifecycle**, now tested for every pack:
+- each page has its own instance (`each_page_gets_a_fresh_instance`);
+- Python has no network, files, environment or processes (`python_has_no_side_doors`; it
+  can't import `os`, `socket`, `subprocess` or `ctypes`, and `open` fails);
+- dropping a page drops its DOM, host objects and pack instance
+  (`a_dropped_page_releases_its_pack_and_dom`, for Dart, JS and Python).
+
+**Limitations and deferred:**
+- **No Python standard library** (`json`, `math`, `random`, `re`...): only the interpreter's
+  built-in modules (`sys`, `time`, `itertools`). Use `Math.random()` for randomness. Adding
+  RustPython's native stdlib crate would cost size and needs auditing for host access.
+- **No imports between page files, and no `async`/`await` tied to the event loop.**
+- **Values:** lists and dicts can't be passed to the host (as for JS). Members use Web IDL
+  camelCase names. The prelude's method list must track `host.rs` (as for JS).
+- **Interrupted packs:** a pack the time limit interrupts is stopped for good, as before. A
+  wasm trap other than the time limit (e.g. a guest panic) is reported but doesn't mark the
+  pack stopped. The same is true for JS.
+- **Pinned dependencies:** RustPython's ruff fork crates are held at 0.16.5, because their
+  0.16.10 patch release breaks `rustpython-codegen` 0.6.0. Revisit when RustPython 0.6.1 or
+  later ships.
 
 ## Known local setup notes
 
