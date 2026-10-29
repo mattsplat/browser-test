@@ -374,7 +374,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 |---|---|---|
 | `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | **Done** | Phase A: host-owned timers, woken by the event loop |
-| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). **`WebSocket` done** (text messages, through the gate; see "Web platform parity part 2 notes"). `XMLHttpRequest` deferred |
+| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). **`WebSocket` done** (text messages, through the gate) and **`XMLHttpRequest`** (async only, on fetch's path); see "Web platform parity part 2 notes" |
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | **Done** (subset) | **`localStorage` and `sessionStorage`** (`storage.rs`; see "Web platform parity notes"); **IndexedDB, a useful subset** (`idb.rs`: stores, transactions, put/add/get/delete/getAll/count/clear; no indexes or cursors; see "Web platform parity part 2 notes") |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | **Done** (part 2) | Listeners, details, `preventDefault`, propagation, `popstate`/`hashchange`/`resize`, and form events: `input`, `change`, `submit` (cancellable), `focus`/`blur`; see "Web platform parity part 2 notes" |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | **Done** (part 2) | Queries, tree walking and editing, `classList`, `dataset`, `style`, `innerHTML`/`outerHTML`, `getBoundingClientRect`, `focus`/`blur`, form `value`/`checked`/`disabled`; see "Web platform parity part 2 notes" |
@@ -1148,8 +1148,8 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
     value is collected), so a Dart page's responses live until it goes, within the 256 MB
     bound. `many_fetches_dont_pile_up_host_objects` checks Python and JS.
   - A replayed page that then goes live has no network (it has no gate).
-  - **XMLHttpRequest deferred:** it isn't cheap on top of fetch (synchronous mode can't work
-    on the UI thread, and its event model is its own); new code uses fetch.
+  - **XMLHttpRequest:** async only, built on this path in part 2 (see "Web platform parity
+    part 2 notes").
 
 **Storage** (`browser/src/storage.rs`, `Obj::Storage`).
 - **`localStorage`:** per profile and origin, one file per origin in the profile's
@@ -1460,6 +1460,35 @@ fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
   pixels `toDataURL` encodes aren't premultiplied; translucent colours aren't checked
   against browsers' exact values.
 - **AI:** drawing calls aren't hidden: what a page draws is its output, like its DOM.
+
+**XMLHttpRequest, async only** (cross-pack test `xml_http_request_behaves_the_same_in_dart_js_and_python`,
+fixtures `tests/fixtures/xhr.*`).
+- `new XMLHttpRequest()`, `open(method, url)`, `setRequestHeader`, `send(body)`,
+  `readyState`, `status`, `statusText`, `responseText`/`response` (text), `responseURL`,
+  `getResponseHeader`, `getAllResponseHeaders`, and `readystatechange`, `load`, `error` and
+  `loadend` events (handlers or listeners).
+- **On fetch's path:** `send` makes the same request `fetch` would (`PageHost::fetch`), so the
+  gate, CORS, cookies, redirects, the public-only resolver, the size bounds and replay are
+  all fetch's; the finished fetch, instead of settling a promise, fills in the request and
+  dispatches its events (`Objects::xhr_finished`). A replay delivers it from the recorded
+  `Step::Fetch` without the network.
+- **Synchronous** `open(..., false)` throws `InvalidAccessError`: it would block the UI
+  thread, where pages run. `readyState` goes from 1 straight to 4 (the body arrives whole:
+  no 2 or 3, no `progress`); `responseType` is text only; `abort`, `timeout`, `upload`,
+  `withCredentials` and `overrideMimeType` aren't supported.
+- **AI:** `XMLHttpRequest.*` calls are hidden in redacted views (the test plants a secret in
+  a response body).
+- **Handles:** releasable, but one in flight stays until its events are delivered; its body
+  counts against fetch's 256 MB bound while held.
+
+**Not done (part 2's optional items):**
+- **`await` for Python's fetch:** a coroutine driver in the prelude (stepping a coroutine
+  each time a host promise settles) would do it; deferred, since `then` callbacks work and
+  RustPython's `async` support without asyncio needs checking.
+- **The `storage` event between same-profile tabs:** each tab's page would need to learn of
+  another's local storage writes. That's a process-wide registry of live pages by origin
+  (held weakly) that `storage::Local::write` notifies, plus a queued event per page and a
+  replay step; deferred as new machinery for a rarely used event.
 _object`),
   which IndexedDB uses too.
 

@@ -27,6 +27,7 @@ METHODS = {
     'put', 'delete', 'getAll', 'count', 'clear',
     'getContext', 'toDataURL', 'fillRect', 'strokeRect', 'clearRect', 'beginPath', 'moveTo', 'lineTo',
     'arc', 'rect', 'closePath', 'fill', 'stroke', 'fillText', 'save', 'restore',
+    'XMLHttpRequest', 'setRequestHeader', 'getResponseHeader', 'getAllResponseHeaders',
 }
 # Storage's methods. Kept apart because `key` is also a property (of keyboard events).
 STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}
@@ -259,6 +260,11 @@ def WebSocket(url, protocols=None):
     return window.WebSocket(url, protocols)
 
 
+def XMLHttpRequest():
+    """An XMLHttpRequest (async only), on fetch's path through the gate."""
+    return window.XMLHttpRequest()
+
+
 def print(*args, sep=' ', end='\n', file=None, flush=False):
     console.log(sep.join(str(a) for a in args))
 
@@ -284,7 +290,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'WebSocket', 'indexedDB'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'WebSocket', 'indexedDB', 'XMLHttpRequest'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}

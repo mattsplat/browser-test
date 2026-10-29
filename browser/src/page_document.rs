@@ -571,11 +571,25 @@ impl RunningPack {
     fn deliver_fetches(&self) -> bool {
         let done = self.objects.borrow_mut().take_fetched();
         for (promise, result) in &done {
-            let mut objects = self.objects.borrow_mut();
-            objects.tape.step(|| replay::Step::Fetch { promise: *promise, result: result.clone() });
-            objects.deliver_fetch(*promise, result.clone());
+            self.objects.borrow_mut().tape.step(|| replay::Step::Fetch { promise: *promise, result: result.clone() });
+            self.fetch_finished(*promise, result);
         }
         !done.is_empty()
+    }
+
+    /// A finished fetch: an XMLHttpRequest's events, or its promise settled.
+    fn fetch_finished(&self, promise: u32, result: &Result<crate::gate::FetchResponse, String>) {
+        let xhr = self.objects.borrow_mut().xhr_finished(promise, result);
+        match xhr {
+            Some((xhr, events)) => {
+                for kind in events {
+                    self.dispatch_object(xhr, kind, EventDetails::default());
+                }
+                self.objects.borrow_mut().xhr_delivered(xhr);
+                release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
+            }
+            None => self.objects.borrow_mut().deliver_fetch(promise, result.clone()),
+        }
     }
 
     /// Deliver an event of type `kind` along `chain` (target first, then its ancestors) to
@@ -660,7 +674,7 @@ impl RunningPack {
             }
             replay::Step::Resume => self.paused.set(false),
             replay::Step::Traverse { url, state } => self.move_to(url, state.clone()),
-            replay::Step::Fetch { promise, result } => self.objects.borrow_mut().deliver_fetch(*promise, result.clone()),
+            replay::Step::Fetch { promise, result } => self.fetch_finished(*promise, result),
             replay::Step::Socket { socket, event } => self.socket_event(*socket, event),
             replay::Step::ObjectEvent { target, kind } => self.object_event(*target, kind),
         }
@@ -1132,14 +1146,14 @@ mod tests {
         assert_eq!(text_of(&doc, "#log"), "Click 1, handled in JS (click)Click 2, handled in JS (click)");
     }
 
-    /// JS sees the web platform through the host and nothing else. (`fetch` and `WebSocket`
-    /// exist, but go through the host and the page's gate: see the web API and socket tests.)
+    /// JS sees the web platform through the host and nothing else. (`fetch`, `XMLHttpRequest`
+    /// and `WebSocket` exist, but go through the host and the page's gate: see their tests.)
     #[test]
     fn js_has_no_side_doors() {
         let page = js_page(
             "<p id=out></p>",
             &[r#"
-                const reachable = ['XMLHttpRequest', 'require', 'process', 'Deno', 'Bun']
+                const reachable = ['require', 'process', 'Deno', 'Bun']
                     .filter((name) => typeof globalThis[name] !== 'undefined');
                 const r = Math.random();
                 document.querySelector('#out').textContent = reachable.length + ' ' + (r >= 0 && r < 1);
@@ -1673,6 +1687,10 @@ mod tests {
         // Python frees each NodeList as its wrapper goes.
         let page = python_page("<p></p><p></p>", &["for i in range(200):\n    document.querySelectorAll('p').length"]);
         assert!(page.pack.objects.borrow().live_of("NodeList") <= 1);
+
+        // Synchronous XMLHttpRequest would block the page: refused.
+        let sync = js_page("<p id=out></p>", &["const x = new XMLHttpRequest(); let r = ''; try { x.open('GET', '/x', false); } catch (e) { r = e.message.split(':')[0]; } document.getElementById('out').textContent = r;"]);
+        assert_eq!(output(&sync), "InvalidAccessError");
     }
 
     // ---- Cross-pack: WebSocket (`tests/fixtures/ws.*`), against a local server.
@@ -1997,6 +2015,61 @@ mod tests {
         let at = |x: usize, y: usize| pixels[(y * 100 + x) * 4..][..4].to_vec();
         assert_eq!(at(15, 15), [255, 0, 0, 255], "inside the drawn rectangle");
         assert_eq!(at(5, 5)[..3], [0, 0, 0], "the rest of the canvas is transparent");
+    }
+
+    // ---- Cross-pack: XMLHttpRequest (`tests/fixtures/xhr.*`), against a local server.
+
+    fn xhr_answer(method: &str, path: &str, headers: &str, body: &str) -> (u16, String, String) {
+        match (method, path) {
+            ("GET", "/app/data.json") => (200, "Content-Type: application/json\r\n".into(), r#"{"name":"web","n":3,"token":"S3CRET-BODY"}"#.into()),
+            ("POST", "/app/echo") => {
+                let x_a = headers.lines().find_map(|l| l.strip_prefix("x-a:")).unwrap_or_default().trim();
+                (200, "Content-Type: text/plain\r\n".into(), format!("{method} {body} {x_a}"))
+            }
+            _ => (404, String::new(), "nope".into()),
+        }
+    }
+
+    /// One page using XMLHttpRequest (a GET, a POST with a header and body, a blocked third
+    /// party), the same in every pack, on fetch's path; replayed without the network; the
+    /// body the page never shows doesn't reach the AI's views.
+    #[tokio::test]
+    async fn xml_http_request_behaves_the_same_in_dart_js_and_python() {
+        let base = serve(xhr_answer);
+        let url = format!("{base}app/xhr.html");
+        let origin = crate::settings::origin_of(&blitz_traits::net::Url::parse(&url).unwrap());
+        let gate = Arc::new(crate::gate::Gate::new(Arc::new(blitz_net::Provider::new(None))));
+        let wasm = compile("tests/fixtures/xhr.dart").await;
+        let html = include_str!("../tests/fixtures/xhr.html");
+        let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+        for pack in ["dart", "js", "python"] {
+            replay::arm(&url);
+            let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+            let env = PageEnv { gate: Some(gate.clone()), ..Default::default() };
+            let (mut page, program) = match pack {
+                "dart" => (crate::dart_pack::start(doc, env, &wasm).unwrap(), replay::Program::Dart(wasm.clone())),
+                "python" => {
+                    let scripts = script("xhr.py", include_str!("../tests/fixtures/xhr.py"));
+                    (crate::python_pack::start(doc, env, &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+                }
+                _ => {
+                    let scripts = script("xhr.js", include_str!("../tests/fixtures/xhr.js"));
+                    let page = crate::js_pack::start(doc, env, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                    (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
+                }
+            };
+            page.attach_recording(html, None, program);
+            settle_network(&mut page).await;
+            assert_eq!(output(&page), "state:4|load:200,application/json,true|echo:POST hello b|blocked:0,4|end", "{pack}: {:?}", errors_on(&url));
+            let recording = page.pack.stop_recording().unwrap();
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            assert_eq!(outcome.diverged, None, "{pack}");
+            assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
+            let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+            assert!(redacted.iter().any(|e| e.call == "XMLHttpRequest.responseText"), "{pack}");
+            assert!(redacted.iter().all(|e| !e.args.contains("S3CRET-BODY") && !e.result.contains("S3CRET-BODY")), "{pack}: the body reached the AI's view");
+        }
     }
 
     /// Storage over the limit throws, as `QuotaExceededError`; a page with no origin has no
@@ -2329,8 +2402,8 @@ let count = 0;
         let err = eval("missing.x").unwrap_err().to_string();
         assert!(err.contains("ReferenceError"), "{err}");
 
-        // No side doors from the console either.
-        assert_eq!(eval("typeof XMLHttpRequest").unwrap(), "\"undefined\"");
+        // No side doors from the console either (XMLHttpRequest is the host's, through the gate).
+        assert_eq!(eval("typeof require").unwrap(), "\"undefined\"");
 
         let trace = host::trace();
         assert!(trace.iter().any(|e| e.pack == "console" && e.call == "eval" && e.args == "bump()" && e.result == "42"));
@@ -2585,7 +2658,7 @@ let count = 0;
     fn python_has_no_side_doors() {
         let page = python_page("<p id=out></p>", &[r#"
 reachable = []
-for name in ['XMLHttpRequest', 'require']:
+for name in ['require', 'process']:
     if name in dir(__builtins__) or name in globals():
         reachable.append(name)
 for module in ['os', 'socket', 'subprocess', 'urllib', 'http', 'js', 'pyodide', 'ctypes']:

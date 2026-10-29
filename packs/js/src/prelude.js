@@ -30,6 +30,7 @@
     'put', 'delete', 'getAll', 'count', 'clear',
     'getContext', 'toDataURL', 'fillRect', 'strokeRect', 'clearRect', 'beginPath', 'moveTo', 'lineTo',
     'arc', 'rect', 'closePath', 'fill', 'stroke', 'fillText', 'save', 'restore',
+    'XMLHttpRequest', 'setRequestHeader', 'getResponseHeader', 'getAllResponseHeaders',
   ]);
   // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
   const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
@@ -174,6 +175,13 @@
     }
   };
   Object.assign(globalThis.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+  // `new XMLHttpRequest()` (async only), on fetch's path through the gate.
+  globalThis.XMLHttpRequest = class XMLHttpRequest {
+    constructor() {
+      return window.XMLHttpRequest();
+    }
+  };
+  Object.assign(globalThis.XMLHttpRequest, { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 });
   globalThis.localStorage = window.localStorage;
   globalThis.sessionStorage = window.sessionStorage;
   globalThis.indexedDB = window.indexedDB;

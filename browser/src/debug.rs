@@ -386,8 +386,8 @@ pub const HIDDEN: &str = "(hidden)";
 pub fn holds_secrets(call: &str) -> bool {
     let member = call.trim_end_matches(" =");
     // Plain objects and arrays hold parsed responses, history states and fetch inits.
-    const INTERFACES: [&str; 14] = [
-        "Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array.", "WebSocket.",
+    const INTERFACES: [&str; 15] = [
+        "Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array.", "WebSocket.", "XMLHttpRequest.",
         "IDBFactory.", "IDBRequest.", "IDBDatabase.", "IDBTransaction.", "IDBObjectStore.",
     ];
     INTERFACES.iter().any(|p| member.starts_with(p))

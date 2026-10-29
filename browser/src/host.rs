@@ -212,7 +212,27 @@ pub enum Obj {
     IdbObjectStore { db: String, store: String, tx: Option<u32> },
     /// A `<canvas>`'s 2D context, one per canvas; its drawing is in `Objects::canvases`.
     Canvas2d(NodeId),
+    /// An `XMLHttpRequest` (async only); its state is in `Objects::xhrs`.
+    Xhr,
 }
+
+/// An `XMLHttpRequest`: what `open` and `setRequestHeader` set, then its response.
+#[derive(Default)]
+pub struct Xhr {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    /// `readyState`: 0 unsent, 1 opened, 4 done (2 and 3 aren't reported: the body arrives
+    /// whole).
+    state: u8,
+    response: Option<Rc<FetchResponse>>,
+    /// Sent, and its events not yet delivered: a release waits for them.
+    in_flight: bool,
+    release_when_done: bool,
+}
+
+/// The most XMLHttpRequests a page may hold at once.
+const MAX_XHRS: usize = 64 * 1024;
 
 /// A page's IndexedDB requests and transactions, by handle.
 #[derive(Default)]
@@ -261,7 +281,7 @@ impl Obj {
     /// Objects that get events but aren't nodes: their listeners are in
     /// `Objects::target_listeners`, their `on<event>` handlers in `Objects::handlers`.
     fn is_event_target(&self) -> bool {
-        matches!(self, Obj::WebSocket | Obj::IdbRequest | Obj::IdbTransaction | Obj::IdbDatabase(_))
+        matches!(self, Obj::WebSocket | Obj::IdbRequest | Obj::IdbTransaction | Obj::IdbDatabase(_) | Obj::Xhr)
     }
 
     pub(crate) fn interface(&self) -> &'static str {
@@ -292,6 +312,7 @@ impl Obj {
             Obj::IdbTransaction => "IDBTransaction",
             Obj::IdbObjectStore { .. } => "IDBObjectStore",
             Obj::Canvas2d(_) => "CanvasRenderingContext2D",
+            Obj::Xhr => "XMLHttpRequest",
         }
     }
 }
@@ -454,6 +475,9 @@ pub struct Objects {
     /// What the page's connections received, for the UI thread to deliver.
     pub inbox: crate::websocket::Inbox,
     pub idb: Idb,
+    /// The page's XMLHttpRequests, by handle, and which one each fetch promise answers.
+    pub xhrs: HashMap<u32, Xhr>,
+    pub xhr_of: HashMap<u32, u32>,
     /// Each canvas's 2D drawing, by canvas element (`canvas.rs`).
     pub canvases: HashMap<NodeId, crate::canvas::Canvas>,
     /// Events for objects that aren't nodes the page caused (an IndexedDB request's
@@ -494,6 +518,8 @@ impl Default for Objects {
             inbox: crate::websocket::Inbox { waker, ..Default::default() },
             idb: Idb::default(),
             canvases: HashMap::new(),
+            xhrs: HashMap::new(),
+            xhr_of: HashMap::new(),
             queued_object_events: Vec::new(),
         }
     }
@@ -665,6 +691,13 @@ impl Objects {
             t.release_when_done = true;
             return;
         }
+        if let Some(x) = self.xhrs.get_mut(&handle).filter(|x| x.in_flight) {
+            x.release_when_done = true;
+            return;
+        }
+        if let Some(body) = self.xhrs.remove(&handle).and_then(|x| x.response) {
+            self.body_bytes -= body.body.len().min(self.body_bytes);
+        }
         self.idb.requests.remove(&handle);
         self.idb.transactions.remove(&handle);
         self.idb.upgrading.remove(&handle);
@@ -688,7 +721,7 @@ impl Objects {
     pub fn releasable(&self, handle: u32) -> bool {
         matches!(
             self.objects.get(&handle),
-            Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_) | Obj::NodeList(_) | Obj::IdbRequest | Obj::IdbTransaction | Obj::IdbObjectStore { .. })
+            Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_) | Obj::NodeList(_) | Obj::IdbRequest | Obj::IdbTransaction | Obj::IdbObjectStore { .. } | Obj::Xhr)
         )
     }
 
@@ -872,6 +905,38 @@ impl Objects {
         let done = std::mem::take(&mut *self.fetched.lock().unwrap());
         self.fetching -= done.len().min(self.fetching);
         done
+    }
+
+    /// A finished fetch an XMLHttpRequest sent: keep its response (bounded, as fetch's are)
+    /// and say which events to dispatch: `readystatechange`, then `load` or `error`, then
+    /// `loadend`. None if the fetch wasn't an XMLHttpRequest's.
+    pub fn xhr_finished(&mut self, promise: u32, result: &Result<FetchResponse, String>) -> Option<(u32, [&'static str; 3])> {
+        let xhr = self.xhr_of.remove(&promise)?;
+        self.promises.remove(&promise);
+        self.objects.remove(&promise);
+        let response = match result {
+            Ok(r) if self.body_bytes + r.body.len() <= MAX_HELD_BODIES => {
+                self.body_bytes += r.body.len();
+                Some(Rc::new(r.clone()))
+            }
+            _ => None,
+        };
+        let x = self.xhrs.get_mut(&xhr)?;
+        x.state = 4;
+        let outcome = if response.is_some() { "load" } else { "error" };
+        x.response = response;
+        Some((xhr, ["readystatechange", outcome, "loadend"]))
+    }
+
+    /// After an XMLHttpRequest's events: its listeners go, and if the pack let go of it, so
+    /// does it.
+    pub fn xhr_delivered(&mut self, xhr: u32) {
+        self.forget_target(xhr);
+        let Some(x) = self.xhrs.get_mut(&xhr) else { return };
+        x.in_flight = false;
+        if x.release_when_done {
+            self.release(xhr);
+        }
     }
 
     /// Settle `promise` with a finished fetch: a new `Response`, or a TypeError message.
@@ -1669,6 +1734,27 @@ impl PageHost {
                     _ => bail!("CanvasRenderingContext2D.{prop} is not supported yet"),
                 }
             }
+            (Obj::Xhr, _) => {
+                let HostValue::Object(handle) = target else { bail!("not a request") };
+                let objects = self.objects.borrow();
+                let x = objects.xhrs.get(handle).context("this request is no longer available")?;
+                let r = x.response.as_deref();
+                match prop {
+                    "readyState" => HostValue::Num(x.state as f64),
+                    "status" => HostValue::Num(r.map_or(0, |r| r.status) as f64),
+                    "statusText" => HostValue::str(r.map_or("", |r| r.status_text.as_str())),
+                    "responseText" | "response" => HostValue::str(r.map_or("", |r| r.body.as_str())),
+                    "responseURL" => HostValue::str(r.map_or("", |r| r.url.as_str())),
+                    "responseType" => HostValue::str(""),
+                    "UNSENT" => HostValue::Num(0.0),
+                    "OPENED" => HostValue::Num(1.0),
+                    "HEADERS_RECEIVED" => HostValue::Num(2.0),
+                    "LOADING" => HostValue::Num(3.0),
+                    "DONE" => HostValue::Num(4.0),
+                    p if p.starts_with("on") => HostValue::Null,
+                    _ => bail!("XMLHttpRequest.{prop} is not supported yet"),
+                }
+            }
             (Obj::Window, "indexedDB") => self.objects.borrow_mut().singleton("indexedDB", Obj::IdbFactory),
             (Obj::IdbRequest | Obj::IdbTransaction, _) => {
                 let HostValue::Object(handle) = target else { bail!("not an object") };
@@ -1834,6 +1920,8 @@ impl PageHost {
                 return Ok(());
             }
             (Obj::WebSocket, "binaryType") => return Ok(()),
+            (Obj::Xhr, "responseType") if matches!(value.display().as_str(), "" | "text") => return Ok(()),
+            (Obj::Xhr, "responseType") => bail!("XMLHttpRequest.responseType {:?} is not supported yet (only text)", value.display()),
             (Obj::Canvas2d(id), _) => {
                 let mut objects = self.objects.borrow_mut();
                 let canvas = objects.canvases.get_mut(id).context("this canvas is no longer available")?;
@@ -1976,6 +2064,87 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Window, "WebSocket") => self.web_socket(args)?,
+            (Obj::Window, "XMLHttpRequest") => {
+                let mut objects = self.objects.borrow_mut();
+                if objects.xhrs.len() >= MAX_XHRS {
+                    bail!("the page holds too many XMLHttpRequests");
+                }
+                let handle = objects.add(Obj::Xhr);
+                objects.xhrs.insert(handle, Xhr::default());
+                HostValue::Object(handle)
+            }
+            (Obj::Xhr, "open" | "setRequestHeader" | "getResponseHeader" | "getAllResponseHeaders" | "send") => {
+                let HostValue::Object(handle) = target else { bail!("not a request") };
+                let (state, in_flight) = self.objects.borrow().xhrs.get(handle).map(|x| (x.state, x.in_flight)).context("this request is no longer available")?;
+                match method {
+                    "open" => {
+                        if args.get(2).is_some_and(|a| !matches!(a, HostValue::Undefined) && !a.truthy()) {
+                            bail!("InvalidAccessError: synchronous XMLHttpRequest isn't supported (it would block the page)");
+                        }
+                        let (method, url) = (text(0)?.to_ascii_uppercase(), text(1)?);
+                        let mut objects = self.objects.borrow_mut();
+                        let x = objects.xhrs.get_mut(handle).context("gone")?;
+                        *x = Xhr { method, url, state: 1, ..Default::default() };
+                        HostValue::Undefined
+                    }
+                    "setRequestHeader" => {
+                        if state != 1 || in_flight {
+                            bail!("InvalidStateError: call open() first");
+                        }
+                        let (name, value) = (text(0)?, text(1)?);
+                        self.objects.borrow_mut().xhrs.get_mut(handle).context("gone")?.headers.push((name, value));
+                        HostValue::Undefined
+                    }
+                    "getResponseHeader" | "getAllResponseHeaders" => {
+                        let objects = self.objects.borrow();
+                        let headers = objects.xhrs.get(handle).and_then(|x| x.response.clone()).map(|r| r.headers.clone()).unwrap_or_default();
+                        match method {
+                            "getAllResponseHeaders" => HostValue::str(&headers.iter().map(|(n, v)| format!("{n}: {v}\r\n")).collect::<String>()),
+                            _ => {
+                                let name = text(0)?.to_ascii_lowercase();
+                                let values: Vec<&str> = headers.iter().filter(|(n, _)| *n == name).map(|(_, v)| v.as_str()).collect();
+                                if values.is_empty() { HostValue::Null } else { HostValue::str(&values.join(", ")) }
+                            }
+                        }
+                    }
+                    _ => {
+                        if state != 1 || in_flight {
+                            bail!("InvalidStateError: call open() first");
+                        }
+                        // Sent through fetch's path: the gate, CORS, cookie and redirect rules,
+                        // the bounds, and replay are all fetch's.
+                        let (method_name, url, headers) = {
+                            let objects = self.objects.borrow();
+                            let x = objects.xhrs.get(handle).context("gone")?;
+                            (x.method.clone(), x.url.clone(), x.headers.clone())
+                        };
+                        let mut fields = vec![("method".to_string(), HostValue::str(&method_name))];
+                        let header_fields = headers.into_iter().map(|(n, v)| (n, HostValue::str(&v))).collect();
+                        fields.push(("headers".to_string(), self.object(header_fields)?));
+                        if let Some(body) = args.first().filter(|b| !matches!(b, HostValue::Undefined | HostValue::Null)) {
+                            fields.push(("body".to_string(), HostValue::str(&body.display())));
+                        }
+                        let init = self.object(fields)?;
+                        let promise = self.fetch(&[HostValue::str(&url), init.clone()])?;
+                        if let HostValue::Object(h) = init {
+                            self.objects.borrow_mut().release(h);
+                        }
+                        let HostValue::Object(promise) = promise else { bail!("no promise") };
+                        let mut objects = self.objects.borrow_mut();
+                        objects.xhr_of.insert(promise, *handle);
+                        objects.xhrs.get_mut(handle).context("gone")?.in_flight = true;
+                        // A URL that can't be fetched fails at once, settling the promise: deliver
+                        // it as a finished fetch, as the network would.
+                        let failed = objects.promises.get(&promise).and_then(|p| p.outcome.clone()).filter(|_| !objects.tape.replaying());
+                        if let Some(Err(e)) = failed {
+                            let error = e.display();
+                            objects.fetched.lock().unwrap().push((promise, Err(error)));
+                            objects.fetching += 1;
+                        }
+                        HostValue::Undefined
+                    }
+                }
+            }
             (Obj::Element(id), "getContext") => match (self.is_canvas(*id), text(0)?.as_str()) {
                 (true, "2d") => {
                     let (w, h) = self.canvas_size(*id).unwrap_or((300, 150));
