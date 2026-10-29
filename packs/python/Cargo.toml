@@ -1,0 +1,26 @@
+# The Python language pack's interpreter: RustPython compiled to wasm32-wasip1, run by the
+# browser in wasmtime with the same host as the Dart and JS packs. Build: packs/python/build.sh
+[package]
+name = "python_pack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No default features: no host_env (files, sockets, ctypes), no wasm-bindgen, no docs.
+rustpython-vm = { version = "0.6.0", default-features = false, features = ["compiler", "gc", "serde"] }
+serde_json = "1"
+# rustpython-codegen 0.6.0 doesn't compile against the 0.16.10 releases of RustPython's ruff
+# fork (they changed the AST in a patch release), so hold them at the version it was built with.
+rustpython-ruff_python_ast = "=0.16.5"
+rustpython-ruff_python_parser = "=0.16.5"
+rustpython-ruff_python_trivia = "=0.16.5"
+rustpython-ruff_source_file = "=0.16.5"
+rustpython-ruff_text_size = "=0.16.5"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -3,7 +3,7 @@
 //! - **Elements:** the page's DOM as a tree. Selecting an element shows its attributes, its
 //!   box and key computed styles, and highlights it on the page.
 //! - **Console:** what the page logged and the errors it hit, filterable by level, with an
-//!   input line that evaluates in the page's JS pack (Dart can't evaluate; see `PackRuntime`).
+//!   input line that evaluates in the page's JS or Python pack (Dart can't; see `PackRuntime`).
 //! - **Exceptions:** pause on exceptions, and the snapshots it kept.
 //! - **Network** is the Requests panel.
 //!
@@ -310,6 +310,15 @@ fn node_details(doc: &BaseDocument, id: NodeId) -> Element {
 
 // ---- Console
 
+/// A pack's language, as the console's input line names it.
+fn language(pack: &str) -> &str {
+    match pack {
+        "js" => "JavaScript",
+        "python" => "Python",
+        other => other,
+    }
+}
+
 #[component]
 fn ConsoleView(page: Option<PageRef>, entries: Signal<Vec<ConsoleEntry>>, origin: String) -> Element {
     let mut input = use_signal(String::new);
@@ -344,12 +353,12 @@ fn ConsoleView(page: Option<PageRef>, entries: Signal<Vec<ConsoleEntry>>, origin
             div { class: choice(Show::Logs), onclick: move |_| show.set(Show::Logs), "Logs" }
             div { class: "request-clear", onclick: move |_| host::clear_trace(), "Clear" }
         }
-        match page.as_ref().and_then(|p| p.pack()).map(|p| p.name) {
-            Some("js") => rsx!(
+        match page.as_ref().and_then(|p| p.pack()) {
+            Some(pack) if pack.can_eval() => rsx!(
                 input {
                     class: "console-input",
                     "type": "text",
-                    placeholder: "Evaluate JavaScript in this page (Enter)",
+                    placeholder: "Evaluate {language(pack.name)} in this page (Enter)",
                     value: input(),
                     oninput: move |evt| input.set(evt.value()),
                     onkeydown: move |evt| {

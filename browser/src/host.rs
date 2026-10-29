@@ -16,8 +16,96 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use blitz_dom::{BaseDocument, LocalName, NodeId, QualName, ns};
+use wasmtime::{AnyRef, OwnedRooted};
 
-use crate::dart_pack::{Host, HostValue};
+/// A JS-like value as seen by the host. Lives inside a wasm externref.
+#[derive(Clone, Debug)]
+pub enum HostValue {
+    Str(Vec<u16>),
+    Num(f64),
+    Bool(bool),
+    Undefined,
+    /// JavaScript `null`: a null reference.
+    Null,
+    /// A function the page handed over (a listener, a timer task); fire it with the pack's
+    /// `fire_callback`. The same function always has the same id, so it can be removed.
+    CallbackId(usize),
+    /// A Dart object passed out by reference. The host can hold it and hand it back,
+    /// but not look inside, just as a JS engine treats it.
+    Opaque(OwnedRooted<AnyRef>),
+    /// A host object (document, element, event...), by handle. Only the host knows what it is.
+    Object(u32),
+}
+
+impl HostValue {
+    pub fn str(s: &str) -> Self {
+        HostValue::Str(s.encode_utf16().collect())
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            HostValue::Str(s) => String::from_utf16_lossy(s),
+            HostValue::Num(n) => format_number(*n),
+            HostValue::Bool(b) => b.to_string(),
+            HostValue::Undefined => "undefined".into(),
+            HostValue::Null => "null".into(),
+            HostValue::CallbackId(id) => format!("function#{id}"),
+            HostValue::Opaque(_) => "[dart object]".into(),
+            HostValue::Object(h) => format!("#{h}"),
+        }
+    }
+
+    /// JavaScript truthiness (`!!value`).
+    pub(crate) fn truthy(&self) -> bool {
+        match self {
+            HostValue::Undefined | HostValue::Null => false,
+            HostValue::Bool(b) => *b,
+            HostValue::Num(n) => *n != 0.0 && !n.is_nan(),
+            HostValue::Str(s) => !s.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// JavaScript `===`.
+    pub(crate) fn strict_equals(&self, other: &HostValue) -> bool {
+        match (self, other) {
+            (HostValue::Undefined, HostValue::Undefined) | (HostValue::Null, HostValue::Null) => true,
+            (HostValue::Bool(a), HostValue::Bool(b)) => a == b,
+            (HostValue::Num(a), HostValue::Num(b)) => a == b,
+            (HostValue::Str(a), HostValue::Str(b)) => a == b,
+            (HostValue::Object(a), HostValue::Object(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    pub fn as_num(&self) -> Option<f64> {
+        match self {
+            HostValue::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn format_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e21 { format!("{}", n as i64) } else { format!("{n}") }
+}
+
+/// What the pack can reach outside its sandbox. Every call goes through here, named the way
+/// the web platform names it (`document`, `querySelector`, `textContent`...).
+pub trait Host {
+    /// `globalThis.<name>`, e.g. `document`.
+    fn global(&mut self, name: &str) -> Result<HostValue>;
+    /// `target.<prop>`.
+    fn get(&mut self, target: &HostValue, prop: &str) -> Result<HostValue>;
+    /// `target.<prop> = value`.
+    fn set(&mut self, target: &HostValue, prop: &str, value: &HostValue) -> Result<()>;
+    /// `target.<method>(args)`. Callback arguments arrive as `HostValue::CallbackId`.
+    fn call(&mut self, target: &HostValue, method: &str, args: &[HostValue]) -> Result<HostValue>;
+    /// Dart's `print`.
+    fn console(&mut self, text: &str);
+    /// The current time in milliseconds since the Unix epoch (`Date.now()`).
+    fn now(&mut self) -> f64;
+}
 
 /// Mouse and keyboard details of an event, as the DOM exposes them.
 #[derive(Clone, Debug, Default)]

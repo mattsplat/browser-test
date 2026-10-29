@@ -1,6 +1,12 @@
-//! A page document with a running language pack (Dart or JS). It delivers DOM events to the
-//! listeners the pack registered, runs the pack's timers, and tells the pack when callbacks
-//! are no longer needed. Both packs share the host, so this behaves identically for them.
+//! A page document with a running language pack (Dart, JS or Python). It delivers DOM events
+//! to the listeners the pack registered, runs the pack's timers, and tells the pack when
+//! callbacks are no longer needed. Every pack shares the host, so this behaves identically
+//! for all of them.
+//!
+//! This module is the pack contract (see "Language packs" in DESIGN.md): `PackRuntime` is
+//! what a pack implements; `PackDocument::starting` and `Startup` are how it starts; and the
+//! wasmtime engine and time limit below are what every pack runs under. Nothing here knows
+//! which language a pack is.
 //!
 //! The browser's tools reach a running page through `PageRef`: the Inspector's console
 //! evaluates in its pack, and pause on exceptions stops delivering it events and timers.
@@ -8,9 +14,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context as TaskContext, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use blitz_dom::{BaseDocument, DocGuard, DocGuardMut, Document, EventDriver, EventHandler, NodeId};
@@ -18,46 +24,63 @@ use blitz_traits::events::{
     BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, DomEvent, DomEventData, EventState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
 };
 use keyboard_types::Modifiers;
+use wasmtime::{Config, Engine, Trap};
 
-use crate::dart_pack::{DartRuntime, HostValue};
 use crate::debug;
-use crate::host::{self, EventDetails, Objects, PageHost, TraceEntry, TraceKind};
-use crate::js_pack::JsRuntime;
+use crate::host::{self, EventDetails, HostValue, Objects, PageHost, TraceEntry, TraceKind};
 
-/// What the document needs from a pack.
+/// What the document needs from a pack. Every call runs on the UI thread, one at a time,
+/// under the time limit (`TIME_LIMIT_TICKS`).
 pub trait PackRuntime {
-    /// Call a function the page handed over (a listener, a timer) with `args`.
+    /// Call a function the page handed over (a listener, a timer) with `args`. An error is
+    /// one the page didn't catch, already formatted to read (message, then its stack).
     fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()>;
     /// The host no longer refers to this callback; the pack may free it.
     fn release_callback(&mut self, id: usize);
+    /// Whether `eval` can run console input (a compiled language may ship no compiler).
+    fn can_eval(&self) -> bool {
+        true
+    }
     /// Evaluate console input in the page's running program; the result formatted to read.
     fn eval(&mut self, source: &str) -> Result<String>;
     /// The pack was stopped for running too long and can't run again.
     fn stopped(&self) -> bool;
 }
 
-impl PackRuntime for DartRuntime {
-    fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
-        DartRuntime::fire_callback(self, id, args)
-    }
-    fn release_callback(&mut self, id: usize) {
-        DartRuntime::release_callback(self, id)
-    }
-    fn eval(&mut self, _source: &str) -> Result<String> {
-        bail!("Dart pages can't evaluate code: dart2wasm compiles ahead of time and the page ships no compiler. Inspect the page in Elements, or print from the Dart source.")
-    }
-    fn stopped(&self) -> bool {
-        DartRuntime::stopped(self)
-    }
+/// The wasmtime engine every pack runs on (GC and exceptions enabled), with epoch
+/// interruption so a pack that never returns can be stopped (see `TIME_LIMIT_TICKS`).
+pub(crate) fn engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = Config::new();
+        config.wasm_gc(true).wasm_function_references(true).wasm_exceptions(true).epoch_interruption(true);
+        let engine = Engine::new(&config).expect("wasmtime engine with GC and exceptions");
+        let ticking = engine.clone();
+        std::thread::Builder::new()
+            .name("pack-clock".into())
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticking.increment_epoch();
+            })
+            .expect("failed to spawn the pack clock");
+        engine
+    })
 }
 
-/// A page script for the JS pack: its name (URL, or the page and a position for inline
-/// scripts), its source, and whether it's a module.
-#[derive(Clone, Debug)]
-pub struct JsSource {
-    pub name: String,
-    pub source: String,
-    pub module: bool,
+/// How often the engine's epoch advances.
+const EPOCH_TICK: Duration = Duration::from_millis(100);
+/// How long one call into a pack may run, in ticks: about 5 s (2 s in tests, so the
+/// runaway-script tests stay quick). Packs run on the UI thread, so a call that never
+/// returns would hang the browser. A pack sets this deadline on its store before every call
+/// in, and reports a call that hits it with `RAN_TOO_LONG` and is `stopped` from then on.
+pub(crate) const TIME_LIMIT_TICKS: u64 = if cfg!(test) { 20 } else { 50 };
+
+pub(crate) const RAN_TOO_LONG: &str = "script ran too long and was stopped";
+pub(crate) const STOPPED: &str = "this page's script was stopped after running too long; reload the page to run it again";
+
+/// Whether `err` is the time limit stopping a pack.
+pub(crate) fn interrupted(err: &wasmtime::Error) -> bool {
+    err.downcast_ref::<Trap>() == Some(&Trap::Interrupt)
 }
 
 /// What the browser's tools can reach in a loaded page, without keeping it alive.
@@ -88,7 +111,7 @@ impl PageRef {
 /// A page's running pack and what it shares with the host. The page document owns it; the
 /// browser's tools hold it weakly (see `PageRef`).
 pub struct RunningPack {
-    /// "dart" or "js".
+    /// "dart", "js" or "python".
     pub name: &'static str,
     /// The page's URL, for the trace.
     pub page: String,
@@ -130,6 +153,11 @@ impl RunningPack {
         self.doc.borrow().shell_provider.request_redraw();
         self.arm_timers();
         result
+    }
+
+    /// Whether the console can evaluate input in this page's pack.
+    pub fn can_eval(&self) -> bool {
+        self.runtime.try_borrow().is_ok_and(|r| r.can_eval())
     }
 
     pub fn is_paused(&self) -> bool {
@@ -226,95 +254,72 @@ pub struct PackDocument {
     pack: Rc<RunningPack>,
 }
 
+/// A page whose pack is starting: what its start-up code reports errors to, and what makes
+/// the running page document once the page's code has run (`finish`).
+pub struct Startup {
+    name: &'static str,
+    page: String,
+    doc: Rc<RefCell<BaseDocument>>,
+    objects: Rc<RefCell<Objects>>,
+    /// An error while starting paused the page (pause on exceptions is on).
+    paused: bool,
+}
+
+impl Startup {
+    /// An error the page's code didn't catch (a script, a module): into the trace, and with
+    /// pause on exceptions on, a snapshot; the page pauses once it has started. Like a
+    /// browser, the pack goes on to the page's next script.
+    pub fn uncaught(&mut self, during: &str, args: String, e: &anyhow::Error) {
+        record_error(self.name, &self.page, during.to_string(), args.clone(), e);
+        self.paused |= snapshot_if_pausing(self.name, &self.page, &self.doc, &self.objects, during, args, e);
+    }
+
+    /// An error that isn't the page's code failing (an import that couldn't be fetched): into
+    /// the trace only.
+    pub fn report(&self, during: &str, args: String, e: &anyhow::Error) {
+        record_error(self.name, &self.page, during.to_string(), args, e);
+    }
+
+    /// With pause on exceptions on, a snapshot only, for an error that stops the page from
+    /// starting (the loader traces it and shows it in place of the page).
+    pub fn snapshot(&self, during: &str, args: String, e: &anyhow::Error) {
+        snapshot_if_pausing(self.name, &self.page, &self.doc, &self.objects, during, args, e);
+    }
+
+    /// The running page, with the pack that started on it.
+    pub fn finish(self, runtime: Box<dyn PackRuntime>) -> PackDocument {
+        let pack = RunningPack {
+            name: self.name,
+            page: self.page,
+            doc: self.doc,
+            objects: self.objects,
+            runtime: RefCell::new(runtime),
+            paused: Cell::new(self.paused),
+            waker: Default::default(),
+            timer_thread: Default::default(),
+        };
+        PackDocument { pack: Rc::new(pack) }
+    }
+}
+
 impl PackDocument {
     /// The page and its pack, for the browser's tools.
     pub fn page_ref(&self) -> PageRef {
         PageRef { doc: Rc::downgrade(&self.pack.doc), pack: Some(Rc::downgrade(&self.pack)) }
     }
 
-    /// The page's DOM and the host a pack for it talks to.
-    fn host(doc: BaseDocument, name: &'static str) -> (Rc<RefCell<BaseDocument>>, Rc<RefCell<Objects>>, PageHost) {
+    /// Start pack `name` on the page `doc`: the host the pack talks to (load the pack with
+    /// it), and the `Startup` to report to while the page's code runs. Each page gets its own
+    /// host, objects and pack instance; nothing is shared between pages or packs.
+    pub fn starting(doc: BaseDocument, name: &'static str) -> (PageHost, Startup) {
         let doc = Rc::new(RefCell::new(doc));
         let objects = Rc::new(RefCell::new(Objects::default()));
         let host = PageHost::new(name, doc.clone(), objects.clone());
-        (doc, objects, host)
-    }
-
-    fn running(name: &'static str, page: String, doc: Rc<RefCell<BaseDocument>>, objects: Rc<RefCell<Objects>>, runtime: Box<dyn PackRuntime>, paused: bool) -> Self {
-        let pack = RunningPack { name, page, doc, objects, runtime: RefCell::new(runtime), paused: Cell::new(paused), waker: Default::default(), timer_thread: Default::default() };
-        Self { pack: Rc::new(pack) }
-    }
-
-    /// Load a Dart program against `doc` and run its `main`.
-    pub fn start_dart(doc: BaseDocument, wasm: &[u8]) -> Result<Self> {
-        let (doc, objects, host) = Self::host(doc, "dart");
         let page = host.page.clone();
-        let mut runtime = DartRuntime::load(wasm, Box::new(host))?;
-        if let Err(e) = runtime.run_main() {
-            // The loader traces it and shows it in place of the page; a snapshot keeps the
-            // page's state from just before.
-            snapshot_if_pausing("dart", &page, &doc, &objects, "main", String::new(), &e);
-            return Err(e);
-        }
-        Ok(Self::running("dart", page, doc, objects, Box::new(runtime), false))
-    }
-
-    /// Run a page's scripts with the JS pack: classic scripts in order, then module scripts
-    /// in order (as browsers run deferred modules). A module's imports are fetched with
-    /// `fetch` (the gate, for real pages) until its graph is complete. Like a browser, an
-    /// error in one script is reported (in the trace) and the next still runs; with pause on
-    /// exceptions on, the page pauses once its scripts have run.
-    pub async fn start_js<F, Fut>(doc: BaseDocument, scripts: &[JsSource], mut fetch: F) -> Result<Self>
-    where
-        F: FnMut(String) -> Fut,
-        Fut: std::future::Future<Output = Result<String>>,
-    {
-        let (doc, objects, host) = Self::host(doc, "js");
-        let page = host.page.clone();
-        let mut runtime = JsRuntime::load(Box::new(host))?;
-        let mut paused = false;
-        let mut uncaught = |during: &str, args: String, e: &anyhow::Error| {
-            record_error("js", &page, during.to_string(), args.clone(), e);
-            paused |= snapshot_if_pausing("js", &page, &doc, &objects, during, args, e);
-        };
-        for script in scripts.iter().filter(|s| !s.module) {
-            if let Err(e) = runtime.run(&script.name, &script.source) {
-                uncaught("script", script.name.clone(), &e);
-            }
-        }
-        'modules: for module in scripts.iter().filter(|s| s.module) {
-            runtime.add_module(&module.name, &module.source)?;
-            // Each round fetches every import the engine found missing; a graph is rarely
-            // more than a few levels deep, so this bound only stops a runaway.
-            for _ in 0..64 {
-                let missing = match runtime.discover(&module.name) {
-                    Ok(missing) => missing,
-                    Err(e) => {
-                        uncaught("module", module.name.clone(), &e);
-                        continue 'modules;
-                    }
-                };
-                if missing.is_empty() {
-                    break;
-                }
-                for url in missing {
-                    match fetch(url.clone()).await {
-                        Ok(source) => runtime.add_module(&url, &source)?,
-                        Err(e) => {
-                            // A failed fetch isn't the page's script failing, so no snapshot.
-                            record_error("js", &page, "import".into(), url, &e);
-                            continue 'modules;
-                        }
-                    }
-                }
-            }
-            if let Err(e) = runtime.run_module(&module.name) {
-                uncaught("module", module.name.clone(), &e);
-            }
-        }
-        Ok(Self::running("js", page, doc, objects, Box::new(runtime), paused))
+        (host, Startup { name, page, doc, objects, paused: false })
     }
 }
+
 
 /// Wakes the event loop at the earliest deadline it has been sent.
 fn timer_thread(rx: Receiver<Instant>, waker: Arc<Mutex<Option<Waker>>>) {
@@ -502,6 +507,7 @@ impl EventHandler for PackEventHandler<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::Script;
     use blitz_dom::DocumentConfig;
     use blitz_html::HtmlDocument;
 
@@ -533,7 +539,7 @@ mod tests {
         let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
         let wasm = compile("../examples/counter/main.dart").await;
         let doc = HtmlDocument::from_html(&html, DocumentConfig::default()).into_inner();
-        let page = PackDocument::start_dart(doc, &wasm).unwrap();
+        let page = crate::dart_pack::start(doc, &wasm).unwrap();
         assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Dart is running. No JavaScript on this page.");
 
         // Deliver two clicks the way the event handler does: the button's click listeners,
@@ -559,7 +565,7 @@ mod tests {
     async fn errors_and_stack_traces_show_dart_lines() {
         let wasm = compile("tests/fixtures/throws.dart").await;
         let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
-        let page = PackDocument::start_dart(doc, &wasm).unwrap();
+        let page = crate::dart_pack::start(doc, &wasm).unwrap();
 
         // main() printed StackTrace.current, from line 4.
         let printed = host::trace().into_iter().find(|e| e.call == "console" && e.args.starts_with("stack:")).unwrap();
@@ -576,23 +582,23 @@ mod tests {
     }
 
     fn js_page(html: &str, scripts: &[&str]) -> PackDocument {
-        let scripts: Vec<JsSource> = scripts
+        let scripts: Vec<Script> = scripts
             .iter()
             .enumerate()
-            .map(|(i, s)| JsSource { name: format!("test-{}.js", i + 1), source: s.to_string(), module: false })
+            .map(|(i, s)| Script { name: format!("test-{}.js", i + 1), source: s.to_string(), module: false })
             .collect();
         js_page_with(html, &scripts, &[])
     }
 
     /// A JS page whose module imports resolve from `files` (URL → source).
-    fn js_page_with(html: &str, scripts: &[JsSource], files: &[(&str, &str)]) -> PackDocument {
+    fn js_page_with(html: &str, scripts: &[Script], files: &[(&str, &str)]) -> PackDocument {
         let doc = HtmlDocument::from_html(html, DocumentConfig::default()).into_inner();
         let files: std::collections::HashMap<String, String> = files.iter().map(|(u, s)| (u.to_string(), s.to_string())).collect();
         let fetch = |url: String| {
             let found = files.get(&url).cloned().ok_or_else(|| anyhow::anyhow!("404 {url}"));
             async move { found }
         };
-        futures_lite_block_on(PackDocument::start_js(doc, scripts, fetch)).expect("JS engine missing? run packs/js/build.sh")
+        futures_lite_block_on(crate::js_pack::start(doc, scripts, fetch)).expect("JS engine missing? run packs/js/build.sh")
     }
 
     /// Drive a future that never actually waits (test fetches resolve immediately).
@@ -670,7 +676,7 @@ mod tests {
         assert_eq!(error.page, page.pack.page);
     }
 
-    // ---- Cross-pack tests: the same page and behaviour in Dart and JS, through the real
+    // ---- Cross-pack tests: the same page and behaviour in Dart, JS and Python, through the real
     // ---- event dispatch and timer code. Each must produce identical output.
 
     use blitz_traits::events::KeyState;
@@ -681,10 +687,14 @@ mod tests {
     async fn events_page(pack: &str) -> PackDocument {
         let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig::default()).into_inner();
         match pack {
-            "dart" => PackDocument::start_dart(doc, &compile("tests/fixtures/events.dart").await).unwrap(),
+            "dart" => crate::dart_pack::start(doc, &compile("tests/fixtures/events.dart").await).unwrap(),
+            "python" => {
+                let script = Script { name: "events.py".into(), source: include_str!("../tests/fixtures/events.py").into(), module: false };
+                crate::python_pack::start(doc, &[script]).expect("Python pack missing? run packs/python/build.sh")
+            }
             _ => {
-                let script = JsSource { name: "events.js".into(), source: include_str!("../tests/fixtures/events.js").into(), module: false };
-                PackDocument::start_js(doc, &[script], |_| async { anyhow::bail!("no imports") }).await.unwrap()
+                let script = Script { name: "events.js".into(), source: include_str!("../tests/fixtures/events.js").into(), module: false };
+                crate::js_pack::start(doc, &[script], |_| async { anyhow::bail!("no imports") }).await.unwrap()
             }
         }
     }
@@ -755,9 +765,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_and_timers_behave_the_same_in_dart_and_js() {
+    async fn events_and_timers_behave_the_same_in_dart_js_and_python() {
         let dart = run_events_scenario("dart").await;
         let js = run_events_scenario("js").await;
+        let python = run_events_scenario("python").await;
         let expected_events = [
             "once,click:10,20,0,true",
             "once,click:10,20,0,true,click:1,2,0,false",
@@ -765,7 +776,7 @@ mod tests {
             "once,click:10,20,0,true,click:1,2,0,false,stop,key:a,KeyA,true",
             "once,click:10,20,0,true,click:1,2,0,false,stop,key:a,KeyA,true,stream",
         ];
-        for (pack, steps) in [("Dart", &dart), ("JS", &js)] {
+        for (pack, steps) in [("Dart", &dart), ("JS", &js), ("Python", &python)] {
             assert_eq!(steps[..5], expected_events, "{pack}: events");
             // Independent timers may fire in either order (an overdue interval and a frame), so
             // compare the set; the cancelled timeout must never run.
@@ -791,12 +802,12 @@ mod tests {
         assert!(text_of(&page.pack.doc.borrow(), "#out").contains("test-2.js:1:"));
     }
 
-    fn module(name: &str, source: &str) -> JsSource {
-        JsSource { name: name.into(), source: source.into(), module: true }
+    fn module(name: &str, source: &str) -> Script {
+        Script { name: name.into(), source: source.into(), module: true }
     }
 
-    fn classic(name: &str, source: &str) -> JsSource {
-        JsSource { name: name.into(), source: source.into(), module: false }
+    fn classic(name: &str, source: &str) -> Script {
+        Script { name: name.into(), source: source.into(), module: false }
     }
 
     /// Imports resolve relative to the importing module, every module in the graph is
@@ -971,12 +982,175 @@ mod tests {
     async fn runaway_dart_is_stopped() {
         let wasm = compile("tests/fixtures/spins.dart").await;
         let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
-        let page = PackDocument::start_dart(doc, &wasm).unwrap();
+        let page = crate::dart_pack::start(doc, &wasm).unwrap();
         let (button, id) = listener(&page, "#go", "click");
         let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
         let err = page.pack.fire(id, &[event.clone()]).unwrap_err().to_string();
         assert!(err.contains("script ran too long and was stopped (Dart)"), "{err}");
         let err = page.pack.fire(id, &[event]).unwrap_err().to_string();
         assert!(err.contains("stopped after running too long"), "{err}");
+    }
+
+    // ---- The Python pack: the same contract, a third language.
+
+    fn python_page(html: &str, scripts: &[&str]) -> PackDocument {
+        let doc = HtmlDocument::from_html(html, DocumentConfig::default()).into_inner();
+        let scripts: Vec<Script> = scripts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Script { name: format!("test-{}.py", i + 1), source: s.to_string(), module: false })
+            .collect();
+        crate::python_pack::start(doc, &scripts).expect("Python pack missing? run packs/python/build.sh")
+    }
+
+    /// The Python counter example, end to end: its inline script in the Python pack
+    /// (RustPython in wasm), the same host as Dart and JS, the real Blitz DOM.
+    #[test]
+    fn python_counter_example_runs_and_handles_clicks() {
+        let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/python-counter/index.html")).unwrap();
+        let script = html.split("<script type=\"text/python\">").nth(1).unwrap().split("</script>").next().unwrap();
+        let page = python_page(&html, &[script]);
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Python is running, as a pack in WebAssembly.");
+
+        let (button, id) = listener(&page, "#increment", "click");
+        for _ in 0..2 {
+            let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
+            page.pack.fire(id, &[event]).unwrap();
+        }
+        let doc = page.pack.doc.borrow();
+        assert_eq!(text_of(&doc, "#count"), "2");
+        assert_eq!(text_of(&doc, "#log"), "Click 1, handled in Python (click)Click 2, handled in Python (click)");
+    }
+
+    /// Uncaught Python errors read as Python tracebacks, with file, line and function; the
+    /// bridge's own frames are left out. A failing script doesn't stop the next, and host
+    /// errors reach Python as exceptions it can catch.
+    #[test]
+    fn python_errors_have_tracebacks() {
+        let mut page = python_page("<button id=b>go</button><p id=out></p>", &[
+            "def inner():\n    raise ValueError('python broke')\n\ndef outer():\n    inner()\n\nouter()",
+            "try:\n    document.fooBar()\nexcept AttributeError as e:\n    document.querySelector('#out').textContent = str(e)",
+            "def on_click(e):\n    {}['missing']\ndocument.querySelector('#b').addEventListener('click', on_click)",
+            "def broken(:\n    pass",
+            "def deeper(n):\n    return deeper(n + 1)\ndeeper(0)",
+        ]);
+        let trace = host::trace();
+        let err = |script: &str| trace.iter().find(|e| e.pack == "python" && e.args == script).map(|e| e.result.clone()).unwrap_or_default();
+        let first = err("test-1.py");
+        assert!(first.starts_with("ERROR Uncaught ValueError: python broke"), "{first}");
+        assert!(first.contains("File \"test-1.py\", line 7, in <module>"), "{first}");
+        assert!(first.contains("File \"test-1.py\", line 5, in outer"), "{first}");
+        assert!(first.contains("File \"test-1.py\", line 2, in inner"), "{first}");
+        assert!(!first.contains("prelude"), "{first}");
+        assert!(err("test-4.py").contains("SyntaxError"), "{}", err("test-4.py"));
+        // Runaway recursion is Python's RecursionError (not a crash), its frames summarised.
+        let deep = err("test-5.py");
+        assert!(deep.starts_with("ERROR Uncaught RecursionError") && deep.contains("[Previous line repeated") && deep.len() < 1000, "{deep}");
+        assert_eq!(output(&page), "Document.fooBar is not supported yet");
+
+        // A listener's error, with pause on exceptions: a snapshot with the traceback.
+        debug::set_pause_on_exceptions(true);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        debug::set_pause_on_exceptions(false);
+        assert!(page.pack.is_paused());
+        let origin = crate::settings::origin_of(&blitz_traits::net::Url::parse(&page.pack.page).unwrap());
+        let snap = debug::exceptions(&origin).into_iter().find(|s| s.error.contains("KeyError")).expect("a snapshot");
+        assert_eq!(snap.during, "click listener on button#b");
+        assert!(snap.error.contains("File \"test-3.py\", line 2, in on_click"), "{}", snap.error);
+    }
+
+    /// Console input runs in the page's own namespace, shows results with `repr`, and is
+    /// traced as the console's.
+    #[test]
+    fn python_console_eval_runs_in_the_page() {
+        let page = python_page("<p id=out>start</p>", &["counter = 41\ndef bump():\n    global counter\n    counter += 1\n    return counter"]);
+        let eval = |source: &str| page.pack.eval(source, debug::CONSOLE_PACK);
+        assert!(page.pack.can_eval());
+        assert_eq!(eval("bump()").unwrap(), "42");
+        assert_eq!(eval("x = [1, 'a', None]\nx").unwrap(), "[1, 'a', None]");
+        assert_eq!(eval("document.querySelector('#out').textContent = 'set from the console'").unwrap(), "None");
+        assert_eq!(output(&page), "set from the console");
+        assert_eq!(eval("document.querySelector('#out')").unwrap(), "<p id=\"out\">");
+        assert_eq!(eval("document").unwrap(), "Document");
+        let err = eval("missing.x").unwrap_err().to_string();
+        assert!(err.contains("NameError"), "{err}");
+        let trace = host::trace();
+        assert!(trace.iter().any(|e| e.pack == "console" && e.call == "eval" && e.args == "bump()" && e.result == "42"));
+        assert!(trace.iter().any(|e| e.pack == "console" && e.call == "Element.textContent =" && e.args.ends_with("set from the console")));
+    }
+
+    /// A Python listener that never returns is stopped by the time limit, like JS and Dart.
+    #[test]
+    fn runaway_python_is_stopped() {
+        let mut page = python_page("<button id=b>go</button>", &[
+            "def spin(e):\n    while True:\n        pass\ndocument.querySelector('#b').addEventListener('click', spin)",
+        ]);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        assert!(host::trace().iter().any(|e| e.pack == "python" && e.result.contains("script ran too long and was stopped (Python)")));
+        assert!(page.pack.idle());
+        let err = page.pack.eval("1", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.contains("stopped after running too long"), "{err}");
+    }
+
+    /// Python sees the web platform through the host and nothing else: no network, files,
+    /// environment or processes, and no way to import them.
+    #[test]
+    fn python_has_no_side_doors() {
+        let page = python_page("<p id=out></p>", &[r#"
+reachable = []
+for name in ['fetch', 'XMLHttpRequest', 'require']:
+    if name in dir(__builtins__) or name in globals():
+        reachable.append(name)
+for module in ['os', 'socket', 'subprocess', 'urllib', 'http', 'js', 'pyodide', 'ctypes']:
+    try:
+        __import__(module)
+        reachable.append(module)
+    except ImportError:
+        pass
+try:
+    open('/etc/passwd').read()
+    reachable.append('open')
+except Exception:
+    pass
+r = Math.random()
+document.querySelector('#out').textContent = f'{len(reachable)} {0 <= r < 1} {reachable}'
+"#]);
+        assert_eq!(output(&page), "0 True []");
+        assert!(host::trace().iter().any(|e| e.pack == "python" && e.call == "Math.random"));
+    }
+
+    // ---- Isolation and lifecycle, for every pack.
+
+    /// Each page gets its own instance: a global one page sets isn't there in the next, in
+    /// either language.
+    #[test]
+    fn each_page_gets_a_fresh_instance() {
+        let first = python_page("<p id=out></p>", &["shared = 'leaked'"]);
+        let second = python_page("<p id=out></p>", &["document.querySelector('#out').textContent = str('shared' in globals())"]);
+        assert_eq!(output(&second), "False");
+        drop(first);
+        let first = js_page("<p id=out></p>", &["var shared = 'leaked';"]);
+        let second = js_page("<p id=out></p>", &["document.querySelector('#out').textContent = typeof shared;"]);
+        assert_eq!(output(&second), "undefined");
+        drop(first);
+    }
+
+    /// Closing a tab or navigating drops the page document; the page's DOM, its pack instance
+    /// and the host objects go with it (the tools only ever held them weakly).
+    #[tokio::test]
+    async fn a_dropped_page_releases_its_pack_and_dom() {
+        for pack in ["dart", "js", "python"] {
+            let mut page = events_page(pack).await;
+            dispatch(&mut page, "#button", click_at(0.0, 0.0, false));
+            // Arm the timer thread too, so it has to wind down.
+            page.pack.arm_timers();
+            let page_ref = page.page_ref();
+            let objects = Rc::downgrade(&page.pack.objects);
+            assert!(page_ref.doc().is_some() && page_ref.pack().is_some());
+            drop(page);
+            assert!(page_ref.doc().is_none(), "{pack}: the DOM outlived its page");
+            assert!(page_ref.pack().is_none(), "{pack}: the pack outlived its page");
+            assert!(objects.upgrade().is_none(), "{pack}: the host objects outlived the page");
+        }
     }
 }

@@ -14,11 +14,13 @@ use linebender_resource_handle::Blob;
 use blitz_dom::{BaseDocument, local_name};
 
 use crate::StdNetProvider;
-use crate::page_document::{JsSource, PackDocument, PageRef};
+use crate::interpreter::Script;
+use crate::page_document::{PackDocument, PageRef};
 use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
 use crate::host::{self, TraceEntry, TraceKind};
+use crate::{dart_pack, js_pack, python_pack};
 use crate::js_permission;
 use crate::prompt;
 use crate::settings::{self, Grant};
@@ -204,8 +206,9 @@ impl Drop for DocumentLoader {
 }
 
 /// Build the document for a loaded page, returning the document, its title, and its
-/// favicon URL (if any). A `<script type="application/dart" src="app.wasm">` starts the Dart
-/// pack; any other script is ignored (JS will be a pack too, off by default).
+/// favicon URL (if any). A page runs one pack, the first of: Dart (`<script
+/// type="application/dart" src="app.wasm">`), Python (`<script type="text/python">`), JS
+/// (plain `<script>`, only where JS is allowed). Any other script is ignored.
 async fn build_page_document(
     html: &str,
     config: DocumentConfig,
@@ -222,8 +225,24 @@ async fn build_page_document(
     let origin = settings::origin_of(document.url());
     let page_url = document.url().clone();
     let Some(src) = dart_script_url(&document) else {
-        // No Dart: the page's JS, if any, runs only where JS is allowed.
-        let scripts = js_scripts(&document);
+        // Python, like Dart, runs unless blocked for the site.
+        let scripts = page_scripts(&document, "python");
+        if !scripts.is_empty() {
+            if settings::get().python_blocked.contains(&origin) {
+                trace_pack_load("python", &page_url, &page_url, format!("skipped {} script(s): Python is blocked for {origin}", scripts.len()));
+                return (shown(document), title, favicon_url);
+            }
+            let sources = fetch_sources("python", &scripts, &page_url, net_provider, signal).await;
+            return match python_pack::start(document, &sources) {
+                Ok(python) => (shown_pack(python), title, favicon_url),
+                Err(e) => {
+                    trace_pack_load("python", &page_url, &page_url, format!("ERROR {e:#}"));
+                    ((error_document(&format!("Python pack failed: {e:#}")), None), title, favicon_url)
+                }
+            };
+        }
+        // No Dart or Python: the page's JS, if any, runs only where JS is allowed.
+        let scripts = page_scripts(&document, "js");
         if scripts.is_empty() {
             return (shown(document), title, favicon_url);
         }
@@ -237,7 +256,7 @@ async fn build_page_document(
                 return (shown(document), title, favicon_url);
             }
         }
-        let sources = fetch_js_sources(&scripts, &page_url, net_provider, signal).await;
+        let sources = fetch_sources("js", &scripts, &page_url, net_provider, signal).await;
         // Module imports come through the gate too, as requests from this page.
         let fetch_import = |url: String| {
             let (net, page, signal) = (Arc::clone(net_provider), page_url.clone(), signal.clone());
@@ -247,7 +266,7 @@ async fn build_page_document(
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
         };
-        return match PackDocument::start_js(document, &sources, fetch_import).await {
+        return match js_pack::start(document, &sources, fetch_import).await {
             Ok(js) => (shown_pack(js), title, favicon_url),
             Err(e) => {
                 trace_pack_load("js", &page_url, &page_url, format!("ERROR {e:#}"));
@@ -275,7 +294,7 @@ async fn build_page_document(
             }
         }
     };
-    match PackDocument::start_dart(document, &wasm) {
+    match dart_pack::start(document, &wasm) {
         Ok(dart) => (shown_pack(dart), title, favicon_url),
         // Loading failed partway; the document it was given is gone, so show the error.
         Err(e) => {
@@ -294,28 +313,30 @@ fn trace_pack_load(pack: &'static str, page: &Url, src: &Url, result: String) {
     host::record(TraceEntry { pack, kind, page: page.to_string(), call: "load".into(), args: src.to_string(), result, micros: 0 });
 }
 
-enum JsScript {
+enum PageScript {
     Inline { source: String, module: bool },
     External { url: Url, module: bool },
 }
 
-/// The page's classic and module scripts, in document order.
-fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
+/// The page's scripts for `pack` ("js" or "python"), in document order. For JS that's classic
+/// and module scripts; for Python, `type="text/python"`.
+fn page_scripts(document: &BaseDocument, pack: &str) -> Vec<PageScript> {
     let Ok(nodes) = document.query_selector_all("script") else { return Vec::new() };
     let mut scripts = Vec::new();
     for id in nodes {
         let Some(node) = document.get_node(id) else { continue };
-        let module = match node.attr(local_name!("type")).map(str::trim) {
-            None | Some("") | Some("text/javascript") | Some("application/javascript") => false,
-            Some("module") => true,
+        let module = match (pack, node.attr(local_name!("type")).map(str::trim)) {
+            ("js", None | Some("") | Some("text/javascript") | Some("application/javascript")) => false,
+            ("js", Some("module")) => true,
+            ("python", Some("text/python")) => false,
             _ => continue,
         };
         scripts.push(match node.attr(local_name!("src")) {
             Some(src) => match document.url().join(src) {
-                Ok(url) => JsScript::External { url, module },
+                Ok(url) => PageScript::External { url, module },
                 Err(_) => continue,
             },
-            None => JsScript::Inline { source: node.text_content(), module },
+            None => PageScript::Inline { source: node.text_content(), module },
         });
     }
     scripts
@@ -323,23 +344,23 @@ fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
 
 /// Script sources in order. External scripts come through the gate; one that fails to load
 /// is reported and skipped, as a browser would.
-async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<JsSource> {
+async fn fetch_sources(pack: &'static str, scripts: &[PageScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<Script> {
     let mut sources = Vec::new();
     let mut inline = 0;
     for script in scripts {
         match script {
-            JsScript::Inline { source, module } => {
+            PageScript::Inline { source, module } => {
                 inline += 1;
                 // Inline modules need a URL to resolve relative imports against.
                 let name = match module {
                     true => format!("{}#inline-module-{inline}", page.as_str().split('#').next().unwrap_or_default()),
                     false => format!("{page} (inline script {inline})"),
                 };
-                sources.push(JsSource { name, source: source.clone(), module: *module });
+                sources.push(Script { name, source: source.clone(), module: *module });
             }
-            JsScript::External { url, module } => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
-                Ok((_, bytes)) => sources.push(JsSource { name: url.to_string(), source: String::from_utf8_lossy(&bytes).into_owned(), module: *module }),
-                Err(e) => trace_pack_load("js", page, url, format!("ERROR could not load: {e:?}")),
+            PageScript::External { url, module } => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
+                Ok((_, bytes)) => sources.push(Script { name: url.to_string(), source: String::from_utf8_lossy(&bytes).into_owned(), module: *module }),
+                Err(e) => trace_pack_load(pack, page, url, format!("ERROR could not load: {e:?}")),
             },
         }
     }
@@ -453,6 +474,21 @@ mod tests {
         assert_eq!(dev_mode_decision(&s, "https://new.test"), DevDecision::Ask);
         assert_eq!(dev_mode_decision(&s, "https://ok.test"), DevDecision::Compile);
         assert!(matches!(dev_mode_decision(&s, "https://no.test"), DevDecision::Skip(_)));
+    }
+
+    /// Each pack gets only its own scripts: `text/python` for Python; classic and module
+    /// scripts for JS; other types for nobody.
+    #[test]
+    fn scripts_are_picked_by_type() {
+        let html = r#"<script>js1</script><script type="text/python">py1</script><script type="module">js2</script>
+            <script type="text/python" src="app.py"></script><script type="text/x-template">neither</script>"#;
+        let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some("https://site.test/".into()), ..Default::default() }).into_inner();
+        let names = |pack| page_scripts(&doc, pack).into_iter().map(|s| match s {
+            PageScript::Inline { source, module } => format!("{source}{}", if module { " (module)" } else { "" }),
+            PageScript::External { url, .. } => url.to_string(),
+        }).collect::<Vec<_>>();
+        assert_eq!(names("python"), ["py1", "https://site.test/app.py"]);
+        assert_eq!(names("js"), ["js1", "js2 (module)"]);
     }
 
     #[test]

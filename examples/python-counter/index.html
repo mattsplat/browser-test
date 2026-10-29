@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Python counter</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+    #status { color: #2E7D32; }
+    .counter { display: flex; align-items: center; gap: 16px; margin: 24px 0; }
+    #count { font-size: 48px; font-weight: bold; min-width: 64px; }
+    button { font-size: 16px; padding: 8px 16px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    #log { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Python counter</h1>
+  <p>The same counter as the Dart and JS examples, in Python. Python is a language pack like
+  Dart: it runs by default and can be blocked for a site in the Site panel. The page ships
+  source; the browser runs it with RustPython, compiled to WebAssembly.</p>
+  <p id="status">Python is blocked for this site.</p>
+  <div class="counter">
+    <span id="count">0</span>
+    <button id="increment">Add one</button>
+  </div>
+  <ul id="log"></ul>
+  <script type="text/python">
+    document.querySelector('#status').textContent = 'Python is running, as a pack in WebAssembly.'
+    count = document.querySelector('#count')
+    log = document.querySelector('#log')
+    clicks = 0
+
+    def add_one(event):
+        global clicks
+        clicks += 1
+        count.textContent = str(clicks)
+        item = document.createElement('li')
+        item.textContent = f'Click {clicks}, handled in Python ({event.type})'
+        log.appendChild(item)
+
+    document.querySelector('#increment').addEventListener('click', add_one)
+  </script>
+</body>
+</html>

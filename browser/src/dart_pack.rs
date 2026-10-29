@@ -13,102 +13,14 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use wasmtime::*;
 
+use crate::host::{Host, HostValue, format_number};
+use crate::page_document::{PackDocument, PackRuntime, RAN_TOO_LONG, STOPPED, TIME_LIMIT_TICKS, engine, interrupted};
 use crate::source_map::SourceMap;
-
-/// A JS-like value as seen by the host. Lives inside a wasm externref.
-#[derive(Clone, Debug)]
-pub enum HostValue {
-    Str(Vec<u16>),
-    Num(f64),
-    Bool(bool),
-    Undefined,
-    /// JavaScript `null`: a null reference.
-    Null,
-    /// A function the page handed over (a listener, a timer task); fire it with the pack's
-    /// `fire_callback`. The same function always has the same id, so it can be removed.
-    CallbackId(usize),
-    /// A Dart object passed out by reference. The host can hold it and hand it back,
-    /// but not look inside, just as a JS engine treats it.
-    Opaque(OwnedRooted<AnyRef>),
-    /// A host object (document, element, event...), by handle. Only the host knows what it is.
-    Object(u32),
-}
-
-impl HostValue {
-    pub fn str(s: &str) -> Self {
-        HostValue::Str(s.encode_utf16().collect())
-    }
-
-    pub fn display(&self) -> String {
-        match self {
-            HostValue::Str(s) => String::from_utf16_lossy(s),
-            HostValue::Num(n) => format_number(*n),
-            HostValue::Bool(b) => b.to_string(),
-            HostValue::Undefined => "undefined".into(),
-            HostValue::Null => "null".into(),
-            HostValue::CallbackId(id) => format!("function#{id}"),
-            HostValue::Opaque(_) => "[dart object]".into(),
-            HostValue::Object(h) => format!("#{h}"),
-        }
-    }
-
-    /// JavaScript truthiness (`!!value`).
-    fn truthy(&self) -> bool {
-        match self {
-            HostValue::Undefined | HostValue::Null => false,
-            HostValue::Bool(b) => *b,
-            HostValue::Num(n) => *n != 0.0 && !n.is_nan(),
-            HostValue::Str(s) => !s.is_empty(),
-            _ => true,
-        }
-    }
-
-    /// JavaScript `===`.
-    fn strict_equals(&self, other: &HostValue) -> bool {
-        match (self, other) {
-            (HostValue::Undefined, HostValue::Undefined) | (HostValue::Null, HostValue::Null) => true,
-            (HostValue::Bool(a), HostValue::Bool(b)) => a == b,
-            (HostValue::Num(a), HostValue::Num(b)) => a == b,
-            (HostValue::Str(a), HostValue::Str(b)) => a == b,
-            (HostValue::Object(a), HostValue::Object(b)) => a == b,
-            _ => false,
-        }
-    }
-
-    pub fn as_num(&self) -> Option<f64> {
-        match self {
-            HostValue::Num(n) => Some(*n),
-            _ => None,
-        }
-    }
-}
-
-fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e21 { format!("{}", n as i64) } else { format!("{n}") }
-}
-
-/// What the pack can reach outside its sandbox. Every call goes through here, named the way
-/// the web platform names it (`document`, `querySelector`, `textContent`...).
-pub trait Host {
-    /// `globalThis.<name>`, e.g. `document`.
-    fn global(&mut self, name: &str) -> Result<HostValue>;
-    /// `target.<prop>`.
-    fn get(&mut self, target: &HostValue, prop: &str) -> Result<HostValue>;
-    /// `target.<prop> = value`.
-    fn set(&mut self, target: &HostValue, prop: &str, value: &HostValue) -> Result<()>;
-    /// `target.<method>(args)`. Callback arguments arrive as `HostValue::CallbackId`.
-    fn call(&mut self, target: &HostValue, method: &str, args: &[HostValue]) -> Result<HostValue>;
-    /// Dart's `print`.
-    fn console(&mut self, text: &str);
-    /// The current time in milliseconds since the Unix epoch (`Date.now()`).
-    fn now(&mut self) -> f64;
-}
 
 /// Something the page asked the host to call later.
 #[derive(Clone)]
@@ -138,41 +50,6 @@ struct State {
     source_map: Option<SourceMap>,
     /// The function `build.sh`'s entry point registers to format errors with Dart's toString.
     describe_error: Option<usize>,
-}
-
-/// The wasmtime engine every pack runs on (GC and exceptions enabled), with epoch
-/// interruption so a pack that never returns can be stopped (see `TIME_LIMIT_TICKS`).
-pub(crate) fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let mut config = Config::new();
-        config.wasm_gc(true).wasm_function_references(true).wasm_exceptions(true).epoch_interruption(true);
-        let engine = Engine::new(&config).expect("wasmtime engine with GC and exceptions");
-        let ticking = engine.clone();
-        std::thread::Builder::new()
-            .name("pack-clock".into())
-            .spawn(move || loop {
-                std::thread::sleep(EPOCH_TICK);
-                ticking.increment_epoch();
-            })
-            .expect("failed to spawn the pack clock");
-        engine
-    })
-}
-
-/// How often the engine's epoch advances.
-const EPOCH_TICK: Duration = Duration::from_millis(100);
-/// How long one call into a pack may run, in ticks: about 5 s (2 s in tests, so the
-/// runaway-script tests stay quick). Packs run on the UI thread, so a call that never
-/// returns would hang the browser.
-pub(crate) const TIME_LIMIT_TICKS: u64 = if cfg!(test) { 20 } else { 50 };
-
-pub(crate) const RAN_TOO_LONG: &str = "script ran too long and was stopped";
-pub(crate) const STOPPED: &str = "this page's script was stopped after running too long; reload the page to run it again";
-
-/// Whether `err` is the time limit stopping a pack.
-pub(crate) fn interrupted(err: &wasmtime::Error) -> bool {
-    err.downcast_ref::<Trap>() == Some(&Trap::Interrupt)
 }
 
 impl DartRuntime {
@@ -375,6 +252,37 @@ impl DartRuntime {
             (None, false) => format!("Uncaught Dart error: {}", messages.join(" | ")),
         };
         anyhow!("{headline}\n{}", stack.unwrap_or_default())
+    }
+}
+
+/// Load a Dart program against the page `doc` and run its `main`. An error out of `main`
+/// fails the start: the loader traces it and shows it in place of the page.
+pub fn start(doc: blitz_dom::BaseDocument, wasm: &[u8]) -> Result<PackDocument> {
+    let (host, startup) = PackDocument::starting(doc, "dart");
+    let mut runtime = DartRuntime::load(wasm, Box::new(host))?;
+    if let Err(e) = runtime.run_main() {
+        // A snapshot keeps the page's state from just before.
+        startup.snapshot("main", String::new(), &e);
+        return Err(e);
+    }
+    Ok(startup.finish(Box::new(runtime)))
+}
+
+impl PackRuntime for DartRuntime {
+    fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
+        DartRuntime::fire_callback(self, id, args)
+    }
+    fn release_callback(&mut self, id: usize) {
+        DartRuntime::release_callback(self, id)
+    }
+    fn can_eval(&self) -> bool {
+        false
+    }
+    fn eval(&mut self, _source: &str) -> Result<String> {
+        bail!("Dart pages can't evaluate code: dart2wasm compiles ahead of time and the page ships no compiler. Inspect the page in Elements, or print from the Dart source.")
+    }
+    fn stopped(&self) -> bool {
+        DartRuntime::stopped(self)
     }
 }
 
