@@ -11,7 +11,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 
 use blitz_traits::net::Url;
-use dioxus_native::{NodeHandle, WindowAttributes, prelude::*, use_back_button};
+use dioxus_native::{NodeHandle, WindowAttributes, prelude::*, use_back_button, use_window_event};
+use winit::event::WindowEvent;
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesMacOS;
@@ -57,6 +59,7 @@ mod icons;
 mod nav;
 mod status_bar;
 mod tab;
+mod tab_manager;
 mod tab_strip;
 mod toolbar;
 mod url_suggestions;
@@ -64,8 +67,9 @@ mod url_suggestions;
 use about_pages::AboutPage;
 use browser_history::{BrowsingHistory, HistoryService, HistoryStore, MAX_HISTORY_ENTRIES};
 use status_bar::StatusBar;
-use tab::{Tab, TabId, TabStoreImplExt, TabWebView, active_tab, open_tab, tab_display_title};
-use tab_strip::TabStrip;
+use tab::{Tab, TabId, TabStoreImplExt, TabWebView, active_tab, tab_display_title};
+use tab_manager::TabManager;
+use tab_strip::{TabStrip, VerticalTabs};
 use toolbar::Toolbar;
 use url_suggestions::provide_url_suggester;
 #[cfg(target_os = "windows")]
@@ -172,20 +176,53 @@ fn app() -> Element {
     use_context_provider(|| history_service.clone());
     provide_url_suggester(browsing_history);
 
-    let tabs: Store<Vec<Tab>> = use_store(Vec::new);
-    let mut active_tab_id: Signal<TabId> = use_hook(|| {
-        let first_tab_url = cli_initial_url.clone().unwrap_or_else(|| home_url.clone());
-        let tab = open_tab(tabs, first_tab_url, net_provider.clone());
-        Signal::new(tab.tab_id())
+    // Tabs, pins and spaces, reopened from the last session.
+    let mut manager = use_context_provider(|| {
+        TabManager::restore(net_provider.clone(), cli_initial_url.clone(), home_url.clone())
     });
+    tab_manager::use_tab_upkeep(manager);
+    let tabs: Store<Vec<Tab>> = manager.tabs;
+    let active_tab_id: Signal<TabId> = manager.active_tab_id;
 
     let open_new_tab = use_callback(move |url: Url| {
-        let new_id = open_tab(tabs, url, net_provider.clone());
-        active_tab_id.set(new_id.tab_id());
+        let new_id = manager.open_tab(url);
+        manager.activate(new_id);
         if let Some(handle) = url_input_handle() {
             drop(handle.set_focus(true));
         }
     });
+
+    let open_panel: Signal<Panel> = use_signal(|| Panel::None);
+
+    // Keyboard shortcuts (Cmd on macOS, Ctrl elsewhere): T new tab, W close tab,
+    // Shift+T reopen the last closed tab.
+    {
+        let home_url = home_url.clone();
+        let mut modifiers = ModifiersState::empty();
+        use_window_event(move |event, _target| match event {
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                modifiers = new_modifiers.state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let shortcut_modifier = if cfg!(target_os = "macos") {
+                    modifiers.meta_key()
+                } else {
+                    modifiers.control_key()
+                };
+                if !shortcut_modifier || !event.state.is_pressed() {
+                    return;
+                }
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyT) if modifiers.shift_key() => manager.reopen_closed(None),
+                    PhysicalKey::Code(KeyCode::KeyT) => open_new_tab(home_url.clone()),
+                    // Keep at least one tab open, matching the close button.
+                    PhysicalKey::Code(KeyCode::KeyW) => manager.close(active_tab_id()),
+                    _ => {}
+                }
+            }
+            _ => {}
+        });
+    }
 
     // Navigate back in the active tab's history when the (Android) hardware
     // back button is pressed. `go_back` is a no-op when there is no history to
@@ -208,7 +245,6 @@ fn app() -> Element {
     };
 
     let show_fps: Signal<bool> = use_signal(|| false);
-    let open_panel: Signal<Panel> = use_signal(|| Panel::None);
 
     let fps_overlay_el = rsx!(if show_fps() {
         fps_overlay::FpsOverlay {}
@@ -220,48 +256,57 @@ fn app() -> Element {
         window_title = format!("{window_title} — {}", profile::name());
     }
 
+    let vertical = (manager.vertical)();
+    let frame_class = match (IS_MOBILE, vertical) {
+        (true, _) => "mobile",
+        (false, true) => "vertical",
+        (false, false) => "",
+    };
+
     rsx!(
         div {
             id: "frame",
             style: "--safe-area-top: {TOP_PAD}; padding-top: {TOP_PAD}; padding-bottom: {BOTTOM_PAD};",
-            class: if IS_MOBILE { "mobile" } else { "" },
+            class: frame_class,
             title { "{window_title}" }
             document::Link { rel: "stylesheet", href: BROWSER_UI_STYLES }
-            TabStrip {
-                tabs,
-                active_tab_id,
-                home_url,
-                open_new_tab,
+            if vertical {
+                VerticalTabs { home_url: home_url.clone(), open_new_tab }
             }
-            Toolbar {
-                url_input_handle,
-                url_input_value,
-                tabs,
-                active_tab_id,
-                open_new_tab,
-                show_fps,
-                open_panel,
-            }
-            prompt::PromptBar {}
-            js_permission::JsBar { tabs, active_tab_id }
-            ai_access::AiAccess { tabs, active_tab_id }
-            for tab in tabs.iter() {
-                TabWebView {
-                    key: "{tab.tab_id()}",
-                    tabs,
-                    tab_id: tab.tab_id(),
-                    active_tab_id,
+            div { class: "chrome-column",
+                if !vertical {
+                    TabStrip { home_url, open_new_tab }
                 }
+                Toolbar {
+                    url_input_handle,
+                    url_input_value,
+                    tabs,
+                    active_tab_id,
+                    open_new_tab,
+                    show_fps,
+                    open_panel,
+                }
+                prompt::PromptBar {}
+                js_permission::JsBar { tabs, active_tab_id }
+                ai_access::AiAccess { tabs, active_tab_id }
+                for tab in tabs.iter() {
+                    TabWebView {
+                        key: "{tab.tab_id()}",
+                        tabs,
+                        tab_id: tab.tab_id(),
+                        active_tab_id,
+                    }
+                }
+                {fps_overlay_el}
+                match open_panel() {
+                    Panel::Requests => rsx!(request_panel::RequestPanel {}),
+                    Panel::Trace => rsx!(trace_panel::TracePanel { tabs, active_tab_id }),
+                    Panel::Site => rsx!(site_panel::SitePanel { tabs, active_tab_id }),
+                    Panel::Inspect => rsx!(inspector::Inspector { tabs, active_tab_id, open_panel }),
+                    Panel::None => rsx!(),
+                }
+                StatusBar { tabs, active_tab_id }
             }
-            {fps_overlay_el}
-            match open_panel() {
-                Panel::Requests => rsx!(request_panel::RequestPanel {}),
-                Panel::Trace => rsx!(trace_panel::TracePanel { tabs, active_tab_id }),
-                Panel::Site => rsx!(site_panel::SitePanel { tabs, active_tab_id }),
-                Panel::Inspect => rsx!(inspector::Inspector { tabs, active_tab_id, open_panel }),
-                Panel::None => rsx!(),
-            }
-            StatusBar { tabs, active_tab_id }
         }
     )
 }

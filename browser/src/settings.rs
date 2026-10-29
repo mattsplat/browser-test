@@ -64,6 +64,10 @@ pub struct Settings {
     pub block_third_party: bool,
     /// Other sites (registrable domains) each origin may reach.
     pub allowed_third_party: BTreeMap<String, BTreeSet<String>>,
+    /// Tabs in a sidebar on the left instead of a strip along the top.
+    pub vertical_tabs: bool,
+    /// Close unpinned tabs left alone this many hours; None (`null`) never closes them.
+    pub close_idle_tabs_hours: Option<u32>,
 }
 
 impl Default for Settings {
@@ -78,6 +82,8 @@ impl Default for Settings {
             // Default-deny for third-party requests, as the design says.
             block_third_party: true,
             allowed_third_party: BTreeMap::new(),
+            vertical_tabs: false,
+            close_idle_tabs_hours: Some(12),
         }
     }
 }
@@ -120,5 +126,26 @@ pub fn origin_of(url: &blitz_traits::net::Url) -> String {
     match url.scheme() {
         "file" => "file://".into(),
         _ => url.origin().ascii_serialization(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_saved_before_new_fields_keep_their_values_and_get_defaults() {
+        // A settings.json from before tab settings existed.
+        let old = r#"{"dev_mode":true,"js_sites":["https://a.test"],"block_third_party":false}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(s.dev_mode && !s.block_third_party);
+        assert!(s.js_sites.contains("https://a.test"));
+        assert!(!s.vertical_tabs);
+        assert_eq!(s.close_idle_tabs_hours, Some(12));
+        // `null` is how "never close idle tabs" is saved.
+        let off: Settings = serde_json::from_str(r#"{"close_idle_tabs_hours":null}"#).unwrap();
+        assert_eq!(off.close_idle_tabs_hours, None);
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(round.close_idle_tabs_hours, None);
     }
 }

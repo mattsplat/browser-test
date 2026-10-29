@@ -1,5 +1,6 @@
 use std::{
     rc::Rc,
+    time::SystemTime,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -37,6 +38,12 @@ pub struct Tab {
     pub html_source: String,
     pub title: String,
     pub favicon_url: Option<Url>,
+    /// Pinned tabs come first, show in every space and are never closed automatically.
+    pub pinned: bool,
+    /// The space (named group) the tab belongs to; see `tab_manager.rs`.
+    pub space: String,
+    /// When the user last left this tab (or opened it), for closing idle tabs.
+    pub last_active: SystemTime,
 }
 
 #[store(pub)]
@@ -91,6 +98,7 @@ pub fn open_tab(
     mut tabs: Store<Vec<Tab>>,
     url: Url,
     net_provider: Arc<StdNetProvider>,
+    space: String,
 ) -> Store<Tab, impl Writable<Target = Tab> + Copy> {
     let id = next_tab_id();
     let initial_request = Request::get(url);
@@ -106,6 +114,9 @@ pub fn open_tab(
         html_source: String::new(),
         title: String::new(),
         favicon_url: None,
+        pinned: false,
+        space,
+        last_active: SystemTime::now(),
     });
 
     // We just pushed; the last element is the tab we want.
@@ -321,6 +332,9 @@ mod tests {
                     html_source: String::new(),
                     title: String::new(),
                     favicon_url: None,
+                    pinned: false,
+                    space: String::new(),
+                    last_active: SystemTime::now(),
                 }]
             });
             let active_tab_id = use_signal(|| 0);

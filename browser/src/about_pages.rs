@@ -195,6 +195,15 @@ fn SettingsPage() -> Element {
     let mut message = use_signal(|| None::<String>);
     let _ = changes();
 
+    let mut manager = use_context::<crate::tab_manager::TabManager>();
+    let vertical = (manager.vertical)();
+    let idle_hours = crate::settings::get().close_idle_tabs_hours;
+    let idle_text = match idle_hours {
+        None => "Never".to_string(),
+        Some(h) if h % 24 == 0 => format!("After {} day{}", h / 24, if h == 24 { "" } else { "s" }),
+        Some(h) => format!("After {h} hour{}", if h == 1 { "" } else { "s" }),
+    };
+
     let current = crate::profile::name();
     let profiles = crate::profile::list();
     let open_profile = use_callback(move |name: String| {
@@ -209,6 +218,26 @@ fn SettingsPage() -> Element {
         document::Link { rel: "stylesheet", href: HISTORY_CSS }
         div { class: "about-history about-settings",
             div { class: "toolbar", h1 { "Settings" } }
+            h2 { "Tabs" }
+            ul {
+                li { class: "setting-row",
+                    span { class: "setting-label", "Tab layout" }
+                    button { class: "clear-btn", onclick: move |_| manager.set_vertical(!vertical),
+                        if vertical { "Vertical (sidebar)" } else { "Horizontal (strip)" }
+                    }
+                }
+                li { class: "setting-row",
+                    span { class: "setting-label", "Close tabs left alone (pinned tabs stay)" }
+                    button {
+                        class: "clear-btn",
+                        onclick: move |_| {
+                            crate::settings::update(|s| s.close_idle_tabs_hours = next_idle_limit(s.close_idle_tabs_hours));
+                            changes += 1;
+                        },
+                        "{idle_text}"
+                    }
+                }
+            }
             h2 { "Profiles" }
             p { class: "setting-note",
                 "Each profile has its own cookies, history, open tabs and site permissions, and opens in its own window. This window is "
@@ -258,6 +287,14 @@ fn SettingsPage() -> Element {
     }
 }
 
+/// The choices for closing idle tabs, in the order the button cycles through them.
+const IDLE_LIMITS: [Option<u32>; 7] = [Some(1), Some(4), Some(12), Some(24), Some(72), Some(168), None];
+
+fn next_idle_limit(current: Option<u32>) -> Option<u32> {
+    let idx = IDLE_LIMITS.iter().position(|&l| l == current).map_or(0, |i| i + 1);
+    IDLE_LIMITS[idx % IDLE_LIMITS.len()]
+}
+
 #[component]
 fn StubPage(name: &'static str) -> Element {
     rsx! {
@@ -284,6 +321,20 @@ mod tests {
             let url = Url::parse(path).unwrap();
             assert_eq!(AboutPage::from_url(&url), Some(expected), "{path}");
         }
+    }
+
+    #[test]
+    fn idle_limit_cycles_through_every_choice_and_off() {
+        let mut seen = vec![];
+        let mut limit = Some(12);
+        for _ in 0..IDLE_LIMITS.len() {
+            limit = next_idle_limit(limit);
+            seen.push(limit);
+        }
+        assert_eq!(limit, Some(12), "back where it started");
+        assert!(seen.contains(&None), "off is one of the choices");
+        // A value edited by hand into settings.json restarts the cycle.
+        assert_eq!(next_idle_limit(Some(5)), Some(1));
     }
 
     #[test]

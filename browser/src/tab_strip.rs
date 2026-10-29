@@ -1,108 +1,140 @@
+//! The tab list, as a strip along the top or a sidebar on the left (Settings → vertical
+//! tabs). Both show the current space's tabs with pinned tabs first and compact, the space
+//! switcher (when there's more than one space) and a new tab button. Tab operations are in
+//! `tab_manager.rs`.
+
 use blitz_traits::net::Url;
 use dioxus_native::prelude::*;
-use dioxus_native::use_window_event;
-use winit::event::WindowEvent;
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
-use crate::tab::{Favicon, Tab, TabId, TabStoreExt, TabStoreImplExt, tab_display_title};
+use crate::tab::{Favicon, TabId, TabStoreExt, TabStoreImplExt, tab_display_title};
+use crate::tab_manager::TabManager;
 
 #[cfg(target_os = "macos")]
 const TABSTRIP_CLASS: &str = "tabstrip merged-titlebar";
 #[cfg(not(target_os = "macos"))]
 const TABSTRIP_CLASS: &str = "tabstrip";
 
+#[cfg(target_os = "macos")]
+const VTABS_CLASS: &str = "vtabs merged-titlebar";
+#[cfg(not(target_os = "macos"))]
+const VTABS_CLASS: &str = "vtabs";
+
 #[component]
-pub fn TabStrip(
-    mut tabs: Store<Vec<Tab>>,
-    active_tab_id: Signal<TabId>,
-    home_url: Url,
-    open_new_tab: Callback<Url>,
-) -> Element {
-    let switch_tab = use_callback(move |id: TabId| {
-        active_tab_id.set(id);
-    });
-
-    let close_tab = use_callback(move |id: TabId| {
-        let current_active = active_tab_id();
-        let idx = tabs.iter().position(|tab| tab.tab_id() == id).unwrap_or(0);
-        let len_after = tabs.len() - 1;
-        tabs.remove(idx);
-        if current_active == id {
-            let new_idx = if idx < len_after {
-                idx
-            } else {
-                len_after.saturating_sub(1)
-            };
-            if let Some(new_id) = tabs.get(new_idx).map(|tab| tab.tab_id()) {
-                active_tab_id.set(new_id);
-            }
-        }
-    });
-
-    // Keyboard shortcuts: Cmd+T/W (macOS) / Ctrl+T/W (other platforms) open a new
-    // tab and close the current tab respectively.
-    {
-        let home_url = home_url.clone();
-        let mut modifiers = ModifiersState::empty();
-        use_window_event(move |event, _target| match event {
-            WindowEvent::ModifiersChanged(new_modifiers) => {
-                modifiers = new_modifiers.state();
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                let shortcut_modifier = if cfg!(target_os = "macos") {
-                    modifiers.meta_key()
-                } else {
-                    modifiers.control_key()
-                };
-                if !shortcut_modifier || !event.state.is_pressed() {
-                    return;
-                }
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::KeyT) => open_new_tab(home_url.clone()),
-                    // Keep at least one tab open, matching the close button.
-                    PhysicalKey::Code(KeyCode::KeyW) if tabs.len() > 1 => {
-                        close_tab(active_tab_id())
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        });
-    }
-
-    let tab_count = tabs.len();
+pub fn TabStrip(home_url: Url, open_new_tab: Callback<Url>) -> Element {
+    let manager = use_context::<TabManager>();
     rsx!(
-        div { class:TABSTRIP_CLASS,
-            for tab_lens in tabs.iter() {
-                {
-                    let tab_id = tab_lens.tab_id();
-                    let is_active = tab_id == active_tab_id();
-                    let title = tab_display_title(tab_lens);
-                    let favicon_url = tab_lens.favicon_url().cloned();
-                    rsx!(
-                        div {
-                            key: "{tab_id}",
-                            class: if is_active { "tab tab--active" } else { "tab" },
-                            title: "{title}",
-                            onclick: move |_| switch_tab(tab_id),
-                            Favicon { url: favicon_url, class: "tab__favicon" }
-                            span { class: "tab__title", "{title}" }
-                            span { class: "tab__tooltip", "{title}" }
-                            if tab_count > 1 {
-                                div {
-                                    class: "tab__close",
-                                    onclick: move |evt| { evt.stop_propagation(); close_tab(tab_id); },
-                                    "×"
-                                }
-                            }
-                        }
-                    )
-                }
+        div { class: TABSTRIP_CLASS,
+            SpaceSwitcher {}
+            for id in manager.visible_ids() {
+                TabItem { key: "{id}", id }
             }
             div {
                 class: "tab-new",
                 onclick: move |_| open_new_tab(home_url.clone()),
                 "+"
+            }
+        }
+    )
+}
+
+#[component]
+pub fn VerticalTabs(home_url: Url, open_new_tab: Callback<Url>) -> Element {
+    let manager = use_context::<TabManager>();
+    let ids = manager.visible_ids();
+    let pinned: Vec<TabId> = ids.iter().copied().filter(|&id| is_pinned(manager, id)).collect();
+    let others: Vec<TabId> = ids.iter().copied().filter(|&id| !is_pinned(manager, id)).collect();
+    rsx!(
+        div { class: VTABS_CLASS,
+            if !pinned.is_empty() {
+                div { class: "vtabs__pinned",
+                    for id in pinned {
+                        TabItem { key: "{id}", id }
+                    }
+                }
+            }
+            div { class: "vtabs__list",
+                for id in others {
+                    TabItem { key: "{id}", id }
+                }
+                div {
+                    class: "tab-new",
+                    onclick: move |_| open_new_tab(home_url.clone()),
+                    "+ New tab"
+                }
+            }
+            SpaceSwitcher {}
+        }
+    )
+}
+
+fn is_pinned(manager: TabManager, id: TabId) -> bool {
+    manager.tabs.iter().any(|t| t.tab_id() == id && t.pinned().cloned())
+}
+
+/// One tab: favicon, title and close button; pinned tabs show only the favicon.
+#[component]
+fn TabItem(id: TabId) -> Element {
+    let mut manager = use_context::<TabManager>();
+    let Some(tab) = manager.tabs.iter().find(|t| t.tab_id() == id) else { return rsx!() };
+    let is_active = id == (manager.active_tab_id)();
+    let pinned = tab.pinned().cloned();
+    let title = tab_display_title(tab);
+    let favicon_url = tab.favicon_url().cloned();
+    let can_close = !pinned && manager.tabs.len() > 1;
+    let class = match (is_active, pinned) {
+        (true, true) => "tab tab--active tab--pinned",
+        (true, false) => "tab tab--active",
+        (false, true) => "tab tab--pinned",
+        (false, false) => "tab",
+    };
+    rsx!(
+        div {
+            class,
+            title: "{title}",
+            onclick: move |_| manager.activate(id),
+            Favicon { url: favicon_url, class: "tab__favicon" }
+            if pinned {
+                // Pages without a favicon still need something to click.
+                if tab.favicon_url().read().is_none() {
+                    span { class: "tab__initial", "{initial(&title)}" }
+                }
+            } else {
+                span { class: "tab__title", "{title}" }
+            }
+            span { class: "tab__tooltip", "{title}" }
+            if can_close {
+                div {
+                    class: "tab__close",
+                    onclick: move |evt| { evt.stop_propagation(); manager.close(id); },
+                    "×"
+                }
+            }
+        }
+    )
+}
+
+fn initial(title: &str) -> String {
+    title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "•".into())
+}
+
+/// The spaces, as chips; click one to show its tabs. Hidden while there's only one.
+#[component]
+fn SpaceSwitcher() -> Element {
+    let mut manager = use_context::<TabManager>();
+    let spaces = manager.spaces.read().clone();
+    if spaces.len() < 2 {
+        return rsx!();
+    }
+    let current = manager.current_space.read().clone();
+    rsx!(
+        div { class: "spaces",
+            for name in spaces {
+                div {
+                    key: "{name}",
+                    class: if name == current { "space space--active" } else { "space" },
+                    onclick: move |_| manager.switch_space(&name),
+                    "{name}"
+                }
             }
         }
     )
