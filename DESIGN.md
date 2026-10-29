@@ -5,7 +5,8 @@ Dart is first-class; JS is just one more language pack, off by default.
 
 Status: experiment. Current plan: "Roadmap (2026-10-28)". Phases 0–3 built in `browser/` (started from Blitz's reference
 browser): the gate, the Dart pack (with dev mode and source maps), the JS pack, and the
-per-site policy screen. Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+per-site policy screen. Phase A is done and Phase B is done apart from breakpoints and DAP
+(the Inspector, AI access and AI control; see "Step 7 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -133,6 +134,7 @@ tree, screenshots, console, boundary trace, network log, breakpoints, recordings
 
 - Off by default, local socket only, requires a token
 - Read-only, except write actions (eval, reload, input) on sites with a dev-mode grant
+  (built as "AI control": eval, click, reload; see "Step 7 notes")
 - Never sees cookies, passwords or payment fields
 - Its calls appear in the tracer like any other client
 
@@ -267,9 +269,16 @@ runs the same page in Dart and JS and expects identical output):
   `trace`, `requests`. URLs lose credentials, query values and fragments. A bar shows while
   it's on, with "Turn off"; AI calls appear in the trace as pack "ai".
 - A shared internal debugging protocol, consumed by the browser UI and MCP; DAP for VS Code.
+  **Done:** `browser/src/debug.rs`, used by the Inspector, the Trace panel and AI access.
+  **Not done:** DAP (see "Step 7 notes" for what it needs).
+- Inspector (Elements, Console, Exceptions; Network is the Requests panel). **Done**, see
+  "Step 7 notes".
 - **Correction (breakpoints):** real breakpoints are high risk here. wasmtime's guest
   debugging is limited and Boa has few debugger hooks. Start with source-mapped tracing and
-  pause-on-exception, then breakpoints.
+  pause-on-exception, then breakpoints. **Done:** pause on exceptions. **Not done:**
+  breakpoints; "Step 7 notes" says what they'd need.
+- AI control (eval, click, reload) as a separate permission. **Done (first version)**, see
+  "Step 7 notes".
 
 **Phase C: browser productivity**
 Command palette (keyboard navigation), vertical tabs, automatic tab management (pinned and
@@ -354,7 +363,7 @@ implemented once in the host (`browser/src/host.rs`), so Dart and JS get it toge
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
 | `window` and `location`: URL, navigation, `history`, viewport size | Missing | |
-| `console.*` with objects, `print` to a console view | Partly | Both packs log to the Trace panel as text |
+| `console.*` with objects, `print` to a console view | Partly | Both packs log as text, with levels, to the Inspector's Console and the Trace panel; objects are shown by handle, not expanded |
 | Canvas, WebGL, audio, media | Missing | Large; depends on what Blitz can render |
 
 ## Phase 0 notes
@@ -469,6 +478,100 @@ implemented once in the host (`browser/src/host.rs`), so Dart and JS get it toge
   until those sites are allowed in the Site panel. Turn the global switch off to browse
   without the rule.
 - Policy logic is a pure function (`gate::decide`), tested without touching saved settings.
+
+## Step 7 notes: the Inspector, the debug protocol and AI control (Phase B)
+
+**Debug protocol** (`browser/src/debug.rs`). One module the browser's tools read through:
+tabs (`TabInfo`, with the page's `PageRef`), DOM nodes (`node`, with `Privacy::Full` for
+the Inspector and `Privacy::Redacted` for AI), `describe`, `box_model`, `computed_styles`,
+the redacted `outline`, console lines with levels (`console`), the trace and requests for a
+site, and exception snapshots. Redaction rules live here, with their tests. It's plain
+functions over the existing stores (the trace, the gate log, the tabs), not a message
+protocol: there is one consumer process, so a wire format would only add a layer. DAP
+would be a translation onto these functions.
+
+**Inspector** (toolbar "Inspect", `browser/src/inspector.rs`), for the active tab:
+- **Elements:** the DOM as a tree (`<html>` and `<body>` open; whitespace text hidden), with
+  every attribute. Selecting a node shows its attributes, its box from Blitz's last layout
+  (page position, size, margin, border, padding) and key computed styles
+  (`resolved_style_value`), and highlights it on the page with Blitz's own
+  `devtools.highlight_node` overlay; no Blitz changes were needed. The tree re-reads the DOM
+  twice a second (the DOM has no change signal the UI can watch).
+- **Console:** logs and errors for the tab's site, from the trace, filterable (All, Errors,
+  Warnings, Logs), with errors' source-mapped Dart or JS stacks as they already come. Console
+  levels now travel in the trace entry (`call` is `console.warn` etc.). Newest first with the
+  input line on top, like the other panels, because Blitz can't yet keep a list scrolled to
+  its bottom. "Clear" clears the trace (the console is a view of it).
+- **Console input** (JS pages): evaluated in the page's own Boa context (`js_eval`), so it
+  sees the page's globals; DOM access goes through the host like page code, and the input
+  and result are traced (pack "console"). Results are formatted by the prelude's
+  `__inspect`: strings quoted, objects/arrays/Maps/Sets three levels deep, cycles marked,
+  functions as `ƒ name()`, host objects as `<p id="out">` or `Document` (naming an element
+  costs two traced host calls). Console input is the user's own action, so it needs no
+  permission. The AI's redacted views leave console input out, since the user may type
+  anything there.
+- **Decided: Dart pages can't evaluate code.** dart2wasm compiles ahead of time and a page
+  ships no compiler, so there's nothing to evaluate Dart with. Evaluating JS against a Dart
+  page's DOM was rejected: it would run the JS engine on a page where JS may be off
+  (principle 1), and JS callbacks would share the host's listener table with Dart's callback
+  ids. A small expression language over host objects was rejected as a new language to
+  maintain for little gain over Elements. The console says this instead of an input line.
+- **Network** opens the Requests panel rather than duplicating it.
+
+**Pause on exceptions** (Inspector → Exceptions; off at every launch). When on, an error a
+pack doesn't catch (a listener, a timer, a script or module, Dart's `main`) records a
+snapshot: what was running (`click listener on button#go`), the error with its
+source-mapped stack, the page's last 12 host calls, what the pack holds (handles, listeners,
+timers) and the redacted DOM outline. The page then **pauses**: its listeners don't run and
+its timers wait until "Resume" (Blitz's own default actions still happen). That's pause at
+event-loop granularity, not mid-function: the error has already unwound, so locals are gone.
+A timer batch that pauses partway still finishes, because its one-shot timers are already
+out of the table. Scripts during page load keep running and the page pauses after them.
+The console still works while paused.
+
+**What breakpoints would need** (not built):
+- **The blocker for both packs:** packs run synchronously on the UI thread, holding the DOM.
+  Stopping inside a pack call means not returning from it, which freezes the browser UI.
+  Breakpoints need the pack to run on its own thread (DOM calls marshalled to the UI thread,
+  which today are direct borrows) or to be resumable from a suspended state; wasmtime's
+  async support (fibers, `call_async`) could suspend a guest at a host call and resume it
+  later on the same thread. That restructuring is the real cost.
+- **JS (Boa):** Boa has no debugger API. We build Boa ourselves (`packs/js`), so a hook in
+  its bytecode loop that checks a (source, line) breakpoint table and calls a host import
+  `host.paused` is feasible; Boa's bytecode carries source positions (it builds stack traces
+  from them). Locals would need Boa's environments exposed through that import.
+- **Dart (wasmtime):** dart2wasm emits source maps, not DWARF, so native debuggers can't
+  help. Breakpoints would mean instrumenting the wasm (insert a host call at each mapped
+  statement offset, as the exnref pass already rewrites it) and resolving source lines with
+  `source_map.rs`. Reading Dart locals means walking WasmGC structs, which have no field
+  names without a name section.
+- **DAP:** an adapter on a loopback socket could map `threads` to tabs, `evaluate` to
+  `RunningPack::eval`, `setExceptionBreakpoints` to pause on exceptions, `continue` to resume
+  and `stackTrace` to a snapshot's stack. Without real stops that's a thin layer over what
+  the Inspector shows, so it waits for breakpoints.
+
+**AI control** (`ai_access.rs`). A second switch, separate from read-only access: off at
+every launch and whenever access is turned off; toggled from the menu (shown while access is
+on) or the AI bar, which says when control is on and offers "Turn off control". Rules
+(`control_decision`, tested): control on, dev mode on, and a dev-mode Allow grant for the
+tab's origin; anything else is refused with the reason, and the refusal is traced as an
+error. Tools:
+- `eval`: JS pages only, through `RunningPack::eval`, traced as pack "ai". Its output isn't
+  redacted: control is only for sites the user has granted dev mode, and eval can reach only
+  what the host exposes (no cookies; no form field values yet).
+- `click`: runs the page's click listeners on the element a selector matches, like
+  `element.click()`, with no default action (a link isn't followed). Typing isn't supported.
+- `reload`: reloads the tab (dev-mode Dart source recompiles).
+
+The tools are always listed (MCP clients cache the list) and say they need control.
+
+**Limitations:**
+- Code that never returns (`while (true) {}`) hangs the browser: packs run on the UI thread
+  with no time limit. That was already true for page scripts; console input and AI `eval`
+  share it. wasmtime's epoch interruption could bound each call; not done, since it changes
+  every pack's engine configuration.
+- Elements selection is keyed by document address; after a reload the tree starts fresh.
+- Snapshots are kept in memory (the last 20, all tabs) and lost on quit.
 
 ## Known local setup notes
 
