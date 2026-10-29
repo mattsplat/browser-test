@@ -340,14 +340,25 @@ pub fn console_entry(e: &TraceEntry) -> Option<ConsoleEntry> {
     }
 }
 
-/// Site `origin`'s console, newest first.
-pub fn console(origin: &str, limit: usize) -> Vec<ConsoleEntry> {
-    host::trace().iter().filter(|e| same_site(&e.page, origin)).filter_map(console_entry).take(limit).collect()
+/// Site `origin`'s console, newest first. Redacted views leave out what the user typed into
+/// the console (it may hold anything); the host calls it made stay, as for any page code.
+pub fn console(origin: &str, privacy: Privacy, limit: usize) -> Vec<ConsoleEntry> {
+    host::trace()
+        .iter()
+        .filter(|e| same_site(&e.page, origin) && !(privacy == Privacy::Redacted && e.pack == CONSOLE_PACK))
+        .filter_map(console_entry)
+        .take(limit)
+        .collect()
 }
 
-/// Site `origin`'s trace, newest first, without AI access's own calls.
-pub fn trace(origin: &str, limit: usize) -> Vec<TraceEntry> {
-    host::trace().into_iter().filter(|e| same_site(&e.page, origin) && e.pack != "ai").take(limit).collect()
+/// Site `origin`'s trace, newest first, without AI access's own calls (and, redacted, without
+/// console input).
+pub fn trace(origin: &str, privacy: Privacy, limit: usize) -> Vec<TraceEntry> {
+    host::trace()
+        .into_iter()
+        .filter(|e| same_site(&e.page, origin) && e.pack != "ai" && !(privacy == Privacy::Redacted && e.pack == CONSOLE_PACK))
+        .take(limit)
+        .collect()
 }
 
 /// Requests pages on site `origin` made, newest first.
@@ -519,5 +530,18 @@ mod tests {
         let eval = console_entry(&eval).unwrap();
         assert_eq!((eval.input.as_deref(), eval.text.as_str()), (Some("1 + 1"), "2"));
         assert!(console_entry(&entry(TraceKind::Call, "Document.querySelector", "#a", "#1")).is_none());
+    }
+
+    /// What the user types into the console never reaches the redacted (AI) view.
+    #[test]
+    fn redacted_console_and_trace_leave_out_console_input() {
+        let page = "https://console-privacy.test/";
+        let typed = TraceEntry { pack: CONSOLE_PACK, kind: TraceKind::Call, page: page.into(), call: "eval".into(), args: "secret typed".into(), result: "1".into(), micros: 0 };
+        host::record(typed);
+        let origin = "https://console-privacy.test";
+        assert!(console(origin, Privacy::Full, 10).iter().any(|e| e.input.as_deref() == Some("secret typed")));
+        assert!(console(origin, Privacy::Redacted, 10).is_empty());
+        assert!(trace(origin, Privacy::Redacted, 10).is_empty());
+        assert_eq!(trace(origin, Privacy::Full, 10).len(), 1);
     }
 }

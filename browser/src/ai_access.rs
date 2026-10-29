@@ -349,7 +349,7 @@ fn answer(tool: &str, args: &Value, tabs: Store<Vec<Tab>>, active: TabId, gate: 
         }
         "console" => {
             let errors_only = args["errors_only"].as_bool().unwrap_or(false);
-            let entries: Vec<Value> = debug::console(&origin, usize::MAX)
+            let entries: Vec<Value> = debug::console(&origin, debug::Privacy::Redacted, usize::MAX)
                 .into_iter()
                 .filter(|e| !errors_only || e.level == debug::Level::Error)
                 .take(limit)
@@ -362,7 +362,7 @@ fn answer(tool: &str, args: &Value, tabs: Store<Vec<Tab>>, active: TabId, gate: 
             Ok(json!(entries))
         }
         "trace" => {
-            let entries: Vec<Value> = debug::trace(&origin, limit)
+            let entries: Vec<Value> = debug::trace(&origin, debug::Privacy::Redacted, limit)
                 .into_iter()
                 .map(|e| json!({ "kind": format!("{:?}", e.kind).to_lowercase(), "pack": e.pack, "call": e.call, "args": e.args, "result": e.result, "micros": e.micros }))
                 .collect();

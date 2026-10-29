@@ -89,7 +89,7 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
                 let origin = debug::tab(tabs, active_tab_id(), None).map(|t| t.origin()).unwrap_or_default();
                 if (host::trace_version(), origin.clone()) != seen {
                     seen = (host::trace_version(), origin.clone());
-                    console.set(debug::console(&origin, MAX_CONSOLE));
+                    console.set(debug::console(&origin, Privacy::Full, MAX_CONSOLE));
                 }
                 polls += 1;
                 if polls % 2 == 0 && view() != View::Console {

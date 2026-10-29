@@ -478,7 +478,7 @@ mod tests {
         let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
         let wasm = compile("../examples/counter/main.dart").await;
         let doc = HtmlDocument::from_html(&html, DocumentConfig::default()).into_inner();
-        let mut page = PackDocument::start_dart(doc, &wasm).unwrap();
+        let page = PackDocument::start_dart(doc, &wasm).unwrap();
         assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Dart is running. No JavaScript on this page.");
 
         // Deliver two clicks the way the event handler does: the button's click listeners,
@@ -504,7 +504,7 @@ mod tests {
     async fn errors_and_stack_traces_show_dart_lines() {
         let wasm = compile("tests/fixtures/throws.dart").await;
         let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
-        let mut page = PackDocument::start_dart(doc, &wasm).unwrap();
+        let page = PackDocument::start_dart(doc, &wasm).unwrap();
 
         // main() printed StackTrace.current, from line 4.
         let printed = host::trace().into_iter().find(|e| e.call == "console" && e.args.starts_with("stack:")).unwrap();
@@ -551,7 +551,7 @@ mod tests {
     fn js_counter_example_runs_and_handles_clicks() {
         let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/js-counter/index.html")).unwrap();
         let script = html.split("<script>").nth(1).unwrap().split("</script>").next().unwrap();
-        let mut page = js_page(&html, &[script]);
+        let page = js_page(&html, &[script]);
         assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "JavaScript is running, as a pack in WebAssembly.");
 
         let (button, id) = listener(&page, "#increment", "click");
