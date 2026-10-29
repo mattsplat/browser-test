@@ -3,6 +3,8 @@
 # same web platform names the Dart and JS packs do (document.querySelector, textContent...),
 # and nothing more. `host_request` (from lib.rs) is the only way out.
 import builtins
+import sys
+import time
 
 # Members that are methods; every other member is a property. Keep in step with the methods
 # browser/src/host.rs implements (packs/js/src/prelude.js has the same list).
@@ -123,6 +125,26 @@ def cancelAnimationFrame(handle):
 
 def print(*args, sep=' ', end='\n', file=None, flush=False):
     console.log(sep.join(str(a) for a in args))
+
+
+# The page runs on the browser's UI thread, so it must never block.
+def sleep(seconds):
+    raise RuntimeError('time.sleep would block the page; use setTimeout')
+
+
+time.sleep = sleep
+
+# Deeper recursion than this overflows the interpreter's Wasm stack, which crashes the pack
+# (measured: about 5,000 simple frames fit), so a page can't raise the limit past it.
+MAX_RECURSION = 3000
+set_recursion_limit = sys.setrecursionlimit
+
+
+def setrecursionlimit(limit):
+    set_recursion_limit(min(limit, MAX_RECURSION))
+
+
+sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',

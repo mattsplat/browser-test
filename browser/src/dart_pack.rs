@@ -19,7 +19,7 @@ use regex::Regex;
 use wasmtime::*;
 
 use crate::host::{Host, HostValue, format_number};
-use crate::page_document::{PackDocument, PackRuntime, RAN_TOO_LONG, STOPPED, TIME_LIMIT_TICKS, engine, interrupted};
+use crate::page_document::{PackDocument, PackRuntime, RAN_TOO_LONG, STOPPED, TIME_LIMIT_TICKS, engine, interrupted, memory_limits};
 use crate::source_map::SourceMap;
 
 /// Something the page asked the host to call later.
@@ -50,6 +50,7 @@ struct State {
     source_map: Option<SourceMap>,
     /// The function `build.sh`'s entry point registers to format errors with Dart's toString.
     describe_error: Option<usize>,
+    limits: StoreLimits,
 }
 
 impl DartRuntime {
@@ -60,8 +61,9 @@ impl DartRuntime {
         let source_map = custom_section(wasm, "dart2wasm-sourcemap")?
             .and_then(|json| SourceMap::parse(&String::from_utf8_lossy(json)).inspect_err(|e| tracing::warn!("{e:#}")).ok());
         let module = Module::new(engine(), wasm)?;
-        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None };
+        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None, limits: memory_limits() };
         let mut store = Store::new(engine(), state);
+        store.limiter(|state| &mut state.limits);
         // Instantiating may run code too.
         store.set_epoch_deadline(TIME_LIMIT_TICKS);
 
@@ -246,10 +248,17 @@ impl DartRuntime {
             let map = self.store.data().source_map.as_ref();
             err.downcast_ref::<WasmBacktrace>().map(|bt| format_stack(map, bt))
         });
-        let headline = match (described, messages.is_empty()) {
-            (Some(text), _) => format!("Uncaught Dart error: {text}"),
-            (None, true) => format!("Dart error: {}", err.root_cause()),
-            (None, false) => format!("Uncaught Dart error: {}", messages.join(" | ")),
+        // A trap (a stack overflow, running out of memory) isn't a Dart error: Dart's code
+        // stopped part-way without unwinding, so, as for the interpreters, it doesn't run again.
+        let trapped = err.downcast_ref::<Trap>();
+        if trapped.is_some() {
+            self.stopped = true;
+        }
+        let headline = match (described, messages.is_empty(), trapped) {
+            (Some(text), _, _) => format!("Uncaught Dart error: {text}"),
+            (None, _, Some(trap)) => format!("the Dart pack crashed ({trap}); reload the page to run it again"),
+            (None, true, None) => format!("Dart error: {}", err.root_cause()),
+            (None, false, None) => format!("Uncaught Dart error: {}", messages.join(" | ")),
         };
         anyhow!("{headline}\n{}", stack.unwrap_or_default())
     }

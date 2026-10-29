@@ -753,8 +753,10 @@ are generalisations:
     them.
 - **`host.rs`:** `Host` and `HostValue` moved here from `dart_pack.rs`, unchanged.
 - **`interpreter.rs`** (new) is the JS pack's bridge, WASI and module cache, taken out of
-  `js_pack.rs` on the third use, parameterised by a `Language` (label, export prefix,
-  path).
+  `js_pack.rs` and parameterised by a `Language` (label, export prefix, path). Only two
+  packs share it, so this isn't "abstract on the third use". It's justified by the size:
+  copying it for Python would have duplicated about 300 lines that must stay in step (the
+  wire format, the WASI table, the cache).
   - The WASI table gained deny-only functions RustPython's standard Rust library links:
     `args_*`, `clock_res_get`, and file calls that fail with EBADF, with no preopened
     directory. They grant nothing; JS doesn't import them.
@@ -795,9 +797,39 @@ are generalisations:
 - **No imports between page files, and no `async`/`await` tied to the event loop.**
 - **Values:** lists and dicts can't be passed to the host (as for JS). Members use Web IDL
   camelCase names. The prelude's method list must track `host.rs` (as for JS).
-- **Interrupted packs:** a pack the time limit interrupts is stopped for good, as before. A
-  wasm trap other than the time limit (e.g. a guest panic) is reported but doesn't mark the
-  pack stopped. The same is true for JS.
+- **Stopped packs:** a pack the time limit interrupts is stopped for good, as before. So now
+  is a pack that **traps** (a guest panic, a stack overflow, running out of memory).
+  - The interpreter's state is half-updated after a trap, so every later call would trap
+    again: before this, a crashing `setInterval` logged an error on every tick.
+  - The page sees one error, `the Python pack crashed (<trap>); reload the page to run it
+    again`. The wasm backtrace goes to the browser's log, and so does a guest panic's
+    stderr, which no longer appears as page console output.
+  - Dart traps stop the Dart pack the same way. Dart exceptions are not traps and don't.
+  - Two known triggers are now page errors instead: Python's `time.sleep` raises "would
+    block the page; use setTimeout", and `sys.setrecursionlimit` is capped at 3,000. About
+    5,000 simple frames fit in the Wasm stack.
+- **Memory cap:** every pack's store (Dart, JS, Python) has a 512 MB memory limit
+  (`page_document::MEMORY_LIMIT`). A page that allocates without end gets an error inside
+  its pack (Python: `MemoryError`; JS: the pack crashes) instead of taking the browser's
+  memory.
+- **JS messages that changed:**
+  - A stopped pack now says `this page's script was stopped (it ran too long or crashed);
+    reload the page to run it again`. It used to say "stopped after running too long".
+  - A JS engine trap now reads `the JS pack crashed (...); reload the page to run it again`
+    and stops the pack. It used to be the raw wasm error, and the pack kept going.
+  - A missing build says `JS pack not built: run packs/js/build.sh`.
+- **The WASI shims check what the pack hands them:**
+  - pointers and lengths are checked against its memory before the host allocates;
+  - iovec arithmetic is checked;
+  - one `fd_write` sends at most 64 KiB to the trace;
+  - one `random_get` fills at most 64 KiB.
+- **Script types** compare ignoring ASCII case (`Text/Python`, `MODULE`).
+- **One pack per page:** the scripts of packs that don't run are traced. For example,
+  `skipped 2 JS script(s): this page runs Python`.
+- **Builds:** `packs/*/build.sh` build with `--locked`. There is no `rust-toolchain.toml`:
+  pinning a toolchain would change how the existing builds pick theirs, for little gain.
+- **Stale compiled packs:** after saving a newly compiled pack, older
+  `<prefix>-engine-*.cwasm` files of the same pack are deleted.
 - **Pinned dependencies:** RustPython's ruff fork crates are held at 0.16.5, because their
   0.16.10 patch release breaks `rustpython-codegen` 0.6.0. Revisit when RustPython 0.6.1 or
   later ships.

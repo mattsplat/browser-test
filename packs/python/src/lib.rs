@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use rustpython_vm::builtins::PyBaseExceptionRef;
 use rustpython_vm::compiler::Mode;
 use rustpython_vm::scope::Scope;
-use rustpython_vm::{Interpreter, PyObjectRef, PyResult, VirtualMachine, py_serde};
+use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyResult, VirtualMachine, py_serde};
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
@@ -89,13 +89,19 @@ fn from_json(vm: &VirtualMachine, json: &str) -> PyResult {
 /// An uncaught exception, read like a browser console's: `Uncaught ValueError: boom`, then
 /// Python's own traceback (file, line and function of each frame), without the prelude's.
 fn describe(vm: &VirtualMachine, exc: &PyBaseExceptionRef) -> String {
+    let name = exc.class().name().to_string();
+    let message = exc.as_object().str(vm).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let headline = if message.is_empty() { format!("Uncaught {name}") } else { format!("Uncaught {name}: {message}") };
     let mut text = String::new();
     let _ = vm.write_exception(&mut text, exc);
+    // The traceback is everything before the exception's own line (its message may span
+    // several lines, so it's not just the last one).
+    let traceback = text.rfind(&format!("\n{name}")).map_or("", |at| &text[..at]);
     let prelude_frame = format!("  File \"{PRELUDE_NAME}\"");
     // A runaway recursion repeats one frame a thousand times; say so once, as CPython does.
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines = vec![headline];
     let mut repeats = 0;
-    for line in text.lines().filter(|l| !l.starts_with(&prelude_frame)) {
+    for line in traceback.lines().filter(|l| !l.starts_with(&prelude_frame)) {
         if lines.last().is_some_and(|last| last == line) {
             repeats += 1;
             continue;
@@ -106,11 +112,10 @@ fn describe(vm: &VirtualMachine, exc: &PyBaseExceptionRef) -> String {
         }
         lines.push(line.to_string());
     }
-    match lines.split_last() {
-        Some((summary, traceback)) if !traceback.is_empty() => format!("Uncaught {summary}\n{}", traceback.join("\n")),
-        Some((summary, _)) => format!("Uncaught {summary}"),
-        None => "Uncaught exception".into(),
+    if repeats > 0 {
+        lines.push(format!("  [Previous line repeated {repeats} more times]"));
     }
+    lines.join("\n")
 }
 
 /// Compile and run `source` (named `name` in tracebacks) in `scope`.
@@ -156,26 +161,11 @@ fn call_prelude(vm: &VirtualMachine, page: &Page, name: &str, args: Vec<PyObject
     f.call(args, vm).map_err(|e| describe(vm, &e))
 }
 
-/// Remove the indentation every line shares, as `textwrap.dedent` does: an inline
-/// `<script>` is usually indented to match the HTML around it. Line numbers don't change.
-fn dedent(source: &str) -> String {
-    let indent = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
-    let lines = || source.lines().filter(|l| !l.trim().is_empty());
-    let Some(first) = lines().next() else { return source.to_string() };
-    let mut common = &first[..indent(first)];
-    for line in lines() {
-        while !line.starts_with(common) {
-            common = &common[..common.len() - 1];
-        }
-    }
-    source.lines().map(|l| l.strip_prefix(common).unwrap_or(l.trim_start())).collect::<Vec<_>>().join("\n")
-}
-
 /// Run a page script. `name` (its URL, or the page and "inline script N") appears in
 /// tracebacks.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_run(ptr: *const u8, len: u32, name_ptr: *const u8, name_len: u32) -> u64 {
-    let source = dedent(&unsafe { take_input(ptr, len) });
+    let source = unsafe { take_input(ptr, len) };
     let name = unsafe { take_input(name_ptr, name_len) };
     with_page(|vm, page| exec(vm, &source, &name, Mode::Exec, page.globals.clone()).map(drop))
 }

@@ -228,6 +228,7 @@ async fn build_page_document(
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");
         if !scripts.is_empty() {
+            trace_skipped(&document, &page_url, "Python", &["js"]);
             if settings::get().python_blocked.contains(&origin) {
                 trace_pack_load("python", &page_url, &page_url, format!("skipped {} script(s): Python is blocked for {origin}", scripts.len()));
                 return (shown(document), title, favicon_url);
@@ -274,6 +275,7 @@ async fn build_page_document(
             }
         };
     };
+    trace_skipped(&document, &page_url, "Dart", &["python", "js"]);
     if settings::get().dart_blocked.contains(&origin) {
         trace_load(&page_url, &src, format!("skipped: Dart is blocked for {origin}"));
         return (shown(document), title, favicon_url);
@@ -304,6 +306,17 @@ async fn build_page_document(
     }
 }
 
+/// A page runs one pack: say in the trace which other packs' scripts it has that won't run.
+fn trace_skipped(document: &BaseDocument, page: &Url, runs: &str, others: &[&'static str]) {
+    for &pack in others {
+        let count = page_scripts(document, pack).len();
+        if count > 0 {
+            let language = if pack == "js" { "JS" } else { "Python" };
+            trace_pack_load(pack, page, page, format!("skipped {count} {language} script(s): this page runs {runs}"));
+        }
+    }
+}
+
 fn trace_load(page: &Url, src: &Url, result: String) {
     trace_pack_load("dart", page, src, result);
 }
@@ -325,7 +338,9 @@ fn page_scripts(document: &BaseDocument, pack: &str) -> Vec<PageScript> {
     let mut scripts = Vec::new();
     for id in nodes {
         let Some(node) = document.get_node(id) else { continue };
-        let module = match (pack, node.attr(local_name!("type")).map(str::trim)) {
+        // Types compare ignoring ASCII case, as browsers do.
+        let kind = node.attr(local_name!("type")).map(|t| t.trim().to_ascii_lowercase());
+        let module = match (pack, kind.as_deref()) {
             ("js", None | Some("") | Some("text/javascript") | Some("application/javascript")) => false,
             ("js", Some("module")) => true,
             ("python", Some("text/python")) => false,
@@ -356,7 +371,9 @@ async fn fetch_sources(pack: &'static str, scripts: &[PageScript], page: &Url, n
                     true => format!("{}#inline-module-{inline}", page.as_str().split('#').next().unwrap_or_default()),
                     false => format!("{page} (inline script {inline})"),
                 };
-                sources.push(Script { name, source: source.clone(), module: *module });
+                // Inline Python is indented to match the HTML around it.
+                let source = if pack == "python" { python_pack::dedent(source) } else { source.clone() };
+                sources.push(Script { name, source, module: *module });
             }
             PageScript::External { url, module } => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
                 Ok((_, bytes)) => sources.push(Script { name: url.to_string(), source: String::from_utf8_lossy(&bytes).into_owned(), module: *module }),
@@ -480,7 +497,7 @@ mod tests {
     /// scripts for JS; other types for nobody.
     #[test]
     fn scripts_are_picked_by_type() {
-        let html = r#"<script>js1</script><script type="text/python">py1</script><script type="module">js2</script>
+        let html = r#"<script>js1</script><script type="Text/Python">py1</script><script type=" MODULE ">js2</script>
             <script type="text/python" src="app.py"></script><script type="text/x-template">neither</script>"#;
         let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some("https://site.test/".into()), ..Default::default() }).into_inner();
         let names = |pack| page_scripts(&doc, pack).into_iter().map(|s| match s {
@@ -489,6 +506,19 @@ mod tests {
         }).collect::<Vec<_>>();
         assert_eq!(names("python"), ["py1", "https://site.test/app.py"]);
         assert_eq!(names("js"), ["js1", "js2 (module)"]);
+
+        // The page runs Python, so its JS is skipped, and the trace says so.
+        let page = Url::parse("https://skipped-js.test/").unwrap();
+        trace_skipped(&doc, &page, "Python", &["js"]);
+        assert!(host::trace().iter().any(|e| e.pack == "js" && e.page == page.as_str() && e.result == "skipped 2 JS script(s): this page runs Python"));
+    }
+
+    #[test]
+    fn inline_python_is_dedented_and_keeps_its_lines() {
+        let source = "\n    x = 1\n\n    def f():\n        return x\n";
+        assert_eq!(python_pack::dedent(source), "\nx = 1\n\ndef f():\n    return x");
+        // Nothing in common: unchanged.
+        assert_eq!(python_pack::dedent("a = 1\n  # note"), "a = 1\n  # note");
     }
 
     #[test]

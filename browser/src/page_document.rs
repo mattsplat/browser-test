@@ -43,7 +43,7 @@ pub trait PackRuntime {
     }
     /// Evaluate console input in the page's running program; the result formatted to read.
     fn eval(&mut self, source: &str) -> Result<String>;
-    /// The pack was stopped for running too long and can't run again.
+    /// The pack was stopped (it ran too long, or crashed) and can't run again.
     fn stopped(&self) -> bool;
 }
 
@@ -76,7 +76,16 @@ const EPOCH_TICK: Duration = Duration::from_millis(100);
 pub(crate) const TIME_LIMIT_TICKS: u64 = if cfg!(test) { 20 } else { 50 };
 
 pub(crate) const RAN_TOO_LONG: &str = "script ran too long and was stopped";
-pub(crate) const STOPPED: &str = "this page's script was stopped after running too long; reload the page to run it again";
+pub(crate) const STOPPED: &str = "this page's script was stopped (it ran too long or crashed); reload the page to run it again";
+
+/// The most memory one page's pack may use. Generous, but a page allocating without end
+/// (`'x' * 2**30`) fails inside its pack instead of exhausting the browser's memory.
+pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
+
+/// The resource limits for a pack's store (`Store::limiter`).
+pub(crate) fn memory_limits() -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build()
+}
 
 /// Whether `err` is the time limit stopping a pack.
 pub(crate) fn interrupted(err: &wasmtime::Error) -> bool {
@@ -118,6 +127,9 @@ pub struct RunningPack {
     doc: Rc<RefCell<BaseDocument>>,
     objects: Rc<RefCell<Objects>>,
     runtime: RefCell<Box<dyn PackRuntime>>,
+    /// Whether the console can evaluate in this pack, read once at start so it doesn't
+    /// depend on the runtime being free.
+    can_eval: bool,
     /// Set by an uncaught error while pause on exceptions is on. The pack gets no events or
     /// timers until resumed (timers due meanwhile run on resume).
     paused: Cell<bool>,
@@ -157,7 +169,7 @@ impl RunningPack {
 
     /// Whether the console can evaluate input in this page's pack.
     pub fn can_eval(&self) -> bool {
-        self.runtime.try_borrow().is_ok_and(|r| r.can_eval())
+        self.can_eval
     }
 
     pub fn is_paused(&self) -> bool {
@@ -293,6 +305,7 @@ impl Startup {
             page: self.page,
             doc: self.doc,
             objects: self.objects,
+            can_eval: runtime.can_eval(),
             runtime: RefCell::new(runtime),
             paused: Cell::new(self.paused),
             waker: Default::default(),
@@ -974,7 +987,7 @@ mod tests {
         assert!(host::trace().iter().any(|e| e.pack == "js" && e.result.contains("script ran too long and was stopped (JS)")));
         assert!(page.pack.idle());
         let err = page.pack.eval("1", debug::CONSOLE_PACK).unwrap_err().to_string();
-        assert!(err.contains("stopped after running too long"), "{err}");
+        assert!(err.contains("was stopped (it ran too long or crashed)"), "{err}");
     }
 
     /// The same for Dart.
@@ -988,7 +1001,7 @@ mod tests {
         let err = page.pack.fire(id, &[event.clone()]).unwrap_err().to_string();
         assert!(err.contains("script ran too long and was stopped (Dart)"), "{err}");
         let err = page.pack.fire(id, &[event]).unwrap_err().to_string();
-        assert!(err.contains("stopped after running too long"), "{err}");
+        assert!(err.contains("was stopped (it ran too long or crashed)"), "{err}");
     }
 
     // ---- The Python pack: the same contract, a third language.
@@ -1009,7 +1022,7 @@ mod tests {
     fn python_counter_example_runs_and_handles_clicks() {
         let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/python-counter/index.html")).unwrap();
         let script = html.split("<script type=\"text/python\">").nth(1).unwrap().split("</script>").next().unwrap();
-        let page = python_page(&html, &[script]);
+        let page = python_page(&html, &[&crate::python_pack::dedent(script)]);
         assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Python is running, as a pack in WebAssembly.");
 
         let (button, id) = listener(&page, "#increment", "click");
@@ -1089,7 +1102,7 @@ mod tests {
         assert!(host::trace().iter().any(|e| e.pack == "python" && e.result.contains("script ran too long and was stopped (Python)")));
         assert!(page.pack.idle());
         let err = page.pack.eval("1", debug::CONSOLE_PACK).unwrap_err().to_string();
-        assert!(err.contains("stopped after running too long"), "{err}");
+        assert!(err.contains("was stopped (it ran too long or crashed)"), "{err}");
     }
 
     /// Python sees the web platform through the host and nothing else: no network, files,
@@ -1152,5 +1165,76 @@ document.querySelector('#out').textContent = f'{len(reachable)} {0 <= r < 1} {re
             assert!(page_ref.pack().is_none(), "{pack}: the pack outlived its page");
             assert!(objects.upgrade().is_none(), "{pack}: the host objects outlived the page");
         }
+    }
+
+    /// A page on its own URL, so its trace entries can be told apart from other tests'.
+    fn python_page_at(url: &str, scripts: &[&str]) -> PackDocument {
+        let config = DocumentConfig { base_url: Some(url.into()), ..Default::default() };
+        let doc = HtmlDocument::from_html("<p id=out></p>", config).into_inner();
+        let scripts: Vec<Script> = scripts.iter().map(|s| Script { name: "test.py".into(), source: s.to_string(), module: false }).collect();
+        crate::python_pack::start(doc, &scripts).unwrap()
+    }
+
+    fn errors_on(page: &str) -> Vec<String> {
+        host::trace().into_iter().filter(|e| e.page == page && e.kind == TraceKind::Error).map(|e| e.result).collect()
+    }
+
+    /// `time.sleep` would block the UI thread, and a raised recursion limit would overflow the
+    /// Wasm stack: both are Python errors the page can see, and the pack keeps running.
+    #[test]
+    fn python_cant_block_or_overflow_the_page() {
+        let page = python_page("<p id=out></p>", &[]);
+        let err = page.pack.eval("import time\ntime.sleep(0.05)", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.contains("time.sleep would block the page; use setTimeout"), "{err}");
+        let err = page.pack.eval("import sys\nsys.setrecursionlimit(10**6)\ndef f(n):\n    return f(n + 1)\nf(0)", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.starts_with("Uncaught RecursionError"), "{err}");
+        assert_eq!(page.pack.eval("sys.getrecursionlimit()", debug::CONSOLE_PACK).unwrap(), "3000");
+        assert!(!page.pack.idle());
+    }
+
+    /// If the interpreter crashes anyway (here, recursion past the cap through the prelude's
+    /// own function), the pack is stopped with one clear error, not one per timer tick.
+    #[test]
+    fn a_crashed_python_pack_stops_with_one_error() {
+        let url = "https://python-crash.test/";
+        let page = python_page_at(url, &[r#"
+import sys
+def deep(n):
+    return deep(n + 1)
+def tick():
+    sys.setrecursionlimit.__globals__['set_recursion_limit'](10**6)
+    deep(0)
+setInterval(tick, 1)
+"#]);
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            page.pack.run_due_timers();
+        }
+        let errors = errors_on(url);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("the Python pack crashed") && errors[0].contains("reload the page"), "{}", errors[0]);
+        assert!(!errors[0].contains("wasm backtrace"), "{}", errors[0]);
+        assert!(page.pack.idle());
+    }
+
+    /// An exception whose message spans lines keeps all of it in the headline.
+    #[test]
+    fn python_multi_line_messages_read_whole() {
+        let page = python_page("<p id=out></p>", &[]);
+        let err = page.pack.eval("def f():\n    raise ValueError('line one\\nline two')\nf()", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.starts_with("Uncaught ValueError: line one\nline two\nTraceback (most recent call last):"), "{err}");
+        assert!(err.contains("line 2, in f"), "{err}");
+    }
+
+    /// A page that allocates without end fails inside its pack (the memory cap), and the
+    /// browser carries on.
+    #[test]
+    fn a_page_cant_take_all_the_memory() {
+        let page = python_page("<p id=out></p>", &[]);
+        let err = page.pack.eval("s = 'x' * (600 * 2**20)", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.contains("MemoryError") || err.contains("Python pack crashed"), "{err}");
+        let page = js_page("<p id=out></p>", &[]);
+        let err = page.pack.eval("let s = 'x'.repeat(600 * 2 ** 20); s.length", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.contains("RangeError") || err.contains("JS pack crashed"), "{err}");
     }
 }

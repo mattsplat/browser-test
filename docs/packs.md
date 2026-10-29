@@ -56,6 +56,8 @@ Ok(startup.finish(Box::new(runtime)))
   (`<script type="text/python">`, inline or `src`), JS (a plain `<script>` or
   `type="module"`). Other script types are ignored.
 - **Permission** is checked before anything loads:
+  - A page's scripts for packs that don't run are traced as skipped, e.g. `skipped 2 JS
+    script(s): this page runs Python`. Script types compare ignoring ASCII case.
   - Dart and Python run by default and can be blocked per site (`dart_blocked`,
     `python_blocked` in settings, toggled in the Site panel).
   - JS follows `js_permission::decide`: a global default (Ask), and per-site "always allow",
@@ -69,10 +71,14 @@ Ok(startup.finish(Box::new(runtime)))
     `<cache dir>/<prefix>-engine-<hash>.cwasm`, keyed by a hash of the `.wasm` bytes and
     wasmtime's `precompile_compatibility_hash`. It is written with
     `profile::write_atomic`, because another profile's process may have it memory-mapped.
+    Once a new file is saved, that pack's older `.cwasm` files are deleted.
   - **Dart:** each page's program is compiled when it loads (pages differ; there's no
     cache).
 - **Instantiating:** each page gets a fresh `Store` and `Instance`, so no pack state is ever
-  shared between pages or tabs. An interpreter's `_initialize` (the wasip1 reactor start) runs
+  shared between pages or tabs. Every store has a memory cap of 512 MB
+  (`page_document::MEMORY_LIMIT`, applied with `Store::limiter`). A page that allocates
+  without end fails inside its pack (Python raises `MemoryError`; Boa traps, which stops the
+  pack) and doesn't take the browser's memory. An interpreter's `_initialize` (the wasip1 reactor start) runs
   at instantiation; its interpreter context is created lazily on the first call.
 
 ## Running the page's code
@@ -106,7 +112,11 @@ Ok(startup.finish(Box::new(runtime)))
 - **Interpreters:** `host.request` and a fixed set of `wasi_snapshot_preview1` functions,
   all implemented in `interpreter.rs`:
   - `random_get` and `clock_time_get`/`clock_res_get` come from the host (principle 4).
-  - `fd_write` goes to the trace as console output.
+  - `fd_write` to stdout goes to the trace as console output; stderr (only ever the
+    interpreter's own, e.g. a Rust panic) goes to the browser's log. One write sends at
+    most 64 KiB, and one `random_get` fills at most 64 KiB.
+  - Every pointer and length the pack hands a shim is checked against its memory before
+    the host reads or allocates anything.
   - `environ_*` and `args_*` report empty lists. `sched_yield` does nothing,
     `poll_oneoff` fails, and `proc_exit` traps.
   - **Files:** `fd_prestat_get` fails, so WASI libc sees no preopened directory and can
@@ -229,8 +239,16 @@ Ok(startup.finish(Box::new(runtime)))
   - The interpreters do it in `Interpreter::enter`, Dart in `DartRuntime::enter`.
 - **When a call runs over:** wasmtime traps with `Trap::Interrupt` (`interrupted(err)`).
   - The pack reports `script ran too long and was stopped (<Language>)` and sets `stopped`.
-  - From then on it refuses every call with `STOPPED`. The interpreter or Dart runtime was
-    interrupted mid-update, so it can't safely run again.
+  - From then on it refuses every call with `STOPPED` ("this page's script was stopped (it
+    ran too long or crashed); reload the page to run it again"). The interpreter or Dart
+    runtime was interrupted mid-update, so it can't safely run again.
+- **A call that traps** is treated the same way: a guest panic, a stack overflow, or
+  running out of memory.
+  - An interpreter's call that doesn't return normally sets `stopped` and reports `the
+    <Language> pack crashed (<trap>); reload the page to run it again`. The wasm backtrace
+    goes to the browser's log, not the page's console.
+  - Dart does the same for traps, but not for Dart exceptions, which unwind normally.
+  - So a crash gives one error, not one per timer tick.
 - **What the document does:** it treats a stopped pack as idle: no events, timers or input.
   Reloading runs a fresh instance.
 
@@ -322,8 +340,13 @@ packed JSON reply.
     interpreter takes about 25 ms (about 55 ms for the first page in a process, which loads
     the cached code).
 - **Pages:**
-  - `<script type="text/python">` inline or with `src`. Inline scripts are dedented, so
-    they can be indented to match the HTML.
+  - `<script type="text/python">` inline or with `src`. The loader dedents inline scripts
+    (`python_pack::dedent`), so they can be indented to match the HTML; line numbers are
+    kept. A `.py` file from `src` is used as it is.
+  - `time.sleep` raises `RuntimeError: time.sleep would block the page; use setTimeout`.
+    The page runs on the UI thread, and the WASI shims have no way to wait.
+  - `sys.setrecursionlimit` is capped at 3,000. Deeper recursion would overflow the Wasm
+    stack (about 5,000 simple frames fit), which crashes the pack. The default stays 1,000.
   - The globals are `window`, `document`, `console`, `Math`, `setTimeout`, `setInterval`,
     `clearTimeout`, `clearInterval`, `requestAnimationFrame` and `cancelAnimationFrame`.
     `print` goes to the console.

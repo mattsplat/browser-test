@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use wasmtime::*;
 
 use crate::host::{Host, HostValue};
-use crate::page_document::{PackRuntime, RAN_TOO_LONG, STOPPED, Startup, TIME_LIMIT_TICKS, engine, interrupted};
+use crate::page_document::{PackRuntime, RAN_TOO_LONG, STOPPED, Startup, TIME_LIMIT_TICKS, engine, interrupted, memory_limits};
 
 /// One interpreter pack: where its build puts it and what it calls itself.
 pub struct Language {
@@ -32,7 +32,7 @@ pub struct Language {
     /// How to build it, for the error when it's missing.
     pub build: &'static str,
     /// The compiled module, once per process: each page gets a fresh instance of it.
-    pub module: &'static std::sync::OnceLock<Module>,
+    pub module: std::sync::OnceLock<Module>,
 }
 
 /// A page script for an interpreter pack: its name (URL, or the page and a position for
@@ -49,6 +49,7 @@ struct State {
     host: Box<dyn Host>,
     rng: u64,
     started: Instant,
+    limits: StoreLimits,
 }
 
 /// A page's instance of an interpreter.
@@ -56,8 +57,8 @@ pub struct Interpreter {
     lang: &'static Language,
     store: Store<State>,
     instance: Instance,
-    /// Stopped for running too long. The interpreter was interrupted mid-call (its state is
-    /// left half-updated), so it can't run again.
+    /// Stopped for running too long, or crashed. Either way the interpreter left a call
+    /// part-way (its state is half-updated, its context still borrowed), so it can't run again.
     stopped: bool,
 }
 
@@ -98,18 +99,36 @@ fn cached_compile(lang: &Language, wasm: &[u8]) -> Result<Module> {
         let saved = path.parent().map(std::fs::create_dir_all).transpose().and_then(|_| {
             module.serialize().map_err(std::io::Error::other).and_then(|bytes| crate::profile::write_atomic(path, &bytes))
         });
-        if let Err(e) = saved {
-            tracing::warn!("could not cache the compiled {} pack: {e}", lang.label);
+        match saved {
+            Ok(()) => remove_stale_caches(lang, path),
+            Err(e) => tracing::warn!("could not cache the compiled {} pack: {e}", lang.label),
         }
     }
     Ok(module)
+}
+
+/// After saving a new compiled pack, delete this pack's older ones (an earlier build or
+/// wasmtime). A process still running one keeps its mapping: on macOS and Linux, deleting a
+/// mapped file only removes its name.
+fn remove_stale_caches(lang: &Language, current: &std::path::Path) {
+    let Some(dir) = current.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let prefix = format!("{}-engine-", lang.prefix);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".cwasm") && path != current {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 impl Interpreter {
     pub fn load(lang: &'static Language, host: Box<dyn Host>) -> Result<Self> {
         let module = module(lang)?;
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-        let mut store = Store::new(engine(), State { lang, host, rng: seed | 1, started: Instant::now() });
+        let mut store = Store::new(engine(), State { lang, host, rng: seed | 1, started: Instant::now(), limits: memory_limits() });
+        store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(TIME_LIMIT_TICKS);
         let mut linker = Linker::new(engine());
         linker.func_wrap("host", "request", host_request)?;
@@ -132,16 +151,23 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Call export `<prefix>_<name>`, reporting the time limit stopping it.
+    /// Call export `<prefix>_<name>`. The interpreter reports the page's own errors as
+    /// return values, so a call that fails didn't return: the time limit stopped it, or it
+    /// trapped (a panic in the interpreter, a stack overflow, running out of memory). Either
+    /// way it's stopped from then on.
     pub(crate) fn call<P: WasmParams, R: WasmResults>(&mut self, name: &str, params: P) -> Result<R> {
         let export = format!("{}_{name}", self.lang.prefix);
         let f = self.instance.get_typed_func::<P, R>(&mut self.store, &export)?;
         f.call(&mut self.store, params).map_err(|e| {
+            self.stopped = true;
             if interrupted(&e) {
-                self.stopped = true;
-                anyhow!("{RAN_TOO_LONG} ({})", self.lang.label)
-            } else {
-                anyhow!("{e:#}")
+                return anyhow!("{RAN_TOO_LONG} ({})", self.lang.label);
+            }
+            // The wasm backtrace is for us, not the page's console.
+            tracing::warn!("the {} pack crashed: {e:?}", self.lang.label);
+            match e.downcast_ref::<Trap>() {
+                Some(trap) => anyhow!("the {} pack crashed ({trap}); reload the page to run it again", self.lang.label),
+                None => anyhow!("the {} pack crashed; reload the page to run it again", self.lang.label),
             }
         })
     }
@@ -232,11 +258,16 @@ fn caller_memory(caller: &mut Caller<'_, State>) -> Result<Memory> {
     caller.get_export("memory").and_then(|e| e.into_memory()).context("the pack has no memory export")
 }
 
+/// The pack's bytes at `ptr..ptr + len`, checked against its memory before anything is
+/// allocated (a bad length from the pack can't make the host allocate gigabytes).
 fn read_caller(caller: &mut Caller<'_, State>, ptr: u32, len: u32) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; len as usize];
-    caller_memory(caller)?.read(&*caller, ptr as usize, &mut buf)?;
-    Ok(buf)
+    let memory = caller_memory(caller)?;
+    let end = (ptr as usize).checked_add(len as usize).context("pointer out of range")?;
+    Ok(memory.data(&*caller).get(ptr as usize..end).context("pointer out of range")?.to_vec())
 }
+
+/// Most bytes one `fd_write` sends to the trace, and one `random_get` fills.
+const MAX_IO: u32 = 64 * 1024;
 
 /// `host.request`: one JSON request in, one JSON reply out (allocated in interpreter memory
 /// with its `alloc`, which it frees).
@@ -314,10 +345,14 @@ fn encode(v: &HostValue) -> Result<Value> {
 fn add_wasi(linker: &mut Linker<State>) -> Result<()> {
     const WASI: &str = "wasi_snapshot_preview1";
     const EBADF: i32 = 8;
+    const EINVAL: i32 = 28;
     const ENOSYS: i32 = 52;
     let wasm_err = |e: anyhow::Error| wasmtime::Error::msg(format!("{e:#}"));
 
     linker.func_wrap(WASI, "random_get", move |mut caller: Caller<'_, State>, buf: u32, len: u32| -> wasmtime::Result<i32> {
+        if len > MAX_IO {
+            return Ok(EINVAL);
+        }
         let mut bytes = vec![0u8; len as usize];
         for b in bytes.iter_mut() {
             let rng = &mut caller.data_mut().rng;
@@ -352,20 +387,27 @@ fn add_wasi(linker: &mut Linker<State>) -> Result<()> {
         })?;
         linker.func_wrap(WASI, get, |_: u32, _: u32| -> i32 { 0 })?;
     }
-    // stdout/stderr (e.g. a Rust panic message in the interpreter) go to the trace.
-    linker.func_wrap(WASI, "fd_write", move |mut caller: Caller<'_, State>, _fd: u32, iovs: u32, iovs_len: u32, written: u32| -> wasmtime::Result<i32> {
-        let memory = caller_memory(&mut caller).map_err(wasm_err)?;
+    // stdout goes to the trace, as console output. stderr is only ever the interpreter's own
+    // (a Rust panic message), so it goes to the browser's log, not the page's console.
+    linker.func_wrap(WASI, "fd_write", move |mut caller: Caller<'_, State>, fd: u32, iovs: u32, iovs_len: u32, written: u32| -> wasmtime::Result<i32> {
         let mut text = Vec::new();
+        let mut total = 0u32;
         for i in 0..iovs_len {
-            let mut iov = [0u8; 8];
-            memory.read(&caller, (iovs + i * 8) as usize, &mut iov)?;
+            let at = i.checked_mul(8).and_then(|o| iovs.checked_add(o)).ok_or_else(|| wasmtime::Error::msg("iovec out of range"))?;
+            let iov = read_caller(&mut caller, at, 8).map_err(wasm_err)?;
             let (ptr, len) = (u32::from_le_bytes(iov[..4].try_into()?), u32::from_le_bytes(iov[4..].try_into()?));
-            let mut chunk = vec![0u8; len as usize];
-            memory.read(&caller, ptr as usize, &mut chunk)?;
-            text.extend(chunk);
+            total = total.saturating_add(len);
+            // Past the cap the rest is dropped, but reported written so the writer moves on.
+            let keep = len.min(MAX_IO.saturating_sub(text.len() as u32));
+            text.extend(read_caller(&mut caller, ptr, keep).map_err(wasm_err)?);
         }
-        memory.write(&mut caller, written as usize, &(text.len() as u32).to_le_bytes())?;
-        caller.data_mut().host.console(&String::from_utf8_lossy(&text));
+        let memory = caller_memory(&mut caller).map_err(wasm_err)?;
+        memory.write(&mut caller, written as usize, &total.to_le_bytes())?;
+        let text = String::from_utf8_lossy(&text).into_owned();
+        match fd {
+            2 => tracing::warn!("{} pack stderr: {text}", caller.data().lang.label),
+            _ => caller.data_mut().host.console(&text),
+        }
         Ok(0)
     })?;
     // No files. `fd_prestat_get` failing tells WASI libc there are no preopened directories,

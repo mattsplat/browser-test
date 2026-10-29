@@ -19,9 +19,8 @@ pub static JS: Language = Language {
     prefix: "js",
     path: concat!(env!("CARGO_MANIFEST_DIR"), "/../packs/js/target/wasm32-wasip1/release/js_pack.wasm"),
     build: "packs/js/build.sh",
-    module: &MODULE,
+    module: OnceLock::new(),
 };
-static MODULE: OnceLock<wasmtime::Module> = OnceLock::new();
 
 /// Run a page's scripts with the JS pack: classic scripts in order, then module scripts in
 /// order (as browsers run deferred modules). A module's imports are fetched with `fetch` (the
