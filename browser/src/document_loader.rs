@@ -297,13 +297,17 @@ fn js_scripts(document: &BaseDocument) -> Vec<JsScript> {
 
 /// Script sources in order. External scripts come through the gate; one that fails to load
 /// is reported and skipped, as a browser would.
-async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<String> {
+async fn fetch_js_sources(scripts: &[JsScript], page: &Url, net_provider: &Arc<StdNetProvider>, signal: &AbortSignal) -> Vec<(String, String)> {
     let mut sources = Vec::new();
+    let mut inline = 0;
     for script in scripts {
         match script {
-            JsScript::Inline(text) => sources.push(text.clone()),
+            JsScript::Inline(text) => {
+                inline += 1;
+                sources.push((format!("{page} (inline script {inline})"), text.clone()));
+            }
             JsScript::External(url) => match net_provider.fetch_for_page(Request::get(url.clone()).signal(signal.clone()), page).await {
-                Ok((_, bytes)) => sources.push(String::from_utf8_lossy(&bytes).into_owned()),
+                Ok((_, bytes)) => sources.push((url.to_string(), String::from_utf8_lossy(&bytes).into_owned())),
                 Err(e) => trace_pack_load("js", url, format!("ERROR could not load: {e:?}")),
             },
         }

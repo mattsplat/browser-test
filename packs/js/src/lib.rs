@@ -78,11 +78,14 @@ fn with_context(f: impl FnOnce(&mut Context) -> Result<(), String>) -> u64 {
     })
 }
 
+/// Run a classic script. `name` (its URL, or the page and "inline script N") appears in
+/// error locations and stack traces.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn js_run(ptr: *const u8, len: u32) -> u64 {
+pub unsafe extern "C" fn js_run(ptr: *const u8, len: u32, name_ptr: *const u8, name_len: u32) -> u64 {
     let source = unsafe { read_str(ptr, len) };
+    let name = unsafe { read_str(name_ptr, name_len) };
     with_context(|ctx| {
-        let result = ctx.eval(Source::from_bytes(source.as_bytes())).map(drop);
+        let result = ctx.eval(Source::from_bytes(source.as_bytes()).with_path(std::path::Path::new(&name))).map(drop);
         // Promise jobs (e.g. `.then`) run before control returns to the host.
         let _ = ctx.run_jobs();
         result.map_err(|e| format!("Uncaught {e}"))

@@ -67,11 +67,17 @@ pub async fn compile(src: &Url, page: &Url, net: &Arc<StdNetProvider>, signal: &
     }
 }
 
-/// The cache is fresh if it is newer than every .dart file and pubspec in the source folder.
+/// The cache is fresh if it is newer than every .dart file and pubspec in the source folder,
+/// and than the build tooling itself (a change there changes the output too).
 fn is_fresh(source: &Path, out: &Path) -> bool {
     let Ok(built) = std::fs::metadata(out).and_then(|m| m.modified()) else { return false };
     let folder = source.parent().unwrap_or(Path::new("."));
-    newest_source(folder).is_some_and(|newest| newest <= built)
+    let tooling = Path::new(env!("CARGO_MANIFEST_DIR")).join("../packs/dart");
+    let newest_tooling = ["build.sh", "embed_imports.dart"]
+        .iter()
+        .filter_map(|f| std::fs::metadata(tooling.join(f)).and_then(|m| m.modified()).ok())
+        .max();
+    newest_source(folder).is_some_and(|newest| newest <= built) && newest_tooling.is_none_or(|t| t <= built)
 }
 
 fn newest_source(dir: &Path) -> Option<SystemTime> {

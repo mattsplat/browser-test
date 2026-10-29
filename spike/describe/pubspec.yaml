@@ -1,0 +1,6 @@
+name: fixtures
+publish_to: none
+environment:
+  sdk: ^3.6.0
+dependencies:
+  web: ^1.1.0

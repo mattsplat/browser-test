@@ -89,11 +89,12 @@ impl JsRuntime {
         Ok(Self { store, instance })
     }
 
-    /// Run a page script.
-    pub fn run(&mut self, source: &str) -> Result<()> {
+    /// Run a page script; `name` shows in error locations and stack traces.
+    pub fn run(&mut self, name: &str, source: &str) -> Result<()> {
         let (ptr, len) = write_str(&mut self.store, &self.instance, source)?;
-        let run = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_run")?;
-        let status = run.call(&mut self.store, (ptr, len))?;
+        let (name_ptr, name_len) = write_str(&mut self.store, &self.instance, name)?;
+        let run = self.instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut self.store, "js_run")?;
+        let status = run.call(&mut self.store, (ptr, len, name_ptr, name_len))?;
         self.check(status)
     }
 

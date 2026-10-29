@@ -132,6 +132,8 @@ struct State {
     microtasks: std::collections::VecDeque<HostValue>,
     /// From the `dart2wasm-sourcemap` section, when the build embedded one.
     source_map: Option<SourceMap>,
+    /// The function `build.sh`'s entry point registers to format errors with Dart's toString.
+    describe_error: Option<usize>,
 }
 
 /// The wasmtime engine every pack runs on (GC and exceptions enabled).
@@ -152,7 +154,7 @@ impl DartRuntime {
         let source_map = custom_section(wasm, "dart2wasm-sourcemap")?
             .and_then(|json| SourceMap::parse(&String::from_utf8_lossy(json)).inspect_err(|e| tracing::warn!("{e:#}")).ok());
         let module = Module::new(engine(), wasm)?;
-        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map };
+        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None };
         let mut store = Store::new(engine(), state);
 
         let mut imports: Vec<Extern> = Vec::new();
@@ -201,6 +203,28 @@ impl DartRuntime {
         let ran = main.call(&mut self.store, &[Val::ExternRef(Some(args))], &mut []);
         ran.map_err(|e| self.explain(e))?;
         self.run_microtasks()
+    }
+
+    /// Call a Dart function the page handed over and return its result, without running
+    /// microtasks or explaining errors (used while explaining one).
+    fn call_function(&mut self, id: usize, args: &[HostValue]) -> Result<HostValue> {
+        let Some(Callback::Function(func, closure)) = self.store.data().callbacks.get(id).cloned().flatten() else {
+            bail!("callback {id} is not a Dart function");
+        };
+        let ty = func.ty(&self.store);
+        let mut values = vec![HostValue::Opaque(closure), HostValue::Num(args.len() as f64)];
+        values.extend(args.iter().cloned());
+        let params: Vec<ValType> = ty.params().collect();
+        let mut call_args = Vec::new();
+        for (i, pty) in params.iter().enumerate() {
+            call_args.push(from_host(&mut self.store, values.get(i).cloned().unwrap_or(HostValue::Undefined), pty)?);
+        }
+        let mut out: Vec<Val> = ty.results().map(|_| Val::null_extern_ref()).collect();
+        func.call(&mut self.store, &call_args, &mut out).map_err(|e| anyhow!("{e:#}"))?;
+        match out.first() {
+            Some(v) => to_host(&mut self.store, v),
+            None => Ok(HostValue::Undefined),
+        }
     }
 
     /// Invoke a callback the page registered, e.g. an event listener, with `args`.
@@ -269,8 +293,17 @@ impl DartRuntime {
     /// error's message and a stack trace in Dart source lines.
     fn explain(&mut self, err: wasmtime::Error) -> anyhow::Error {
         let mut strings = Vec::new();
+        let mut described = None;
         if err.downcast_ref::<ThrownException>().is_some() {
             if let Some(exn) = self.store.take_pending_exception() {
+                // Best: Dart's own toString, via the function build.sh's entry registered.
+                if let (Some(describe), Ok(Val::AnyRef(Some(thrown)))) = (self.store.data().describe_error, exn.field(&mut self.store, 0)) {
+                    if let Ok(owned) = thrown.to_owned_rooted(&mut self.store) {
+                        if let Ok(HostValue::Str(s)) = self.call_function(describe, &[HostValue::Opaque(owned)]) {
+                            described = Some(String::from_utf16_lossy(&s));
+                        }
+                    }
+                }
                 // The host can't call Dart's toString, so collect the strings the error object
                 // holds: its message, and the stack trace Dart captured when it was thrown.
                 for i in 0..4 {
@@ -286,9 +319,10 @@ impl DartRuntime {
             let map = self.store.data().source_map.as_ref();
             err.downcast_ref::<WasmBacktrace>().map(|bt| format_stack(map, bt))
         });
-        let headline = match messages.is_empty() {
-            true => format!("Dart error: {}", err.root_cause()),
-            false => format!("Uncaught Dart error: {}", messages.join(" | ")),
+        let headline = match (described, messages.is_empty()) {
+            (Some(text), _) => format!("Uncaught Dart error: {text}"),
+            (None, true) => format!("Dart error: {}", err.root_cause()),
+            (None, false) => format!("Uncaught Dart error: {}", messages.join(" | ")),
         };
         anyhow!("{headline}\n{}", stack.unwrap_or_default())
     }
@@ -368,6 +402,8 @@ enum Helper {
     Get(String),
     /// `(x0,x1) => { x0.name = x1 }`
     Set(String),
+    /// `x0 => { globalThis.name = x0 }`
+    SetGlobal(String),
     Truthy,
     StrictEquals,
     LastIndexOf,
@@ -411,13 +447,14 @@ enum Helper {
 
 fn classify(body: &str) -> Helper {
     // The four shapes package:web's generated bindings compile to.
-    static SHAPES: OnceLock<[(Regex, fn(String) -> Helper); 4]> = OnceLock::new();
+    static SHAPES: OnceLock<[(Regex, fn(String) -> Helper); 5]> = OnceLock::new();
     let shapes = SHAPES.get_or_init(|| {
         [
             (Regex::new(r"^\(\) => globalThis\.(\w+)$").unwrap(), Helper::Global as fn(String) -> Helper),
             (Regex::new(r"^\(?x0(?:,x\d+)*\)? => x0\.(\w+)\((?:x\d+(?:,x\d+)*)?\)$").unwrap(), Helper::Method),
             (Regex::new(r"^x0 => x0\.(\w+)$").unwrap(), Helper::Get),
             (Regex::new(r"^\(x0,x1\) => \{ x0\.(\w+) = x1 \}$").unwrap(), Helper::Set),
+            (Regex::new(r"^x0 => \{ globalThis\.(\w+) = x0 \}$").unwrap(), Helper::SetGlobal),
         ]
     });
     let b = body.trim().trim_end_matches(',');
@@ -742,6 +779,13 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
             let args = host_args(caller, params)?;
             caller.data_mut().host.call(&args[0], method, &args[1..])?
         }
+        Helper::SetGlobal(name) => match (name.as_str(), to_host(caller, &params[0])?) {
+            ("__dartPackDescribeError", HostValue::CallbackId(id)) => {
+                caller.data_mut().describe_error = Some(id);
+                HostValue::Undefined
+            }
+            (other, _) => bail!("setting globalThis.{other} is not supported yet"),
+        },
         Helper::Truthy => HostValue::Bool(to_host(caller, &params[0])?.truthy()),
         Helper::StrictEquals => {
             let (l, r) = (to_host(caller, &params[0])?, to_host(caller, &params[1])?);

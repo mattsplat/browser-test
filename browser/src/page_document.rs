@@ -65,14 +65,14 @@ impl PackDocument {
         Ok(Self::new(inner, Box::new(runtime), objects, "dart"))
     }
 
-    /// Run a page's scripts in order with the JS pack. Like a browser, an error in one
-    /// script is reported (in the trace) and the next still runs.
-    pub fn start_js(doc: BaseDocument, scripts: &[String]) -> Result<Self> {
+    /// Run a page's scripts, as (name, source), in order with the JS pack. Like a browser,
+    /// an error in one script is reported (in the trace) and the next still runs.
+    pub fn start_js(doc: BaseDocument, scripts: &[(String, String)]) -> Result<Self> {
         let (inner, objects, host) = Self::host(doc, "js");
         let mut runtime = JsRuntime::load(Box::new(host))?;
-        for (i, source) in scripts.iter().enumerate() {
-            if let Err(e) = runtime.run(source) {
-                record_error("js", format!("script {}", i + 1), String::new(), &e);
+        for (name, source) in scripts {
+            if let Err(e) = runtime.run(name, source) {
+                record_error("js", "script".into(), name.clone(), &e);
             }
         }
         Ok(Self::new(inner, Box::new(runtime), objects, "js"))
@@ -334,14 +334,15 @@ mod tests {
         let (button, id) = listener(&page, "#go", "click");
         let event = HostValue::Object(page.objects.borrow_mut().event("click", button, Default::default()));
         let err = format!("{:#}", page.runtime.fire_callback(id, &[event]).unwrap_err());
-        assert!(err.starts_with("Uncaught Dart error: boom from a click"), "{err}");
+        // Dart's own toString: the error's type shows ("Bad state" is StateError's prefix).
+        assert!(err.starts_with("Uncaught Dart error: Bad state: boom from a click"), "{err}");
         assert!(err.contains("at throws.dart:9:3"), "{err}");
         assert!(!err.contains("_internal"), "SDK capture frames are trimmed: {err}");
     }
 
     fn js_page(html: &str, scripts: &[&str]) -> PackDocument {
         let doc = HtmlDocument::from_html(html, DocumentConfig::default()).into_inner();
-        let scripts: Vec<String> = scripts.iter().map(|s| s.to_string()).collect();
+        let scripts: Vec<(String, String)> = scripts.iter().enumerate().map(|(i, s)| (format!("test-{}.js", i + 1), s.to_string())).collect();
         PackDocument::start_js(doc, &scripts).expect("JS engine missing? run packs/js/build.sh")
     }
 
@@ -413,7 +414,7 @@ mod tests {
         let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig::default()).into_inner();
         match pack {
             "dart" => PackDocument::start_dart(doc, &compile("tests/fixtures/events.dart").await).unwrap(),
-            _ => PackDocument::start_js(doc, &[include_str!("../tests/fixtures/events.js").to_string()]).unwrap(),
+            _ => PackDocument::start_js(doc, &[("events.js".into(), include_str!("../tests/fixtures/events.js").to_string())]).unwrap(),
         }
     }
 
@@ -500,15 +501,35 @@ mod tests {
     async fn events_and_timers_behave_the_same_in_dart_and_js() {
         let dart = run_events_scenario("dart").await;
         let js = run_events_scenario("js").await;
-        let expected = [
+        let expected_events = [
             "once,click:10,20,0,true",
             "once,click:10,20,0,true,click:1,2,0,false",
             "once,click:10,20,0,true,click:1,2,0,false,stop",
             "once,click:10,20,0,true,click:1,2,0,false,stop,key:a,KeyA,true",
             "once,click:10,20,0,true,click:1,2,0,false,stop,key:a,KeyA,true,stream",
-            "once,click:10,20,0,true,click:1,2,0,false,stop,key:a,KeyA,true,stream,timeout,interval:3,frame",
         ];
-        assert_eq!(dart, expected, "Dart");
-        assert_eq!(js, expected, "JS");
+        for (pack, steps) in [("Dart", &dart), ("JS", &js)] {
+            assert_eq!(steps[..5], expected_events, "{pack}: events");
+            // Independent timers may fire in either order (an overdue interval and a frame), so
+            // compare the set; the cancelled timeout must never run.
+            let after = steps[5].strip_prefix(expected_events[4]).unwrap_or(&steps[5]);
+            let mut timers: Vec<&str> = after.split(',').filter(|s| !s.is_empty()).collect();
+            timers.sort();
+            assert_eq!(timers, ["frame", "interval:3", "timeout"], "{pack}: timers");
+        }
+    }
+
+    /// JS errors carry their type, message and a stack with function names and locations.
+    #[test]
+    fn js_errors_have_types_and_stacks() {
+        let page = js_page("<p id=out></p>", &[
+            "function inner() { null.foo; }\nfunction outer() { inner(); }\nouter();",
+            "let e = new Error('x'); document.querySelector('#out').textContent = String(e.stack);",
+        ]);
+        let err = host::trace().into_iter().find(|e| e.pack == "js" && e.args == "test-1.js").unwrap().result;
+        assert!(err.contains("Uncaught TypeError"), "{err}");
+        assert!(err.contains("at inner (test-1.js:1:"), "{err}");
+        assert!(err.contains("at outer (test-1.js:2:"), "{err}");
+        assert!(text_of(&page.inner.borrow(), "#out").contains("test-2.js:1:"));
     }
 }

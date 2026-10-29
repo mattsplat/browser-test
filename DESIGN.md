@@ -220,15 +220,22 @@ runs the same page in Dart and JS and expects identical output):
   (a stale one errors instead of aliasing); callbacks nothing refers to are released in the
   pack; the JS prelude holds wrappers weakly.
 - `window` and `console` (log/info/warn/error/debug) globals; `Date.now` from the host.
+- Error reporting with types, messages and stacks in both packs:
+  - **Dart:** `build.sh` compiles through a generated entry point (`.pack_entry_<name>.dart`,
+    deleted after) that registers a function formatting errors with Dart's own `toString`
+    (via a `globalThis` assignment; dart2wasm forbids `wasm:export` in user code). Uncaught
+    errors read `Uncaught Dart error: Bad state: boom from a click` / `at throws.dart:9:3`.
+    Pages built without it fall back to the strings inside the error object.
+  - **JS:** Boa already reports the type, message and a stack with function names; scripts
+    are now named (their URL, or `page (inline script N)`) so locations read `app.js:1:25`.
+    `error.stack` works in page code.
+  - The dev-mode compile cache now also goes stale when the build tooling changes.
 - Timers: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` (plus
   `requestAnimationFrame`), host-owned so time comes from the host (principle 4).
 - `removeEventListener` with correct listener identity and cleanup.
 - Keyboard and mouse event properties.
 - Fix the event-object leak: release handles when the pack no longer holds them.
-- Error types, messages and stack traces.
-  **Limitation:** for Dart, the host can't call `toString`, so the error's class name
-  (e.g. `StateError`) may only be recoverable from the wasm name section, if dart2wasm
-  keeps type names. To investigate.
+- Error types, messages and stack traces. (Done: see above.)
 - JS ES modules (`<script type="module">`, imports, execution order). Imports are fetched
   through the gate, so the module graph is loaded by the host before Boa links it.
 - JS permission prompt and default policy (see below).

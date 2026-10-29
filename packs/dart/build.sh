@@ -17,7 +17,26 @@ sdk="$(dirname "$(dirname "$(readlink -f "$(command -v dart)")")")"
 wasm_opt="$sdk/bin/utils/wasm-opt"
 [ -x "$wasm_opt" ] || { echo "wasm-opt not found in the Dart SDK at $sdk" >&2; exit 1; }
 
-dart compile wasm "$src" -o "$out"
+# Compile through a small generated entry point beside the source (so relative imports and
+# the package config resolve). It hands the browser a function that formats uncaught errors
+# with Dart's own toString, then runs the page's main. It is deleted afterwards.
+name="$(basename "$src" .dart)"
+entry="$(dirname "$src")/.pack_entry_$name.dart"
+trap 'rm -f "$entry"' EXIT
+cat > "$entry" <<DART
+import 'dart:js_interop';
+import '$name.dart' as app;
+
+@JS('__dartPackDescribeError')
+external set _describeError(JSFunction f);
+
+void main() {
+  _describeError = ((ExternalDartReference error) => error.toDartObject.toString().toJS).toJS;
+  (app.main as dynamic)();
+}
+DART
+
+dart compile wasm "$entry" -o "$out"
 "$wasm_opt" "$out" \
   --enable-gc --enable-reference-types --enable-exception-handling \
   --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
