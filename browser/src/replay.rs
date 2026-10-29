@@ -62,6 +62,8 @@ pub enum Step {
     Eval { source: String, by: &'static str },
     /// The user resumed the page after it paused on an exception.
     Resume,
+    /// A `fetch` finished: its promise (a handle) and what it resolved with.
+    Fetch { promise: u32, result: Result<crate::gate::FetchResponse, String> },
 }
 
 impl Step {
@@ -72,6 +74,8 @@ impl Step {
             Step::Timers(t) => format!("{} timer(s)", t.len()),
             Step::Eval { by, .. } => format!("{by} input"),
             Step::Resume => "resumed after an exception".into(),
+            Step::Fetch { result: Ok(r), .. } => format!("fetch answered ({})", r.status),
+            Step::Fetch { result: Err(_), .. } => "fetch failed".into(),
         }
     }
 }
@@ -99,6 +103,10 @@ impl Step {
             Step::Timers(fired) => fired.len() * 16,
             Step::Eval { source, .. } => source.len(),
             Step::Resume => 0,
+            Step::Fetch { result, .. } => match result {
+                Ok(r) => r.url.len() + r.body.len() + r.headers.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>(),
+                Err(e) => e.len(),
+            },
         }
     }
 }
@@ -368,14 +376,14 @@ pub async fn replay(recording: &Recording, config: DocumentConfig, upto: Option<
         armed.push((recording.url.clone(), Tape::Replay { values, texts: recording.texts.clone(), diverged: None }));
     }
     let started = match program {
-        Program::Dart(wasm) => crate::dart_pack::start(doc, wasm),
-        Program::Scripts { pack: "python", scripts, .. } => crate::python_pack::start(doc, scripts),
+        Program::Dart(wasm) => crate::dart_pack::start(doc, Default::default(), wasm),
+        Program::Scripts { pack: "python", scripts, .. } => crate::python_pack::start(doc, Default::default(), scripts),
         Program::Scripts { scripts, imports, .. } => {
             let fetch = |url: String| {
                 let found = imports.iter().find(|(u, _)| *u == url).map(|(_, s)| s.clone()).with_context(|| format!("{url} wasn't fetched when this was recorded"));
                 async move { found }
             };
-            crate::js_pack::start(doc, scripts, fetch).await
+            crate::js_pack::start(doc, Default::default(), scripts, fetch).await
         }
     };
     // A start that failed early may not have taken its tape.

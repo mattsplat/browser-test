@@ -370,7 +370,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 |---|---|---|
 | `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | Missing | Needs the event loop to wake the pack; time comes from the host (principle 4) |
-| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Missing | Must go through the gate with the page's URL (`fetch_for_page`), so third-party rules apply |
+| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). `XMLHttpRequest` and `WebSocket` deferred |
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | Missing | Per origin, and per profile: keep it under `profile::dir()` |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
@@ -1050,6 +1050,63 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
     `fetch` (below) sends cookies only to its own origin.
   - Saving writes the whole file on each change with an expiry; fine for normal jars, a cost
     for sites that set many persistent cookies per response.
+
+**fetch** (`Window.fetch`, `gate::fetch_from_page`).
+- **Through the gate, as a request from the page.** `Gate::fetch_from_page` checks every hop
+  with the same `allow` as everything else (logged, third-party default-deny, block-all), and
+  follows redirects itself so a same-site URL can't redirect to a blocked site unchecked.
+  blitz-net gained `Provider::fetch_once` (one request, any status, its headers, no redirects,
+  no HTTP cache), with a cookie-carrying client and a credentialless one.
+- **Same origin by default; basic CORS for the rest.** Cookies go only to the page's own
+  origin (`credentials: "omit"` sends none; `"include"` is treated as same-origin, so cookies
+  never go cross-origin). A cross-origin response is readable only if
+  `Access-Control-Allow-Origin` is `*` or the page's origin; its headers are cut to the
+  CORS-safelisted ones plus `Access-Control-Expose-Headers`. There's **no preflight**: a
+  cross-origin request that would need one (another method, custom headers) is refused
+  before anything is sent. `Set-Cookie` is never exposed. Forbidden request headers
+  (`Cookie`, `Host`, `Origin`, `Sec-*`...) set by page code are dropped.
+- **Schemes:** http(s); `data:`; `file:` only from a file page and only in its folder or below
+  it (not anywhere on disk). Anything else rejects.
+- **Rejections** are `TypeError: Failed to fetch <url>: <why>` (blocked, CORS, network
+  error). JS gets a real `TypeError`.
+- **Async, in every pack.** The host has a small promise (`Obj::Promise`, `Objects::settle`):
+  `then(onFulfilled, onRejected)` callbacks run later as zero-delay "promise" timers with the
+  value, so they go through the same dispatch, release and replay machinery as timers. The
+  network task pushes its result to `Objects::fetched` and wakes the page's event loop;
+  `RunningPack::deliver_fetches` (from `poll`) settles the promise on the UI thread.
+  - **JS:** a real `Promise` (the prelude wraps host promises; `await` works). `json()`
+    parses with `JSON.parse`, so the page gets ordinary objects. Host objects aren't
+    thenable, so resolving with a `Response` doesn't call it.
+  - **Dart:** `package:web`'s `window.fetch(...).toDart` works unchanged: dart2wasm's
+    `p.then(s, (e) => f(e, e === undefined))` snippet is recognised (`PromiseThen`), and the
+    second argument is added for its rejection handler.
+  - **Python:** callbacks, `fetch(url).then(on_value, on_error)` (a `Promise` wrapper);
+    `then` returns None, so nest rather than chain. Chosen as the simplest that works with
+    RustPython without asyncio (there's no stdlib); `await` would need a small coroutine
+    driver in the prelude and is deferred.
+- **Plain objects can cross now** (needed for `fetch`'s `init` and headers): `Host::object`
+  (and `array`, `is_array` for Dart's `String.split`) makes an `Obj::Json`; the interpreter
+  wire format gained `{"obj": {...}}`; Dart object literals (`({method: x0, ...})`, `({})`
+  with `o[p] = v`) are recognised. Only data crosses (strings, numbers, booleans, null, other
+  plain objects), not functions or host objects inside them.
+- **Replay:** a finished fetch is a step (`Step::Fetch`, with the response), and replaying
+  sends nothing: the page's `fetch` makes a promise and the step settles it.
+- **AI:** `Window.fetch`, `Response.*`, `Headers.*` and `Promise.*` calls are hidden in
+  redacted trace views; bodies are never traced (they reach the pack as callback arguments).
+- **Tested** against a local server (`serve` in `page_document.rs` tests): same-origin GET with
+  a `Set-Cookie` that `document.cookie` then sees, POST with a header and body, a 404, a
+  redirect, a blocked third party, a CORS-allowed cross-origin read (no cookies sent) and a
+  refused one, identical in all three packs and replayed.
+- **Limitations and deferred:**
+  - Bodies are text only: no `arrayBuffer()`, `blob()`, `formData()`, streams, or binary
+    request bodies; invalid UTF-8 is replaced. At most 64 MB per response.
+  - No `Request`/`Headers` constructors, `AbortController`, or `mode: "no-cors"` (opaque
+    responses); `bodyUsed` is always false and a body can be read more than once.
+  - No HTTP cache for page fetches; no third-party cookie partitioning (none are sent).
+  - Response and promise handles live until the page goes (like element handles).
+  - A replayed page that then goes live has no network (it has no gate).
+  - **XMLHttpRequest deferred:** it isn't cheap on top of fetch (synchronous mode can't work
+    on the UI thread, and its event model is its own); new code uses fetch.
 
 ## Known local setup notes
 

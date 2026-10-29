@@ -14,7 +14,10 @@ METHODS = {
     'preventDefault', 'stopPropagation', 'stopImmediatePropagation',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
+    'fetch', 'then', 'text', 'json', 'get', 'has',
 }
+# Methods that return a host promise, wrapped in `Promise` (below).
+PROMISES = {'fetch', 'text', 'json'}
 
 # Callbacks by id, and each function's id, so passing the same function again (e.g. to
 # removeEventListener) gives the same id. The host says when an id can be released.
@@ -24,10 +27,15 @@ next_callback = 0
 
 
 def encode(v):
-    """A value as it crosses to the host: None → null, host object → {o: h}, function → {cb: id}."""
+    """A value as it crosses to the host: None → null, host object → {o: h}, function → {cb: id},
+    a dict (a fetch init, a history state) → {obj: {...}}."""
     global next_callback
     if isinstance(v, HostObject):
         return {'o': v._handle}
+    if isinstance(v, Promise):
+        return {'o': v._host._handle}
+    if isinstance(v, dict):
+        return {'obj': {str(k): encode(x) for k, x in v.items()}}
     if v is None or isinstance(v, (bool, int, float, str)):
         return v
     if callable(v):
@@ -73,7 +81,10 @@ class HostObject:
             raise AttributeError(name)
         h = self._handle
         if name in METHODS:
-            return lambda *args: request({'op': 'call', 'target': h, 'name': name, 'args': [encode(a) for a in args]})
+            def call(*args):
+                result = request({'op': 'call', 'target': h, 'name': name, 'args': [encode(a) for a in args]})
+                return Promise(result) if name in PROMISES else result
+            return call
         return request({'op': 'get', 'target': h, 'name': name}, AttributeError)
 
     def __setattr__(self, name, value):
@@ -89,6 +100,23 @@ class HostObject:
 
     def __repr__(self):
         return describe(self)
+
+
+class Promise:
+    """A host promise (from fetch, Response.text(), Response.json()). `then(on_value, on_error)`
+    calls one of them later, from the event loop, never during the call; it returns None, so
+    nest calls rather than chaining them. A rejection's reason is a message such as
+    "TypeError: Failed to fetch ..."."""
+    __slots__ = ('_host',)
+
+    def __init__(self, host):
+        self._host = host
+
+    def then(self, on_value=None, on_error=None):
+        self._host.then(on_value, on_error)
+
+    def __repr__(self):
+        return 'Promise'
 
 
 window = request({'op': 'global', 'name': 'window'})
@@ -123,6 +151,11 @@ def cancelAnimationFrame(handle):
     window.cancelAnimationFrame(handle)
 
 
+def fetch(input, init=None):
+    """The network, through the page's gate: a Promise of a Response."""
+    return window.fetch(input, init)
+
+
 def print(*args, sep=' ', end='\n', file=None, flush=False):
     console.log(sep.join(str(a) for a in args))
 
@@ -148,7 +181,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}

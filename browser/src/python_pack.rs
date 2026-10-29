@@ -25,8 +25,8 @@ pub static PYTHON: Language = Language {
 
 /// Run a page's Python scripts in order, in one shared namespace (like a browser's global
 /// scope). An error in one is reported (in the trace) and the next still runs.
-pub fn start(doc: BaseDocument, scripts: &[Script]) -> Result<PackDocument> {
-    let (host, mut startup) = PackDocument::starting(doc, "python");
+pub fn start(doc: BaseDocument, env: crate::host::PageEnv, scripts: &[Script]) -> Result<PackDocument> {
+    let (host, mut startup) = PackDocument::starting(doc, env, "python");
     let mut runtime = Interpreter::load(&PYTHON, Box::new(host))?;
     runtime.run_scripts(scripts, &mut startup);
     Ok(startup.finish(Box::new(runtime)))

@@ -254,6 +254,8 @@ async fn build_page_document(
     let favicon_url = document.favicon_url();
 
     let page_url = document.url().clone();
+    // What the page's code reaches beyond its document: the network, through its gate.
+    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)) };
     let Some(src) = dart_script_url(&document) else {
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");
@@ -265,7 +267,7 @@ async fn build_page_document(
             }
             let sources = fetch_sources("python", &scripts, &page_url, net_provider, signal).await;
             arm(&page_url);
-            return match python_pack::start(document, &sources) {
+            return match python_pack::start(document, env, &sources) {
                 Ok(python) => {
                     record(&python, replay::Program::Scripts { pack: "python", scripts: sources, imports: Vec::new() });
                     (shown_pack(python), title, favicon_url)
@@ -307,7 +309,7 @@ async fn build_page_document(
             }
         };
         arm(&page_url);
-        return match js_pack::start(document, &sources, fetch_import).await {
+        return match js_pack::start(document, env, &sources, fetch_import).await {
             Ok(js) => {
                 record(&js, replay::Program::Scripts { pack: "js", scripts: sources, imports: imports.take() });
                 (shown_pack(js), title, favicon_url)
@@ -340,7 +342,7 @@ async fn build_page_document(
         }
     };
     arm(&page_url);
-    match dart_pack::start(document, &wasm) {
+    match dart_pack::start(document, env, &wasm) {
         Ok(dart) => {
             record(&dart, replay::Program::Dart(wasm));
             (shown_pack(dart), title, favicon_url)

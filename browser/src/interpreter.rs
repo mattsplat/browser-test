@@ -269,11 +269,12 @@ fn dispatch(host: &mut dyn Host, request: &Value) -> Result<Value> {
         Some("global") => host.global(&name()?)?,
         Some("get") => host.get(&target()?, &name()?)?,
         Some("set") => {
-            host.set(&target()?, &name()?, &decode(field("value")?)?)?;
+            let value = decode(host, field("value")?)?;
+            host.set(&target()?, &name()?, &value)?;
             HostValue::Undefined
         }
         Some("call") => {
-            let args = field("args")?.as_array().context("args is not an array")?.iter().map(decode).collect::<Result<Vec<_>>>()?;
+            let args = field("args")?.as_array().context("args is not an array")?.iter().map(|a| decode(host, a)).collect::<Result<Vec<_>>>()?;
             host.call(&target()?, &name()?, &args)?
         }
         Some("console") => {
@@ -285,9 +286,10 @@ fn dispatch(host: &mut dyn Host, request: &Value) -> Result<Value> {
     encode(&value)
 }
 
-/// JSON → host value. Undefined, host objects and callbacks use small tagged objects:
-/// `{"u": 1}`, `{"o": handle}`, `{"cb": id}`.
-fn decode(v: &Value) -> Result<HostValue> {
+/// JSON → host value. Undefined, host objects, callbacks and plain objects use small tagged
+/// objects: `{"u": 1}`, `{"o": handle}`, `{"cb": id}`, `{"obj": {name: value, ...}}` (a plain
+/// object the page built, which becomes a host object).
+fn decode(host: &mut dyn Host, v: &Value) -> Result<HostValue> {
     Ok(match v {
         Value::Null => HostValue::Null,
         Value::Bool(b) => HostValue::Bool(*b),
@@ -296,6 +298,10 @@ fn decode(v: &Value) -> Result<HostValue> {
         Value::Object(o) if o.contains_key("u") => HostValue::Undefined,
         Value::Object(o) if o.contains_key("o") => HostValue::Object(o["o"].as_u64().context("bad handle")? as u32),
         Value::Object(o) if o.contains_key("cb") => HostValue::CallbackId(o["cb"].as_u64().context("bad callback")? as usize),
+        Value::Object(o) if o.contains_key("obj") => {
+            let fields = o["obj"].as_object().context("bad object")?.iter().map(|(k, v)| Ok((k.clone(), decode(host, v)?))).collect::<Result<Vec<_>>>()?;
+            host.object(fields)?
+        }
         other => bail!("the value {other} cannot be passed to the host yet"),
     })
 }

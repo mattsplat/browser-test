@@ -29,7 +29,7 @@ use wasmtime::{Config, Engine, Trap};
 
 use crate::debug;
 use crate::replay;
-use crate::host::{self, EventDetails, HostValue, Obj, Objects, PageHost, TimerInfo, TraceEntry, TraceKind};
+use crate::host::{self, EventDetails, HostValue, Obj, Objects, PageEnv, PageHost, TimerInfo, TraceEntry, TraceKind};
 
 /// What the document needs from a pack. Every call runs on the UI thread, one at a time,
 /// under the time limit (`TIME_LIMIT_TICKS`).
@@ -176,7 +176,7 @@ pub struct RunningPack {
     /// Set by an uncaught error while pause on exceptions is on. The pack gets no events or
     /// timers until resumed (timers due meanwhile run on resume).
     paused: Cell<bool>,
-    /// Wakes the event loop when the next timer is due (set from `poll`).
+    /// Wakes the event loop when the next timer is due or a fetch finished (set from `poll`).
     waker: Arc<Mutex<Option<Waker>>>,
     timer_thread: RefCell<Option<Sender<Instant>>>,
     /// How many times each callback has been called, for the Inspector's Handles view.
@@ -316,16 +316,29 @@ impl RunningPack {
         if due.is_empty() {
             return false;
         }
-        self.objects.borrow_mut().tape.step(|| replay::Step::Timers(due.iter().map(|t| (t.handle, t.args.first().and_then(|a| a.as_num()))).collect()));
+        let frames = due.iter().map(|t| (t.handle, if t.kind == "animation frame" { t.args.first().and_then(|a| a.as_num()) } else { None }));
+        let frames = frames.collect();
+        self.objects.borrow_mut().tape.step(|| replay::Step::Timers(frames));
         for timer in &due {
-            let during = if timer.args.is_empty() { "timer" } else { "animation frame" };
-            if let Err(e) = self.call(timer.callback, &timer.args, during, String::new()) {
-                self.uncaught(during, String::new(), &e);
+            if let Err(e) = self.call(timer.callback, &timer.args, timer.kind, String::new()) {
+                self.uncaught(timer.kind, String::new(), &e);
             }
         }
         self.objects.borrow_mut().after_timers_ran(&due);
         release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
         true
+    }
+
+    /// Settle the promises of fetches that finished (each one a recorded step), so their
+    /// callbacks run with the due timers. Returns whether any did.
+    fn deliver_fetches(&self) -> bool {
+        let done = self.objects.borrow_mut().take_fetched();
+        for (promise, result) in &done {
+            let mut objects = self.objects.borrow_mut();
+            objects.tape.step(|| replay::Step::Fetch { promise: *promise, result: result.clone() });
+            objects.deliver_fetch(*promise, result.clone());
+        }
+        !done.is_empty()
     }
 
     /// Deliver an event of type `kind` along `chain` (target first, then its ancestors) to
@@ -409,6 +422,7 @@ impl RunningPack {
                 let _ = self.eval(source, by);
             }
             replay::Step::Resume => self.paused.set(false),
+            replay::Step::Fetch { promise, result } => self.objects.borrow_mut().deliver_fetch(*promise, result.clone()),
         }
         Ok(())
     }
@@ -515,6 +529,7 @@ impl Startup {
         let running = self.started.elapsed().saturating_sub(self.waiting);
         let micros = (running.as_micros() as u64).saturating_sub(self.objects.borrow().host_micros.get());
         host::record(TraceEntry { pack: self.name, kind: TraceKind::Pack, page: self.page.clone(), call: "start".into(), args: String::new(), result: String::new(), micros });
+        let waker = self.objects.borrow().waker.clone();
         let pack = RunningPack {
             name: self.name,
             page: self.page,
@@ -523,7 +538,7 @@ impl Startup {
             can_eval: runtime.can_eval(),
             runtime: RefCell::new(runtime),
             paused: Cell::new(self.paused),
-            waker: Default::default(),
+            waker,
             timer_thread: Default::default(),
             fires: Default::default(),
         };
@@ -568,10 +583,10 @@ impl PackDocument {
     /// Start pack `name` on the page `doc`: the host the pack talks to (load the pack with
     /// it), and the `Startup` to report to while the page's code runs. Each page gets its own
     /// host, objects and pack instance; nothing is shared between pages or packs.
-    pub fn starting(doc: BaseDocument, name: &'static str) -> (PageHost, Startup) {
+    pub fn starting(doc: BaseDocument, env: PageEnv, name: &'static str) -> (PageHost, Startup) {
         let doc = Rc::new(RefCell::new(doc));
         let objects = Rc::new(RefCell::new(Objects::default()));
-        let host = PageHost::new(name, doc.clone(), objects.clone());
+        let host = PageHost::new(name, doc.clone(), objects.clone(), env);
         let page = host.page.clone();
         // A recording or replay armed for this page starts with it, before the pack reads
         // anything.
@@ -723,9 +738,10 @@ impl Document for PackDocument {
                 *waker = Some(cx.waker().clone());
             }
         }
+        let delivered = self.pack.deliver_fetches();
         let ran = self.pack.run_due_timers();
         self.pack.arm_timers();
-        ran
+        delivered || ran
     }
 }
 
@@ -776,7 +792,7 @@ mod tests {
         let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
         let wasm = compile("../examples/counter/main.dart").await;
         let doc = HtmlDocument::from_html(&html, DocumentConfig::default()).into_inner();
-        let page = crate::dart_pack::start(doc, &wasm).unwrap();
+        let page = crate::dart_pack::start(doc, Default::default(), &wasm).unwrap();
         assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Dart is running. No JavaScript on this page.");
 
         // Deliver two clicks the way the event handler does: the button's click listeners,
@@ -802,7 +818,7 @@ mod tests {
     async fn errors_and_stack_traces_show_dart_lines() {
         let wasm = compile("tests/fixtures/throws.dart").await;
         let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
-        let page = crate::dart_pack::start(doc, &wasm).unwrap();
+        let page = crate::dart_pack::start(doc, Default::default(), &wasm).unwrap();
 
         // main() printed StackTrace.current, from line 4.
         let printed = host::trace().into_iter().find(|e| e.call == "console" && e.args.starts_with("stack:")).unwrap();
@@ -835,7 +851,7 @@ mod tests {
             let found = files.get(&url).cloned().ok_or_else(|| anyhow::anyhow!("404 {url}"));
             async move { found }
         };
-        futures_lite_block_on(crate::js_pack::start(doc, scripts, fetch)).expect("JS engine missing? run packs/js/build.sh")
+        futures_lite_block_on(crate::js_pack::start(doc, Default::default(), scripts, fetch)).expect("JS engine missing? run packs/js/build.sh")
     }
 
     /// Drive a future that never actually waits (test fetches resolve immediately).
@@ -862,13 +878,14 @@ mod tests {
         assert_eq!(text_of(&doc, "#log"), "Click 1, handled in JS (click)Click 2, handled in JS (click)");
     }
 
-    /// JS sees the web platform through the host and nothing else.
+    /// JS sees the web platform through the host and nothing else. (`fetch` exists, but goes
+    /// through the host and the page's gate: see the web API test.)
     #[test]
     fn js_has_no_side_doors() {
         let page = js_page(
             "<p id=out></p>",
             &[r#"
-                const reachable = ['fetch', 'XMLHttpRequest', 'require', 'process', 'WebSocket', 'Deno', 'Bun']
+                const reachable = ['XMLHttpRequest', 'require', 'process', 'WebSocket', 'Deno', 'Bun']
                     .filter((name) => typeof globalThis[name] !== 'undefined');
                 const r = Math.random();
                 document.querySelector('#out').textContent = reachable.length + ' ' + (r >= 0 && r < 1);
@@ -924,14 +941,14 @@ mod tests {
     async fn events_page(pack: &str) -> PackDocument {
         let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig::default()).into_inner();
         match pack {
-            "dart" => crate::dart_pack::start(doc, &compile("tests/fixtures/events.dart").await).unwrap(),
+            "dart" => crate::dart_pack::start(doc, Default::default(), &compile("tests/fixtures/events.dart").await).unwrap(),
             "python" => {
                 let script = Script { name: "events.py".into(), source: include_str!("../tests/fixtures/events.py").into(), module: false };
-                crate::python_pack::start(doc, &[script]).expect("Python pack missing? run packs/python/build.sh")
+                crate::python_pack::start(doc, Default::default(), &[script]).expect("Python pack missing? run packs/python/build.sh")
             }
             _ => {
                 let script = Script { name: "events.js".into(), source: include_str!("../tests/fixtures/events.js").into(), module: false };
-                crate::js_pack::start(doc, &[script], |_| async { anyhow::bail!("no imports") }).await.unwrap()
+                crate::js_pack::start(doc, Default::default(), &[script], |_| async { anyhow::bail!("no imports") }).await.unwrap()
             }
         }
     }
@@ -1024,71 +1041,168 @@ mod tests {
         }
     }
 
-    // ---- Cross-pack: the web platform beyond the DOM (cookies, ...), the same page in each pack.
+    // ---- Cross-pack: the web platform beyond the DOM (cookies, fetch, ...), the same page in
+    // ---- each pack, against a local server (nothing leaves the machine).
 
-    const WEB_API_HTML: &str = include_str!("../tests/fixtures/web_api.html");
+    /// A small HTTP/1.1 server on 127.0.0.1 for the duration of the test process:
+    /// `answer(method, path, headers, body)` gives (status, extra header lines, body).
+    /// Returns its base URL.
+    fn serve(answer: fn(&str, &str, &str, &str) -> (u16, String, String)) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut stream = stream;
+                    loop {
+                        let mut head = String::new();
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            head.push_str(&line.to_ascii_lowercase());
+                        }
+                        let mut words = head.split_whitespace();
+                        let (method, path) = (words.next().unwrap_or_default().to_ascii_uppercase(), words.next().unwrap_or_default().to_string());
+                        let length = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+                        let mut body = vec![0; length];
+                        let _ = reader.read_exact(&mut body);
+                        let (status, extra, text) = answer(&method, &path, &head, &String::from_utf8_lossy(&body));
+                        let reply = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\n{extra}\r\n{text}", text.len());
+                        if stream.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        base
+    }
 
-    async fn web_api_page(pack: &str, url: &str) -> PackDocument {
-        let doc = HtmlDocument::from_html(WEB_API_HTML, DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
-        let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
-        match pack {
-            "dart" => crate::dart_pack::start(doc, &compile("tests/fixtures/web_api.dart").await).unwrap(),
-            "python" => crate::python_pack::start(doc, &script("web_api.py", include_str!("../tests/fixtures/web_api.py"))).unwrap(),
-            _ => crate::js_pack::start(doc, &script("web_api.js", include_str!("../tests/fixtures/web_api.js")), |_| async { anyhow::bail!("no imports") }).await.unwrap(),
+    /// The page's own server.
+    fn same_origin_answer(method: &str, path: &str, headers: &str, body: &str) -> (u16, String, String) {
+        let cookie = if headers.contains("fromserver=1") { "yes" } else { "no" };
+        match (method, path) {
+            ("GET", "/app/data.json") => (200, "Content-Type: application/json\r\nSet-Cookie: fromserver=1; Path=/\r\n".into(), r#"{"name":"web","n":3}"#.into()),
+            ("POST", "/app/echo") => {
+                let x_a = headers.lines().find_map(|l| l.strip_prefix("x-a:")).unwrap_or_default().trim();
+                (200, "Content-Type: text/plain\r\n".into(), format!("{method} {body} {x_a} cookie:{cookie}"))
+            }
+            ("GET", "/app/redirect") => (302, "Location: /app/data.json\r\n".into(), String::new()),
+            _ => (404, String::new(), "nope".into()),
         }
     }
 
+    /// Another origin (another port): one answer readable cross-origin, one not.
+    fn cross_origin_answer(_method: &str, path: &str, headers: &str, _body: &str) -> (u16, String, String) {
+        let cookie = if headers.contains("cookie:") { "sent" } else { "none" };
+        match path {
+            "/cors" => (200, "Access-Control-Allow-Origin: *\r\n".into(), format!("cookies {cookie}")),
+            _ => (200, String::new(), "secret".into()),
+        }
+    }
+
+    /// What the web API page prints, in every pack.
+    const WEB_API_OUTPUT: &[&str] = &[
+        "cookie:a=1; b=2",
+        "cookie:b=2",
+        "fetch:200,true,application/json,null",
+        "json:web,3",
+        "cookie:b=2; fromserver=1",
+        "echo:POST hello b cookie:yes",
+        "missing:404,false,nope",
+        "redirect:200,true",
+        "blocked:TypeError",
+        "cors:cookies none",
+        "nocors:TypeError",
+    ];
+
+    fn web_api_program(pack: &str, wasm: &[u8]) -> replay::Program {
+        let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+        match pack {
+            "dart" => replay::Program::Dart(wasm.to_vec()),
+            "python" => replay::Program::Scripts { pack: "python", scripts: script("web_api.py", include_str!("../tests/fixtures/web_api.py")), imports: Vec::new() },
+            _ => replay::Program::Scripts { pack: "js", scripts: script("web_api.js", include_str!("../tests/fixtures/web_api.js")), imports: Vec::new() },
+        }
+    }
+
+    /// Run the page's timers and deliver its fetches until both are done (or 5 s pass),
+    /// letting the network's tasks run in between.
+    async fn settle_network(page: &mut PackDocument) {
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        while Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            page.pack.deliver_fetches();
+            page.pack.run_due_timers();
+            let objects = page.pack.objects.borrow();
+            if !objects.fetching() && objects.next_deadline().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// One page using cookies and fetch (`tests/fixtures/web_api.*`), the same in every pack.
+    /// Recorded as it runs: a replay ends with the same DOM after the cookies have changed and
+    /// with no network at all, because cookie reads and fetch responses are on the recording.
+    /// The AI's redacted trace never shows a cookie value or a response, though the user's own
+    /// trace does.
     #[tokio::test]
     async fn web_apis_behave_the_same_in_dart_js_and_python() {
         use blitz_net::CookieStore as _;
+        crate::cookies::install();
+        let base = serve(same_origin_answer);
+        let cross = serve(cross_origin_answer);
+        let html = include_str!("../tests/fixtures/web_api.html").replace("CROSS_ORIGIN", &cross);
+        let url = blitz_traits::net::Url::parse(&format!("{base}app/page.html")).unwrap();
+        let origin = crate::settings::origin_of(&url);
+        let gate = std::sync::Arc::new(crate::gate::Gate::new(std::sync::Arc::new(blitz_net::Provider::new(None))));
+        let wasm = compile("tests/fixtures/web_api.dart").await;
+        let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
         for pack in ["dart", "js", "python"] {
-            // Each pack on its own site: the profile's cookie jar is shared by every test.
-            let url = blitz_traits::net::Url::parse(&format!("http://web-api-{pack}.test/app/page.html")).unwrap();
-            // A cookie the server set, HttpOnly: page code must never see it.
+            // The packs share the server's site, and the profile's jar: start each afresh, with
+            // a cookie the server set, HttpOnly, which page code must never see.
+            crate::cookies::jar().clear_site("127.0.0.1");
             let server = blitz_net::HeaderValue::from_static("server=secret; HttpOnly; Path=/");
             crate::cookies::jar().set_cookies(&mut [server].iter(), &url);
-            let mut page = web_api_page(pack, url.as_str()).await;
-            settle_timers(&mut page);
-            assert_eq!(output(&page), "cookie:a=1; b=2|cookie:b=2", "{pack}: {:?}", errors_on(url.as_str()));
-        }
-    }
 
-    /// The web API page, recorded: a replay ends with the same DOM even after the cookies
-    /// it read have changed, because the reads are on the tape; and the AI's redacted trace
-    /// never shows a cookie value, though the user's own trace does.
-    #[tokio::test]
-    async fn web_api_reads_replay_from_the_tape_and_stay_out_of_ai_views() {
-        for pack in ["dart", "js", "python"] {
-            let url = format!("http://web-api-replay-{pack}.test/app/page.html");
-            replay::arm(&url);
-            let page = web_api_page(pack, &url).await;
-            let program = match pack {
-                "dart" => replay::Program::Dart(compile("tests/fixtures/web_api.dart").await),
-                "python" => replay::Program::Scripts { pack: "python", scripts: vec![Script { name: "web_api.py".into(), source: include_str!("../tests/fixtures/web_api.py").into(), module: false }], imports: Vec::new() },
-                _ => replay::Program::Scripts { pack: "js", scripts: vec![Script { name: "web_api.js".into(), source: include_str!("../tests/fixtures/web_api.js").into(), module: false }], imports: Vec::new() },
+            replay::arm(url.as_str());
+            let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.to_string()), ..Default::default() }).into_inner();
+            let env = PageEnv { gate: Some(gate.clone()) };
+            let mut page = match pack {
+                "dart" => crate::dart_pack::start(doc, env, &wasm).unwrap(),
+                "python" => crate::python_pack::start(doc, env, &script("web_api.py", include_str!("../tests/fixtures/web_api.py"))).unwrap(),
+                _ => crate::js_pack::start(doc, env, &script("web_api.js", include_str!("../tests/fixtures/web_api.js")), |_| async { anyhow::bail!("no imports") }).await.unwrap(),
             };
-            page.attach_recording(WEB_API_HTML, None, program);
+            page.attach_recording(&html, None, web_api_program(pack, &wasm));
+            settle_network(&mut page).await;
+            assert_eq!(output(&page).split('|').collect::<Vec<_>>(), WEB_API_OUTPUT, "{pack}: {:?}", errors_on(url.as_str()));
             let recording = page.pack.stop_recording().unwrap();
             assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Cookie), "{pack}: cookie reads are on the tape");
+            assert!(recording.steps.iter().any(|s| matches!(s, replay::Step::Fetch { .. })), "{pack}: responses are steps");
 
-            // The jar changes afterwards; the replay still reads what the recording did, and
-            // doesn't write to the real jar.
-            let parsed = blitz_traits::net::Url::parse(&url).unwrap();
-            crate::cookies::jar().set_document_cookie(&parsed, "b=changed; Path=/");
-            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
-            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            // The jar changes afterwards; the replay still reads what the recording did, sends
+            // nothing, and doesn't write to the real jar.
+            crate::cookies::jar().set_document_cookie(&url, "b=changed; Path=/");
+            let config = DocumentConfig { base_url: Some(url.to_string()), ..Default::default() };
+            let (mut replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            settle_timers(&mut replayed);
             assert_eq!(outcome.diverged, None, "{pack}");
             assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
-            assert_eq!(crate::cookies::jar().document_cookie(&parsed), "b=changed", "{pack}: the replay left the jar alone");
+            assert_eq!(crate::cookies::jar().document_cookie(&url), "b=changed; fromserver=1", "{pack}: the replay left the jar alone");
 
-            let origin = crate::settings::origin_of(&parsed);
             let full = debug::trace(&origin, debug::Privacy::Full, usize::MAX);
             assert!(full.iter().any(|e| e.call == "Document.cookie" && e.result.contains("b=2")), "{pack}: the user's trace shows it");
             let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
-            assert!(redacted.iter().any(|e| e.call == "Document.cookie"), "{pack}");
+            assert!(redacted.iter().any(|e| e.call == "Document.cookie") && redacted.iter().any(|e| e.call == "Window.fetch"), "{pack}");
             // (What the page itself writes into its DOM is the page's output, and isn't hidden.)
             let secret = |e: &&TraceEntry| debug::holds_secrets(&e.call);
-            assert!(redacted.iter().filter(secret).all(|e| e.args == debug::HIDDEN && e.result == debug::HIDDEN), "{pack}: a cookie value reached the AI's view");
+            assert!(redacted.iter().filter(secret).all(|e| e.args == debug::HIDDEN && e.result == debug::HIDDEN), "{pack}: a secret reached the AI's view");
         }
     }
 
@@ -1106,15 +1220,15 @@ mod tests {
         replay::arm(&url);
         let (mut page, program) = match pack {
             "dart" => {
-                (crate::dart_pack::start(doc, &wasm).unwrap(), replay::Program::Dart(wasm))
+                (crate::dart_pack::start(doc, Default::default(), &wasm).unwrap(), replay::Program::Dart(wasm))
             }
             "python" => {
                 let scripts = vec![Script { name: "events.py".into(), source: include_str!("../tests/fixtures/events.py").into(), module: false }];
-                (crate::python_pack::start(doc, &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+                (crate::python_pack::start(doc, Default::default(), &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
             }
             _ => {
                 let scripts = vec![Script { name: "events.js".into(), source: include_str!("../tests/fixtures/events.js").into(), module: false }];
-                let page = crate::js_pack::start(doc, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                let page = crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
                 (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
             }
         };
@@ -1193,7 +1307,7 @@ mod tests {
             const b = document.querySelector('#b'), out = document.querySelector('#out');
             b.addEventListener('click', () => { throw new Error('first listener fails'); });
             b.addEventListener('click', () => { out.textContent += 'second ran;'; });".into(), module: false }];
-        let mut page = crate::js_pack::start(doc, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+        let mut page = crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
         page.attach_recording("<button id=b>go</button><p id=out></p>", None, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() });
         debug::set_pause_on_exceptions(true);
         dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
@@ -1293,7 +1407,7 @@ mod tests {
         assert!(err.contains("ReferenceError"), "{err}");
 
         // No side doors from the console either.
-        assert_eq!(eval("typeof fetch").unwrap(), "\"undefined\"");
+        assert_eq!(eval("typeof XMLHttpRequest").unwrap(), "\"undefined\"");
 
         let trace = host::trace();
         assert!(trace.iter().any(|e| e.pack == "console" && e.call == "eval" && e.args == "bump()" && e.result == "42"));
@@ -1406,7 +1520,7 @@ mod tests {
     async fn runaway_dart_is_stopped() {
         let wasm = compile("tests/fixtures/spins.dart").await;
         let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
-        let page = crate::dart_pack::start(doc, &wasm).unwrap();
+        let page = crate::dart_pack::start(doc, Default::default(), &wasm).unwrap();
         let (button, id) = listener(&page, "#go", "click");
         let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
         let err = page.pack.fire(id, &[event.clone()]).unwrap_err().to_string();
@@ -1450,7 +1564,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| Script { name: format!("test-{}.py", i + 1), source: s.to_string(), module: false })
             .collect();
-        crate::python_pack::start(doc, &scripts).expect("Python pack missing? run packs/python/build.sh")
+        crate::python_pack::start(doc, Default::default(), &scripts).expect("Python pack missing? run packs/python/build.sh")
     }
 
     /// The Python counter example, end to end: its inline script in the Python pack
@@ -1548,7 +1662,7 @@ mod tests {
     fn python_has_no_side_doors() {
         let page = python_page("<p id=out></p>", &[r#"
 reachable = []
-for name in ['fetch', 'XMLHttpRequest', 'require']:
+for name in ['XMLHttpRequest', 'require']:
     if name in dir(__builtins__) or name in globals():
         reachable.append(name)
 for module in ['os', 'socket', 'subprocess', 'urllib', 'http', 'js', 'pyodide', 'ctypes']:
@@ -1609,7 +1723,7 @@ document.querySelector('#out').textContent = f'{len(reachable)} {0 <= r < 1} {re
         let config = DocumentConfig { base_url: Some(url.into()), ..Default::default() };
         let doc = HtmlDocument::from_html("<p id=out></p>", config).into_inner();
         let scripts: Vec<Script> = scripts.iter().map(|s| Script { name: "test.py".into(), source: s.to_string(), module: false }).collect();
-        crate::python_pack::start(doc, &scripts).unwrap()
+        crate::python_pack::start(doc, Default::default(), &scripts).unwrap()
     }
 
     fn errors_on(page: &str) -> Vec<String> {

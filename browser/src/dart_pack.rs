@@ -50,6 +50,8 @@ struct State {
     source_map: Option<SourceMap>,
     /// The function `build.sh`'s entry point registers to format errors with Dart's toString.
     describe_error: Option<usize>,
+    /// Rejection handlers from `PromiseThen`, which take (reason, reason === undefined).
+    two_argument_rejections: std::collections::HashSet<usize>,
     limits: StoreLimits,
 }
 
@@ -60,7 +62,7 @@ impl DartRuntime {
         // A broken map only costs readable stack traces, so don't fail the page over it.
         let source_map = custom_section(wasm, "dart2wasm-sourcemap")?
             .and_then(|json| SourceMap::parse(&String::from_utf8_lossy(json)).inspect_err(|e| tracing::warn!("{e:#}")).ok());
-        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None, limits: memory_limits() };
+        let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None, two_argument_rejections: Default::default(), limits: memory_limits() };
         let mut store = Store::new(engine(), state);
         store.limiter(|state| &mut state.limits);
         // Instantiating may run code too.
@@ -161,6 +163,10 @@ impl DartRuntime {
         // The trampoline is `wasmFunction(f, arguments.length, x0, ...)`: closure, argument
         // count, then the arguments, converted to whatever types the trampoline declares.
         let ty = func.ty(&self.store);
+        let mut args = args.to_vec();
+        if self.store.data().two_argument_rejections.contains(&id) {
+            args.push(HostValue::Bool(matches!(args.first(), Some(HostValue::Undefined) | None)));
+        }
         let mut values = vec![HostValue::Opaque(closure), HostValue::Num(args.len() as f64)];
         values.extend(args.iter().cloned());
         let params: Vec<ValType> = ty.params().collect();
@@ -180,6 +186,7 @@ impl DartRuntime {
         if let Some(slot) = self.store.data_mut().callbacks.get_mut(id) {
             *slot = None;
         }
+        self.store.data_mut().two_argument_rejections.remove(&id);
     }
 
     /// Run one task dart2wasm scheduled (a timer firing), then its microtasks.
@@ -269,10 +276,10 @@ impl DartRuntime {
 
 /// Load a Dart program against the page `doc` and run its `main`. An error out of `main`
 /// fails the start: the loader traces it and shows it in place of the page.
-pub fn start(doc: blitz_dom::BaseDocument, wasm: &[u8]) -> Result<PackDocument> {
+pub fn start(doc: blitz_dom::BaseDocument, env: crate::host::PageEnv, wasm: &[u8]) -> Result<PackDocument> {
     let origin = crate::settings::origin_of(doc.url());
     let module = compiled(wasm, &origin, crate::profile::dir())?;
-    let (host, startup) = PackDocument::starting(doc, "dart");
+    let (host, startup) = PackDocument::starting(doc, env, "dart");
     let mut runtime = DartRuntime::load(wasm, &module, Box::new(host))?;
     if let Err(e) = runtime.run_main() {
         // A snapshot keeps the page's state from just before.
@@ -449,6 +456,17 @@ enum Helper {
     SetTimer { repeat: bool },
     /// `clearTimeout(handle)` / `clearInterval(handle)`
     ClearTimer,
+    /// `(p, s, f) => p.then(s, (e) => f(e, e === undefined))`: `JSPromise.toDart`. Dart's
+    /// rejection handler takes a second argument, whether the reason was undefined.
+    PromiseThen,
+    /// `(x0,x1) => ({a: x0,b: x1})`, or `() => ({})`: an object literal with these fields.
+    ObjectLiteral(Vec<String>),
+    /// `(o, p, v) => o[p] = v`
+    SetIndex,
+    /// `(string, token) => string.split(token)`
+    Split,
+    /// `o => o instanceof Array`
+    IsArray,
     Unsupported(String),
 }
 
@@ -470,8 +488,18 @@ fn classify(body: &str) -> Helper {
             return helper(c[1].to_string());
         }
     }
+    static LITERAL: OnceLock<Regex> = OnceLock::new();
+    let literal = LITERAL.get_or_init(|| Regex::new(r"^\((?:x\d+(?:,x\d+)*)?\) => \(\{(.*)\}\)$").unwrap());
+    if let Some(c) = literal.captures(b) {
+        let names = c[1].split(',').filter_map(|f| f.split_once(':')).map(|(name, _)| name.trim().to_string()).collect();
+        return Helper::ObjectLiteral(names);
+    }
     match b {
         "b => !!b" => Helper::Truthy,
+        "(p, s, f) => p.then(s, (e) => f(e, e === undefined))" => Helper::PromiseThen,
+        "(o, p, v) => o[p] = v" => Helper::SetIndex,
+        "(string, token) => string.split(token)" => Helper::Split,
+        "o => o instanceof Array" => Helper::IsArray,
         "(l, r) => l === r" => Helper::StrictEquals,
         "(s, p, i) => s.lastIndexOf(p, i)" => Helper::LastIndexOf,
         _ if b.contains("queueMicrotask(") => Helper::QueueMicrotask,
@@ -484,8 +512,8 @@ fn classify(body: &str) -> Helper {
         "o => String(o)" => Helper::ToStr,
         "s => JSON.stringify(s)" => Helper::JsonStringify,
         "o => o" => Helper::Identity,
-        "o => o.length" => Helper::Get("length".into()),
-        "(o, i) => o[i]" => Helper::Index,
+        "o => o.length" | "a => a.length" => Helper::Get("length".into()),
+        "(o, i) => o[i]" | "(o, p) => o[p]" | "(a, i) => a[i]" => Helper::Index,
         "(string, times) => string.repeat(times)" => Helper::Repeat,
         // DateTime.now() imports `Date.now` itself.
         "() => Date.now()" | "Date.now" => Helper::DateNow,
@@ -794,6 +822,36 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
             }
             (other, _) => bail!("setting globalThis.{other} is not supported yet"),
         },
+        Helper::PromiseThen => {
+            let args = host_args(caller, params)?;
+            if let HostValue::CallbackId(id) = args[2] {
+                caller.data_mut().two_argument_rejections.insert(id);
+            }
+            caller.data_mut().host.call(&args[0], "then", &args[1..])?
+        }
+        Helper::ObjectLiteral(names) => {
+            let args = host_args(caller, params)?;
+            let fields = names.iter().cloned().zip(args).collect();
+            caller.data_mut().host.object(fields)?
+        }
+        Helper::SetIndex => {
+            let args = host_args(caller, params)?;
+            caller.data_mut().host.set(&args[0], &args[1].display(), &args[2])?;
+            args[2].clone()
+        }
+        Helper::IsArray => {
+            let value = to_host(caller, &params[0])?;
+            HostValue::Bool(caller.data_mut().host.is_array(&value))
+        }
+        Helper::Split => {
+            let (text, token) = (to_host(caller, &params[0])?.display(), to_host(caller, &params[1])?.display());
+            let parts: Vec<HostValue> = if token.is_empty() {
+                text.encode_utf16().map(|u| HostValue::Str(vec![u])).collect()
+            } else {
+                text.split(token.as_str()).map(HostValue::str).collect()
+            };
+            caller.data_mut().host.array(parts)?
+        }
         Helper::Truthy => HostValue::Bool(to_host(caller, &params[0])?.truthy()),
         Helper::StrictEquals => {
             let (l, r) = (to_host(caller, &params[0])?, to_host(caller, &params[1])?);

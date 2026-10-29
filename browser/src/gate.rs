@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use blitz_net::{Provider, ProviderError};
-use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request, Url};
+use blitz_traits::net::{Body, Bytes, NetHandler, NetProvider, Request, Url, http};
 
 use crate::settings::{self, Settings};
 
@@ -142,10 +142,165 @@ impl Gate {
         self.inner.fetch_async(request).await
     }
 
+    /// A page's `fetch()`: `request` on behalf of `page`, through the same policy as
+    /// everything else, every redirect hop included (each is checked and logged). Rejections
+    /// are `TypeError: ...` messages, as `fetch` rejects. See `PageFetch` for the rules.
+    pub async fn fetch_from_page(&self, mut request: PageFetch, page: &Url) -> Result<FetchResponse, String> {
+        let failed = |url: &Url, why: String| format!("TypeError: Failed to fetch {url}: {why}");
+        let page_origin = page.origin();
+        let mut redirected = false;
+        for _ in 0..MAX_REDIRECTS {
+            let url = request.url.clone();
+            match url.scheme() {
+                "http" | "https" => {}
+                // Local schemes never leave the machine. A file is readable only by a file page
+                // in the same folder or above it (as Firefox once allowed), not anywhere on disk.
+                "data" | "file" if url.scheme() == "data" || file_beside(&url, page) => {
+                    self.allow(&url, Some(page)).map_err(|reason| failed(&url, format!("blocked ({reason})")))?;
+                    let (_, body) = self.inner.fetch_async(Request::get(url.clone())).await.map_err(|e| failed(&url, e.to_string()))?;
+                    return Ok(FetchResponse { url: url.to_string(), status: 200, status_text: "OK".into(), headers: Vec::new(), body: String::from_utf8_lossy(&body).into_owned(), redirected, cross_origin: false });
+                }
+                other => return Err(failed(&url, format!("{other}: URLs can't be fetched by this page"))),
+            }
+            self.allow(&url, Some(page)).map_err(|reason| failed(&url, format!("blocked ({reason})")))?;
+            let same_origin = url.origin() == page_origin;
+            if !same_origin && !request.is_simple() {
+                return Err(failed(&url, "a cross-origin request with this method or these headers needs a CORS preflight, which isn't supported yet".into()));
+            }
+            // Cookies go only to the page's own origin (fetch's default, "same-origin").
+            let credentials = same_origin && request.credentials != "omit";
+            let mut sent = Request::get(url.clone());
+            sent.method = request.method.parse().map_err(|_| failed(&url, format!("bad method {}", request.method)))?;
+            for (name, value) in &request.headers {
+                if let (Ok(name), Ok(value)) = (name.parse::<http::HeaderName>(), value.parse::<http::HeaderValue>()) {
+                    sent.headers.append(name, value);
+                }
+            }
+            if !same_origin {
+                if let Ok(origin) = page_origin.ascii_serialization().parse() {
+                    sent.headers.insert(http::header::ORIGIN, origin);
+                }
+            }
+            if let Some(body) = &request.body {
+                sent.body = Body::Bytes(Bytes::from(body.clone()));
+            }
+            let response = self.inner.fetch_once(sent, credentials).await.map_err(|e| failed(&url, e.to_string()))?;
+            let header = |name: &str| response.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+            if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+                if let Some(next) = header("location").and_then(|l| url.join(&l).ok()) {
+                    // 303, and 301/302 after a POST, continue as a GET without a body.
+                    if response.status == 303 || (matches!(response.status, 301 | 302) && request.method == "POST") {
+                        request.method = "GET".into();
+                        request.body = None;
+                    }
+                    request.url = next;
+                    redirected = true;
+                    continue;
+                }
+            }
+            if response.body.len() > MAX_BODY {
+                return Err(failed(&url, format!("the response is over {} MB", MAX_BODY >> 20)));
+            }
+            let mut headers: Vec<(String, String)> = response.headers.iter().filter(|(n, _)| n != "set-cookie" && n != "set-cookie2").cloned().collect();
+            if !same_origin {
+                // Basic CORS: readable only if the server says this origin may read it.
+                let allowed = header("access-control-allow-origin").is_some_and(|a| a.trim() == "*" || a.trim() == page_origin.ascii_serialization());
+                if !allowed {
+                    return Err(failed(&url, format!("CORS: the response doesn't allow {} to read it (no matching Access-Control-Allow-Origin)", page_origin.ascii_serialization())));
+                }
+                let exposed: Vec<String> = header("access-control-expose-headers").unwrap_or_default().split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+                headers.retain(|(n, _)| CORS_SAFELISTED_RESPONSE.contains(&n.as_str()) || exposed.contains(n));
+            }
+            return Ok(FetchResponse {
+                url: url.to_string(),
+                status: response.status,
+                status_text: response.status_text,
+                headers,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+                redirected,
+                cross_origin: !same_origin,
+            });
+        }
+        Err(failed(&request.url, "too many redirects".into()))
+    }
+
     #[cfg(feature = "cache")]
     pub async fn clear_cache(&self) {
         self.inner.clear_cache().await
     }
+}
+
+/// Whether file URL `url` is in page `page`'s folder (or below it), and `page` is a file.
+fn file_beside(url: &Url, page: &Url) -> bool {
+    let folder = page.path().rsplit_once('/').map(|(dir, _)| format!("{dir}/")).unwrap_or_default();
+    page.scheme() == "file" && url.scheme() == "file" && !url.path().contains("/../") && url.path().starts_with(&folder)
+}
+
+const MAX_REDIRECTS: usize = 20;
+/// The biggest response body a page's `fetch` takes, so a page can't fill the browser's
+/// memory (host memory isn't under the pack's cap).
+const MAX_BODY: usize = 64 << 20;
+/// Response headers any origin may read (the fetch spec's CORS-safelisted names).
+const CORS_SAFELISTED_RESPONSE: &[&str] = &["cache-control", "content-language", "content-length", "content-type", "expires", "last-modified", "pragma"];
+/// Request headers page code may not set; they're dropped, as browsers drop them.
+const FORBIDDEN_REQUEST: &[&str] = &[
+    "accept-charset", "accept-encoding", "access-control-request-headers", "access-control-request-method", "connection",
+    "content-length", "cookie", "cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin", "referer", "te",
+    "trailer", "transfer-encoding", "upgrade", "user-agent", "via",
+];
+
+/// A page's `fetch(url, init)`, as the host read it.
+#[derive(Clone, Debug)]
+pub struct PageFetch {
+    pub url: Url,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    /// `init.credentials`: "omit", "same-origin" (the default) or "include" (treated as
+    /// same-origin: cookies never go to another origin).
+    pub credentials: String,
+}
+
+impl PageFetch {
+    pub fn new(url: Url) -> Self {
+        Self { url, method: "GET".into(), headers: Vec::new(), body: None, credentials: "same-origin".into() }
+    }
+
+    /// Add a request header, unless it's one page code may not set.
+    pub fn header(&mut self, name: &str, value: &str) {
+        let lower = name.to_ascii_lowercase();
+        if !FORBIDDEN_REQUEST.contains(&lower.as_str()) && !lower.starts_with("proxy-") && !lower.starts_with("sec-") {
+            self.headers.push((lower, value.to_string()));
+        }
+    }
+
+    /// A "simple" request: one a browser sends cross-origin without a preflight.
+    fn is_simple(&self) -> bool {
+        matches!(self.method.as_str(), "GET" | "HEAD" | "POST")
+            && self.headers.iter().all(|(name, value)| match name.as_str() {
+                "accept" | "accept-language" | "content-language" => true,
+                "content-type" => {
+                    let essence = value.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+                    matches!(essence.as_str(), "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain")
+                }
+                _ => false,
+            })
+    }
+}
+
+/// What a page's `fetch` resolves with. Headers have lowercase names and never include
+/// `Set-Cookie`; a cross-origin response has only the CORS-safelisted and exposed ones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetchResponse {
+    pub url: String,
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    /// The body as text (UTF-8, invalid bytes replaced): `text()` and `json()` are all
+    /// that's supported.
+    pub body: String,
+    pub redirected: bool,
+    pub cross_origin: bool,
 }
 
 /// Subresource fetches made by documents with no page context.
@@ -311,5 +466,37 @@ mod tests {
         // Navigations (no page) aren't third-party; block-all still applies.
         assert_eq!(decide(&s, false, &url("https://anything.example/"), None), Ok(None));
         assert!(decide(&s, true, &url("https://anything.example/"), None).is_err());
+    }
+
+    /// A file page reads files beside it, never elsewhere on disk; only simple requests go
+    /// cross-origin (there's no preflight); page code can't set forbidden headers.
+    #[test]
+    fn page_fetch_rules() {
+        let page = url("file:///Users/me/site/index.html");
+        assert!(file_beside(&url("file:///Users/me/site/data/a.json"), &page));
+        assert!(!file_beside(&url("file:///etc/passwd"), &page));
+        assert!(!file_beside(&url("file:///Users/me/site/a.json"), &url("https://x.test/")));
+
+        let mut f = PageFetch::new(url("https://a.test/"));
+        f.header("Cookie", "stolen=1");
+        f.header("Content-Type", "text/plain; charset=utf-8");
+        assert_eq!(f.headers, [("content-type".to_string(), "text/plain; charset=utf-8".to_string())]);
+        assert!(f.is_simple());
+        f.header("X-Custom", "1");
+        assert!(!f.is_simple());
+        let mut put = PageFetch::new(url("https://a.test/"));
+        put.method = "PUT".into();
+        assert!(!put.is_simple());
+    }
+
+    /// A blocked request is refused before anything is sent, and logged as the page's.
+    #[tokio::test]
+    async fn a_pages_fetch_obeys_the_third_party_rule() {
+        let gate = gate();
+        let err = gate.fetch_from_page(PageFetch::new(url("https://tracker.io/p")), &url("https://news.example/")).await.unwrap_err();
+        assert!(err.starts_with("TypeError: Failed to fetch") && err.contains("tracker.io"), "{err}");
+        assert!(!gate.log()[0].allowed);
+        let err = gate.fetch_from_page(PageFetch::new(url("file:///etc/passwd")), &url("https://news.example/")).await.unwrap_err();
+        assert!(err.contains("can't be fetched"), "{err}");
     }
 }

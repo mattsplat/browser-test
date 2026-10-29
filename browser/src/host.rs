@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use crate::gate::{FetchResponse, Gate, PageFetch};
 use crate::replay::Read;
 use blitz_dom::{BaseDocument, LocalName, NodeId, QualName, ns};
 use wasmtime::{AnyRef, OwnedRooted};
@@ -111,6 +112,14 @@ pub trait Host {
     fn clock(&mut self, id: u32) -> u64;
     /// Random bits for a pack's own randomness (an interpreter's `random_get`).
     fn random_u64(&mut self) -> u64;
+    /// A plain object the page built (`{method: "POST", body: "x"}`, a `fetch` init or a
+    /// history state): its fields' values must be data (strings, numbers, booleans, null, or
+    /// other plain objects). Undefined fields are left out, as `JSON.stringify` does.
+    fn object(&mut self, fields: Vec<(String, HostValue)>) -> Result<HostValue>;
+    /// An array of data, as `object` (Dart's `String.split` builds one).
+    fn array(&mut self, items: Vec<HostValue>) -> Result<HostValue>;
+    /// `value instanceof Array`.
+    fn is_array(&mut self, value: &HostValue) -> bool;
 }
 
 /// Mouse and keyboard details of an event, as the DOM exposes them.
@@ -153,6 +162,12 @@ pub enum Obj {
     Console,
     Element(NodeId),
     Event(EventObj),
+    /// A promise the host settles later (`fetch`, `Response.text()`); see `Objects::settle`.
+    Promise,
+    Response(Rc<FetchResponse>),
+    Headers(Rc<Vec<(String, String)>>),
+    /// A plain data object or array: one the page built, or parsed JSON (`Response.json()`).
+    Json(serde_json::Value),
 }
 
 impl Obj {
@@ -164,9 +179,33 @@ impl Obj {
             Obj::Console => "Console",
             Obj::Element(_) => "Element",
             Obj::Event(_) => "Event",
+            Obj::Promise => "Promise",
+            Obj::Response(_) => "Response",
+            Obj::Headers(_) => "Headers",
+            Obj::Json(v) if v.is_array() => "Array",
+            Obj::Json(_) => "Object",
         }
     }
 }
+
+/// What a page reaches beyond its own document. The loader gives each page its tab's; tests
+/// and replays use the default, which has no network.
+#[derive(Clone, Default)]
+pub struct PageEnv {
+    /// The gate the page's `fetch` goes through; None: the page has no network.
+    pub gate: Option<std::sync::Arc<Gate>>,
+}
+
+/// A promise's state: its outcome once settled, and the callbacks waiting for it.
+#[derive(Default)]
+struct PromiseState {
+    outcome: Option<Result<HostValue, HostValue>>,
+    /// (on fulfilled, on rejected), in the order `then` was called.
+    reactions: Vec<(Option<usize>, Option<usize>)>,
+}
+
+/// A finished `fetch`, waiting to be delivered to the page on the UI thread.
+pub type Fetched = (u32, Result<FetchResponse, String>);
 
 struct Timer {
     due: Instant,
@@ -174,13 +213,15 @@ struct Timer {
     callback: usize,
     /// requestAnimationFrame: called with a timestamp.
     frame: bool,
+    /// A promise reaction: called with the promise's value (`args`).
+    args: Option<Vec<HostValue>>,
 }
 
 /// A pending timer, as the Inspector's Handles view shows it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimerInfo {
     pub handle: u32,
-    /// "timeout", "interval" or "frame".
+    /// "timeout", "interval", "frame" or "promise".
     pub kind: &'static str,
     /// Milliseconds until it's due (negative: overdue, e.g. while paused).
     pub due_in_ms: f64,
@@ -192,6 +233,18 @@ pub struct DueTimer {
     pub handle: u32,
     pub callback: usize,
     pub args: Vec<HostValue>,
+    /// What it is, for the trace: "timer", "animation frame" or "promise".
+    pub kind: &'static str,
+}
+
+impl Timer {
+    fn kind(&self) -> &'static str {
+        match (self.frame, &self.args) {
+            (true, _) => "animation frame",
+            (_, Some(_)) => "promise",
+            _ => "timer",
+        }
+    }
 }
 
 /// Objects handed to the pack, its event listeners and its timers. Shared between the host
@@ -217,6 +270,13 @@ pub struct Objects {
     pub host_micros: std::cell::Cell<u64>,
     /// The page's nondeterminism: live, recorded or replayed (`replay.rs`).
     pub tape: crate::replay::Tape,
+    promises: HashMap<u32, PromiseState>,
+    /// Fetches finished on the network's threads, for the UI thread to settle (`take_fetched`).
+    fetched: std::sync::Arc<Mutex<Vec<Fetched>>>,
+    /// Fetches started and not yet taken.
+    fetching: usize,
+    /// Wakes the page's event loop: a timer is due, or a fetch finished.
+    pub waker: std::sync::Arc<Mutex<Option<std::task::Waker>>>,
 }
 
 impl Default for Objects {
@@ -234,6 +294,10 @@ impl Default for Objects {
             caller: Default::default(),
             host_micros: Default::default(),
             tape: Default::default(),
+            promises: HashMap::new(),
+            fetched: Default::default(),
+            fetching: 0,
+            waker: Default::default(),
         }
     }
 }
@@ -316,7 +380,7 @@ impl Objects {
             .iter()
             .map(|(handle, t)| TimerInfo {
                 handle: *handle,
-                kind: if t.frame { "frame" } else if t.interval.is_some() { "interval" } else { "timeout" },
+                kind: if t.frame { "frame" } else if t.args.is_some() { "promise" } else if t.interval.is_some() { "interval" } else { "timeout" },
                 due_in_ms: if t.due >= now { (t.due - now).as_secs_f64() * 1000.0 } else { -((now - t.due).as_secs_f64() * 1000.0) },
                 callback: t.callback,
             })
@@ -329,7 +393,8 @@ impl Objects {
     fn release_if_unused(&mut self, callback: usize) {
         let in_listeners = self.listeners.values().any(|ids| ids.contains(&callback));
         let in_timers = self.timers.values().any(|t| t.callback == callback);
-        if !in_listeners && !in_timers {
+        let in_promises = self.promises.values().flat_map(|p| &p.reactions).any(|(f, r)| *f == Some(callback) || *r == Some(callback));
+        if !in_listeners && !in_timers && !in_promises {
             self.released_callbacks.push(callback);
         }
     }
@@ -348,8 +413,117 @@ impl Objects {
     fn add_timer(&mut self, callback: usize, delay: Duration, interval: Option<Duration>, frame: bool) -> HostValue {
         let handle = self.next_timer;
         self.next_timer += 1;
-        self.timers.insert(handle, Timer { due: Instant::now() + delay, interval, callback, frame });
+        self.timers.insert(handle, Timer { due: Instant::now() + delay, interval, callback, frame, args: None });
         HostValue::Num(handle as f64)
+    }
+
+    // ---- Promises
+
+    fn promise(&mut self) -> u32 {
+        let handle = self.add(Obj::Promise);
+        self.promises.insert(handle, PromiseState::default());
+        handle
+    }
+
+    /// `promise.then(on_fulfilled, on_rejected)`. Each callback runs later, as a task (a
+    /// zero-delay timer with the value), never during the call, as for a real promise.
+    fn then(&mut self, promise: u32, on_fulfilled: Option<usize>, on_rejected: Option<usize>) -> Result<()> {
+        let state = self.promises.get_mut(&promise).context("this promise is no longer available")?;
+        state.reactions.push((on_fulfilled, on_rejected));
+        if state.outcome.is_some() {
+            self.react(promise);
+        }
+        Ok(())
+    }
+
+    /// Settle `promise` with `outcome` (Ok: fulfilled, Err: rejected) and run its reactions.
+    /// A promise settles once; later outcomes are ignored.
+    pub fn settle(&mut self, promise: u32, outcome: Result<HostValue, HostValue>) {
+        if let Some(state) = self.promises.get_mut(&promise) {
+            if state.outcome.is_none() {
+                state.outcome = Some(outcome);
+                self.react(promise);
+            }
+        }
+    }
+
+    /// Queue a settled promise's waiting callbacks; the ones for the other outcome go.
+    fn react(&mut self, promise: u32) {
+        let Some(state) = self.promises.get_mut(&promise) else { return };
+        let Some(outcome) = state.outcome.clone() else { return };
+        let reactions = std::mem::take(&mut state.reactions);
+        for (on_fulfilled, on_rejected) in reactions {
+            let (run, unused, value) = match &outcome {
+                Ok(v) => (on_fulfilled, on_rejected, v.clone()),
+                Err(e) => (on_rejected, on_fulfilled, e.clone()),
+            };
+            if let Some(callback) = run {
+                let handle = self.next_timer;
+                self.next_timer += 1;
+                self.timers.insert(handle, Timer { due: Instant::now(), interval: None, callback, frame: false, args: Some(vec![value]) });
+            }
+            if let Some(callback) = unused {
+                self.release_if_unused(callback);
+            }
+        }
+    }
+
+    /// Fetches that finished since last asked, to settle on the UI thread.
+    pub fn take_fetched(&mut self) -> Vec<Fetched> {
+        let done = std::mem::take(&mut *self.fetched.lock().unwrap());
+        self.fetching -= done.len().min(self.fetching);
+        done
+    }
+
+    /// Whether a `fetch` is still on its way.
+    #[cfg(test)]
+    pub fn fetching(&self) -> bool {
+        self.fetching > 0
+    }
+
+    /// Settle `promise` with a finished fetch: a new `Response`, or a TypeError message.
+    pub fn deliver_fetch(&mut self, promise: u32, result: Result<FetchResponse, String>) {
+        let outcome = match result {
+            Ok(response) => Ok(HostValue::Object(self.add(Obj::Response(Rc::new(response))))),
+            Err(message) => Err(HostValue::str(&message)),
+        };
+        self.settle(promise, outcome);
+    }
+
+    /// A promise already settled with `outcome` (`Response.text()`).
+    fn settled(&mut self, outcome: Result<HostValue, HostValue>) -> HostValue {
+        let promise = self.promise();
+        self.settle(promise, outcome);
+        HostValue::Object(promise)
+    }
+
+    /// A JSON value as the page sees it: scalars as values, objects and arrays as handles.
+    fn from_json(&mut self, value: serde_json::Value) -> HostValue {
+        use serde_json::Value;
+        match value {
+            Value::Null => HostValue::Null,
+            Value::Bool(b) => HostValue::Bool(b),
+            Value::Number(n) => HostValue::Num(n.as_f64().unwrap_or(f64::NAN)),
+            Value::String(s) => HostValue::str(&s),
+            other => HostValue::Object(self.add(Obj::Json(other))),
+        }
+    }
+
+    /// A value the page passed, as JSON data: scalars, and plain objects by handle.
+    fn to_json(&self, value: &HostValue) -> Result<Option<serde_json::Value>> {
+        use serde_json::Value;
+        Ok(Some(match value {
+            HostValue::Undefined => return Ok(None),
+            HostValue::Null => Value::Null,
+            HostValue::Bool(b) => Value::Bool(*b),
+            HostValue::Num(n) => serde_json::Number::from_f64(*n).map(Value::Number).unwrap_or(Value::Null),
+            HostValue::Str(_) => Value::String(value.display()),
+            HostValue::Object(_) => match self.get(value)? {
+                Obj::Json(v) => v,
+                other => bail!("a {} can't be used as data", other.interface()),
+            },
+            HostValue::CallbackId(_) | HostValue::Opaque(_) => bail!("a function or object of the page's own can't be used as data"),
+        }))
     }
 
     fn clear_timer(&mut self, handle: u32) {
@@ -374,7 +548,8 @@ impl Objects {
             let fired = DueTimer {
                 handle,
                 callback: timer.callback,
-                args: if timer.frame { vec![HostValue::Num(elapsed_ms)] } else { Vec::new() },
+                args: if timer.frame { vec![HostValue::Num(elapsed_ms)] } else { timer.args.clone().unwrap_or_default() },
+                kind: timer.kind(),
             };
             match timer.interval {
                 Some(every) => timer.due = now + every,
@@ -398,7 +573,11 @@ impl Objects {
         let mut out = Vec::new();
         for (handle, frame) in fired {
             let timer = self.timers.get_mut(handle)?;
-            out.push(DueTimer { handle: *handle, callback: timer.callback, args: frame.map(|t| vec![HostValue::Num(t)]).unwrap_or_default() });
+            let args = match frame {
+                Some(t) => vec![HostValue::Num(*t)],
+                None => timer.args.clone().unwrap_or_default(),
+            };
+            out.push(DueTimer { handle: *handle, callback: timer.callback, args, kind: timer.kind() });
             match timer.interval {
                 Some(every) => timer.due = now + every,
                 None => {
@@ -424,15 +603,72 @@ pub struct PageHost {
     pub page: String,
     pub doc: Rc<RefCell<BaseDocument>>,
     pub objects: Rc<RefCell<Objects>>,
+    env: PageEnv,
     rng: u64,
 }
 
 impl PageHost {
-    pub fn new(pack: &'static str, doc: Rc<RefCell<BaseDocument>>, objects: Rc<RefCell<Objects>>) -> Self {
+    pub fn new(pack: &'static str, doc: Rc<RefCell<BaseDocument>>, objects: Rc<RefCell<Objects>>, env: PageEnv) -> Self {
         // Randomness comes from the host so a recording can replay it (principle 4).
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
         let page = doc.borrow().url().to_string();
-        Self { pack, page, doc, objects, rng: seed | 1 }
+        Self { pack, page, doc, objects, env, rng: seed | 1 }
+    }
+
+    /// `window.fetch(input, init)`: a promise, settled when the request through the gate
+    /// finishes (`RunningPack` delivers it on the UI thread). Replaying, nothing is sent: the
+    /// recorded response arrives as a step.
+    fn fetch(&mut self, args: &[HostValue]) -> Result<HostValue> {
+        let input = args.first().context("fetch: missing argument 0")?.display();
+        let page = self.doc.borrow().url().clone();
+        let promise = self.objects.borrow_mut().promise();
+        let request = (|| -> Result<PageFetch> {
+            let url = page.join(&input).map_err(|e| anyhow::anyhow!("TypeError: Failed to fetch: bad URL {input:?} ({e})"))?;
+            let mut request = PageFetch::new(url);
+            let init = match args.get(1) {
+                Some(v @ HostValue::Object(_)) => self.objects.borrow().to_json(v)?,
+                _ => None,
+            };
+            if let Some(init) = init {
+                let text = |name: &str| init.get(name).and_then(|v| v.as_str()).map(str::to_string);
+                if let Some(method) = text("method") {
+                    request.method = method.to_ascii_uppercase();
+                }
+                for (name, value) in init.get("headers").and_then(|h| h.as_object()).into_iter().flatten() {
+                    request.header(name, &value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()));
+                }
+                request.body = text("body");
+                if let Some(credentials) = text("credentials") {
+                    request.credentials = credentials;
+                }
+            }
+            Ok(request)
+        })();
+        let mut objects = self.objects.borrow_mut();
+        if objects.tape.replaying() {
+            return Ok(HostValue::Object(promise));
+        }
+        let (request, gate, runtime) = match (request, &self.env.gate, tokio::runtime::Handle::try_current()) {
+            (Ok(request), Some(gate), Ok(runtime)) => (request, gate.clone(), runtime),
+            (Err(e), _, _) => {
+                objects.settle(promise, Err(HostValue::str(&format!("{e:#}"))));
+                return Ok(HostValue::Object(promise));
+            }
+            _ => {
+                objects.settle(promise, Err(HostValue::str("TypeError: Failed to fetch: this page has no network")));
+                return Ok(HostValue::Object(promise));
+            }
+        };
+        objects.fetching += 1;
+        let (fetched, waker) = (objects.fetched.clone(), objects.waker.clone());
+        runtime.spawn(async move {
+            let result = gate.fetch_from_page(request, &page).await;
+            fetched.lock().unwrap().push((promise, result));
+            if let Some(w) = waker.lock().unwrap().as_ref() {
+                w.wake_by_ref();
+            }
+        });
+        Ok(HostValue::Object(promise))
     }
 
     /// xorshift64: fast, and good enough for a page's Math.random.
@@ -537,6 +773,29 @@ impl PageHost {
                 HostValue::str(&el.name.local.to_ascii_uppercase())
             }
             (Obj::Element(id), "id") => HostValue::str(self.doc.borrow().get_node(*id).and_then(|n| n.attr(LocalName::from("id"))).unwrap_or("")),
+            (Obj::Response(r), _) => match prop {
+                "status" => HostValue::Num(r.status as f64),
+                "ok" => HostValue::Bool((200..300).contains(&r.status)),
+                "statusText" => HostValue::str(&r.status_text),
+                "url" => HostValue::str(&r.url),
+                "redirected" => HostValue::Bool(r.redirected),
+                "type" => HostValue::str(if r.cross_origin { "cors" } else { "basic" }),
+                "bodyUsed" => HostValue::Bool(false),
+                "headers" => HostValue::Object(self.objects.borrow_mut().add(Obj::Headers(Rc::new(r.headers.clone())))),
+                _ => bail!("Response.{prop} is not supported yet"),
+            },
+            (Obj::Json(value), _) => {
+                let field = match value {
+                    serde_json::Value::Array(items) if prop == "length" => Some(serde_json::Value::from(items.len())),
+                    serde_json::Value::Array(items) => prop.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
+                    serde_json::Value::Object(fields) => fields.get(prop).cloned(),
+                    _ => None,
+                };
+                match field {
+                    Some(v) => self.objects.borrow_mut().from_json(v),
+                    None => HostValue::Undefined,
+                }
+            }
             (Obj::Event(e), _) => match self.event_prop(e, prop) {
                 Some(v) => v,
                 None => bail!("Event.{prop} is not supported yet"),
@@ -549,6 +808,14 @@ impl PageHost {
         let obj = self.objects.borrow().get(target)?;
         match (&obj, prop) {
             (Obj::Element(_), _) => {}
+            (Obj::Json(_), _) => {
+                let field = self.objects.borrow().to_json(value)?;
+                let HostValue::Object(handle) = target else { bail!("not an object") };
+                if let (Some(Obj::Json(serde_json::Value::Object(fields))), Some(field)) = (self.objects.borrow_mut().objects.get_mut(handle), field) {
+                    fields.insert(prop.to_string(), field);
+                }
+                return Ok(());
+            }
             (Obj::Document, "cookie") => {
                 // A replay reads cookies from its tape; it mustn't change the real jar.
                 if !self.objects.borrow().tape.replaying() {
@@ -686,6 +953,35 @@ impl PageHost {
                 record(TraceEntry { pack: self.trace_pack(), kind: TraceKind::Console, page: self.page.clone(), call, args: line, result: String::new(), micros: 0 });
                 HostValue::Undefined
             }
+            (Obj::Window, "fetch") => self.fetch(args)?,
+            (Obj::Promise, "then") => {
+                let HostValue::Object(promise) = target else { bail!("not a promise") };
+                let function = |i: usize| match args.get(i) {
+                    Some(HostValue::CallbackId(id)) => Some(*id),
+                    _ => None,
+                };
+                self.objects.borrow_mut().then(*promise, function(0), function(1))?;
+                HostValue::Undefined
+            }
+            (Obj::Response(r), "text") => self.objects.borrow_mut().settled(Ok(HostValue::str(&r.body))),
+            (Obj::Response(r), "json") => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&r.body);
+                let mut objects = self.objects.borrow_mut();
+                let outcome = match parsed {
+                    Ok(value) => Ok(objects.from_json(value)),
+                    Err(e) => Err(HostValue::str(&format!("SyntaxError: the response isn't JSON ({e})"))),
+                };
+                objects.settled(outcome)
+            }
+            (Obj::Headers(headers), "get" | "has") => {
+                let name = text(0)?.to_ascii_lowercase();
+                let values: Vec<&str> = headers.iter().filter(|(n, _)| *n == name).map(|(_, v)| v.as_str()).collect();
+                match (method, values.is_empty()) {
+                    ("has", empty) => HostValue::Bool(!empty),
+                    (_, true) => HostValue::Null,
+                    (_, false) => HostValue::str(&values.join(", ")),
+                }
+            }
             (Obj::Math, "random") => {
                 let live = (self.next_random() >> 11) as f64 / (1u64 << 53) as f64;
                 HostValue::Num(f64::from_bits(self.objects.borrow_mut().tape.read(Read::Random, live.to_bits())))
@@ -754,6 +1050,27 @@ impl Host for PageHost {
         let live = self.next_random();
         self.objects.borrow_mut().tape.read(Read::Bits, live)
     }
+
+    fn object(&mut self, fields: Vec<(String, HostValue)>) -> Result<HostValue> {
+        let mut objects = self.objects.borrow_mut();
+        let mut map = serde_json::Map::new();
+        for (name, value) in fields {
+            if let Some(v) = objects.to_json(&value)? {
+                map.insert(name, v);
+            }
+        }
+        Ok(HostValue::Object(objects.add(Obj::Json(serde_json::Value::Object(map)))))
+    }
+
+    fn is_array(&mut self, value: &HostValue) -> bool {
+        matches!(self.objects.borrow().get(value), Ok(Obj::Json(serde_json::Value::Array(_))))
+    }
+
+    fn array(&mut self, items: Vec<HostValue>) -> Result<HostValue> {
+        let mut objects = self.objects.borrow_mut();
+        let items = items.iter().map(|v| Ok(objects.to_json(v)?.unwrap_or(serde_json::Value::Null))).collect::<Result<Vec<_>>>()?;
+        Ok(HostValue::Object(objects.add(Obj::Json(serde_json::Value::Array(items)))))
+    }
 }
 
 /// How many trace entries are kept; older ones are dropped.
@@ -821,7 +1138,7 @@ mod tests {
 
     fn page(html: &str) -> PageHost {
         let doc = HtmlDocument::from_html(html, DocumentConfig::default()).into_inner();
-        PageHost::new("test", Rc::new(RefCell::new(doc)), Default::default())
+        PageHost::new("test", Rc::new(RefCell::new(doc)), Default::default(), Default::default())
     }
 
     fn s(v: &str) -> HostValue {

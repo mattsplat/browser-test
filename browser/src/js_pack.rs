@@ -27,12 +27,12 @@ pub static JS: Language = Language {
 /// gate, for real pages) until its graph is complete. Like a browser, an error in one script
 /// is reported (in the trace) and the next still runs; with pause on exceptions on, the page
 /// pauses once its scripts have run.
-pub async fn start<F, Fut>(doc: BaseDocument, scripts: &[Script], mut fetch: F) -> Result<PackDocument>
+pub async fn start<F, Fut>(doc: BaseDocument, env: crate::host::PageEnv, scripts: &[Script], mut fetch: F) -> Result<PackDocument>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    let (host, mut startup) = PackDocument::starting(doc, "js");
+    let (host, mut startup) = PackDocument::starting(doc, env, "js");
     let mut runtime = Interpreter::load(&JS, Box::new(host))?;
     runtime.run_scripts(scripts, &mut startup);
     'modules: for module in scripts.iter().filter(|s| s.module) {

@@ -149,6 +149,10 @@ impl Jar {
 /// The site (registrable domain) a cookie belongs to.
 fn cookie_site(c: &Cookie<'_>) -> String {
     let domain = c.domain.as_cow().map(|d| d.into_owned()).unwrap_or_default();
+    // IP addresses are their own site, as in `gate::site_of`.
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return domain;
+    }
     psl::domain_str(&domain).unwrap_or(&domain).to_string()
 }
 

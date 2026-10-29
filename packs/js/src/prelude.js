@@ -17,9 +17,13 @@
     'preventDefault', 'stopPropagation', 'stopImmediatePropagation',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
+    'fetch', 'text', 'json', 'get', 'has',
   ]);
+  // Methods that return a host promise, which becomes a real JS Promise.
+  const PROMISES = new Set(['fetch', 'text']);
 
-  // Values cross as JSON: undefined → {u:1}, host object → {o:h}, function → {cb:id}.
+  // Values cross as JSON: undefined → {u:1}, host object → {o:h}, function → {cb:id}, a
+  // plain object (a fetch init, a history state) → {obj: {...}}.
   const encode = (v) => {
     if (v === undefined) return { u: 1 };
     if (typeof v === 'function') {
@@ -30,9 +34,24 @@
       }
       return { cb: callbackIds.get(v) };
     }
-    if (v !== null && typeof v === 'object' && v[HANDLE] !== undefined) return { o: v[HANDLE] };
+    if (v !== null && typeof v === 'object') {
+      if (v[HANDLE] !== undefined) return { o: v[HANDLE] };
+      const proto = Object.getPrototypeOf(v);
+      if (proto === Object.prototype || proto === null) {
+        return { obj: Object.fromEntries(Object.entries(v).map(([k, x]) => [k, encode(x)])) };
+      }
+    }
     return v;
   };
+  // The host rejects with a message such as "TypeError: Failed to fetch ...": that error.
+  const toError = (reason) => {
+    const m = /^(\w*Error): ([\s\S]*)$/.exec(String(reason));
+    const Type = m && typeof globalThis[m[1]] === 'function' ? globalThis[m[1]] : Error;
+    return new Type(m ? m[2] : String(reason));
+  };
+  const promised = (p) => new Promise((resolve, reject) => {
+    request({ op: 'call', target: p[HANDLE], name: 'then', args: [resolve, (reason) => reject(toError(reason))].map(encode) });
+  });
   const decode = (v) => {
     if (v === null || typeof v !== 'object') return v;
     if (v.u) return undefined;
@@ -57,8 +76,16 @@
     const proxy = new Proxy({}, {
       get(_, prop) {
         if (prop === HANDLE) return h;
-        if (typeof prop !== 'string') return undefined;
-        if (METHODS.has(prop)) return (...args) => request({ op: 'call', target: h, name: prop, args: args.map(encode) });
+        // Not thenable: resolving a JS promise with a host object mustn't call it.
+        if (typeof prop !== 'string' || prop === 'then') return undefined;
+        // Response.json() parses in JS, so the page gets ordinary objects and arrays.
+        if (prop === 'json') return () => promised(request({ op: 'call', target: h, name: 'text', args: [] })).then((t) => JSON.parse(t));
+        if (METHODS.has(prop)) {
+          return (...args) => {
+            const result = request({ op: 'call', target: h, name: prop, args: args.map(encode) });
+            return PROMISES.has(prop) ? promised(result) : result;
+          };
+        }
         return request({ op: 'get', target: h, name: prop });
       },
       set(_, prop, value) {
@@ -86,6 +113,8 @@
   globalThis.clearInterval = (handle) => window.clearInterval(handle);
   globalThis.requestAnimationFrame = (f) => window.requestAnimationFrame(f);
   globalThis.cancelAnimationFrame = (handle) => window.cancelAnimationFrame(handle);
+  // The network, through the page's gate.
+  globalThis.fetch = (input, init) => window.fetch(String(input), init);
 
   // Console results, formatted for reading: strings quoted, objects and arrays shown a few
   // levels deep, host objects by what they are. Element names cost two host calls (traced).

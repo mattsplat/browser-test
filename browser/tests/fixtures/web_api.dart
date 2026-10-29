@@ -1,8 +1,10 @@
 // The web platform APIs beyond the DOM, the same in every pack (web_api.js, web_api.py),
 // through package:web. The cross-pack test runs all three and expects identical output.
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 import 'package:web/web.dart';
 
-void main() {
+Future<void> main() async {
   final out = document.querySelector('#out')!;
   final lines = <String>[];
   void add(String line) {
@@ -17,4 +19,36 @@ void main() {
   add('cookie:${document.cookie}');
   document.cookie = 'a=; Max-Age=0';
   add('cookie:${document.cookie}');
+
+  // fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect,
+  // a blocked third party, and cross-origin reads that CORS allows (without cookies) or
+  // refuses.
+  final cross = out.getAttribute('data-cross')!;
+  String errorName(Object e) => '$e'.split(':').first;
+  final r = await window.fetch('data.json'.toJS).toDart;
+  add('fetch:${r.status},${r.ok},${r.headers.get('content-type')},${r.headers.get('set-cookie')}');
+  final data = (await r.json().toDart) as JSObject;
+  add('json:${data.getProperty('name'.toJS)},${data.getProperty('n'.toJS)}');
+  add('cookie:${document.cookie}');
+  final init = RequestInit(method: 'POST', headers: {'X-A': 'b'}.jsify() as HeadersInit, body: 'hello'.toJS);
+  final echo = await window.fetch('echo'.toJS, init).toDart;
+  add('echo:${(await echo.text().toDart).toDart}');
+  final missing = await window.fetch('missing'.toJS).toDart;
+  add('missing:${missing.status},${missing.ok},${(await missing.text().toDart).toDart}');
+  final moved = await window.fetch('redirect'.toJS).toDart;
+  add('redirect:${moved.status},${moved.redirected}');
+  try {
+    await window.fetch('http://blocked.example/x'.toJS).toDart;
+    add('blocked:no');
+  } catch (e) {
+    add('blocked:${errorName(e)}');
+  }
+  final cors = await window.fetch('${cross}cors'.toJS).toDart;
+  add('cors:${(await cors.text().toDart).toDart}');
+  try {
+    await window.fetch('${cross}nocors'.toJS).toDart;
+    add('nocors:read');
+  } catch (e) {
+    add('nocors:${errorName(e)}');
+  }
 }

@@ -146,6 +146,8 @@ Ok(startup.finish(Box::new(runtime)))
 | `now()` | `Date.now()` |
 | `clock(id)` | an interpreter's WASI clock: real time, or monotonic from the page's start |
 | `random_u64()` | an interpreter's WASI random bytes |
+| `object(fields)`, `array(items)` | a plain object or array literal of data (`{method: "POST"}`) |
+| `is_array(value)` | `value instanceof Array` (dart2wasm asks) |
 
 Every nondeterministic value a pack reads (`now`, `Math.random`, `clock`, `random_u64`)
 passes through the page's `Tape` (`replay.rs`), so a recording can replay it. A pack must
@@ -166,9 +168,18 @@ not read time or randomness any other way.
   scalars, plus three tagged objects:
   - `{"u": 1}` is undefined;
   - `{"o": handle}` is a web object;
-  - `{"cb": id}` is a callback.
+  - `{"cb": id}` is a callback;
+  - `{"obj": {name: value}}` is a plain object of data, which the host turns into a host
+    object (`Host::object`).
 
-  Arrays and plain objects can't cross yet.
+  Arrays can't cross from an interpreter yet.
+- **Promises:** host methods that return a promise (`fetch`, `Response.text`, `json`) return
+  a host `Promise` object with `then(onFulfilled, onRejected)`. Its callbacks run later, as
+  zero-delay timers. The JS prelude wraps them in real Promises; Python's in a `Promise` class
+  with `then`; Dart's `toDart` calls `then` itself.
+- **What a page reaches beyond its DOM** comes in `PageEnv`, which the loader passes to each
+  pack's `start`: its gate (for `fetch`), and its tab. Tests and replays pass the default:
+  no network, no tab.
 - **Wrapping:** each interpreter's prelude (`packs/js/src/prelude.js`,
   `packs/python/src/prelude.py`) wraps handles so page code reads naturally: a JS `Proxy`, or a
   Python `HostObject` with `__getattr__`/`__setattr__`.
@@ -300,8 +311,10 @@ not read time or randomness any other way.
 - Each page has its own `Store`, `PageHost` and `Objects`. Two pages, even in the same
   language, share nothing but compiled code. `each_page_gets_a_fresh_instance` checks this.
 - A page runs one pack, so packs on one page can't see each other.
-- No pack can reach the network: there is no `fetch`, `XMLHttpRequest` or socket. Requests a
-  page causes (scripts, imports, Dart programs) go through the gate.
+- No pack reaches the network except through the host: `fetch` is a host call that goes
+  through the page's gate (third-party rules, logging, block-all). There is no
+  `XMLHttpRequest` or socket. Requests a page causes (scripts, imports, Dart programs) go
+  through the gate too.
 - No pack can reach files, the environment or processes. `js_has_no_side_doors` and
   `python_has_no_side_doors` check this.
 
