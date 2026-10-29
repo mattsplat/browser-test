@@ -3,7 +3,7 @@
 //! - **Elements:** the page's DOM as a tree. Selecting an element shows its attributes, its
 //!   box and key computed styles, and highlights it on the page.
 //! - **Console:** what the page logged and the errors it hit, filterable by level, with an
-//!   input line that evaluates in the page's JS or Python pack (Dart can't; see `PackRuntime`).
+//!   input line that evaluates in the page's JS, Python or PHP pack (Dart can't; see `PackRuntime`).
 //! - **Exceptions:** pause on exceptions, and the snapshots it kept.
 //! - **Handles:** what the page's pack holds: host objects by handle, listeners per node,
 //!   pending timers, and how often each callback ran.
@@ -105,6 +105,25 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
                 if (host::trace_version(), origin.clone()) != seen {
                     seen = (host::trace_version(), origin.clone());
                     console.set(debug::console(&origin, Privacy::Full, MAX_CONSOLE));
+                }
+                // An element clicked with the DevTools picker (toolbar menu) is selected here,
+                // with its ancestors opened so its row shows.
+                if let Some(doc) = debug::tab(tabs, active_tab_id(), None).and_then(|t| t.page).and_then(|p| p.doc()) {
+                    let picked = doc.try_borrow_mut().ok().and_then(|mut d| d.devtools_mut().picked_node.take());
+                    if let Some(node) = picked {
+                        let key = doc_key(&doc);
+                        let d = doc.borrow();
+                        let mut open = if expanded.peek().0 == key { expanded.peek().1.clone() } else { default_expanded(&d) };
+                        let mut parent = d.get_node(node).and_then(|n| n.parent);
+                        while let Some(id) = parent {
+                            open.insert(id);
+                            parent = d.get_node(id).and_then(|n| n.parent);
+                        }
+                        drop(d);
+                        expanded.set((key, open));
+                        selected.set(Some((key, node)));
+                        view.set(View::Elements);
+                    }
                 }
                 polls += 1;
                 if polls % 2 == 0 && view() != View::Console {
@@ -334,6 +353,7 @@ fn language(pack: &str) -> &str {
     match pack {
         "js" => "JavaScript",
         "python" => "Python",
+        "php" => "PHP",
         other => other,
     }
 }

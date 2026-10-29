@@ -242,8 +242,11 @@ pub fn Toolbar(
         }
     });
 
+    // Hover outlines elements; a click picks one, which the Inspector then selects.
     let devtools_action = use_callback(move |_| {
         menu_open.set(false);
+        let mut open_panel = open_panel;
+        open_panel.set(Panel::Inspect);
         let tab = active_tab(tabs, active_tab_id());
         with_sub_doc(tab, |sub_doc| {
             sub_doc.devtools_mut().toggle_highlight_hover()
