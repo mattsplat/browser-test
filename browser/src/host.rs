@@ -103,6 +103,9 @@ pub struct Objects {
     started: Instant,
     /// Callbacks nothing refers to any more; the document tells the pack to release them.
     released_callbacks: Vec<usize>,
+    /// Who the pack is running for, when not the page: console input ("console") or AI
+    /// eval ("ai"). Host calls are traced under it.
+    pub caller: std::cell::Cell<Option<&'static str>>,
 }
 
 impl Default for Objects {
@@ -117,6 +120,7 @@ impl Default for Objects {
             next_timer: 1,
             started: Instant::now(),
             released_callbacks: Vec::new(),
+            caller: Default::default(),
         }
     }
 }
@@ -273,6 +277,11 @@ impl PageHost {
         Self { pack, page, doc, objects, rng: seed | 1 }
     }
 
+    /// The pack name trace entries go under: the page's pack, or whoever it's running for.
+    fn trace_pack(&self) -> &'static str {
+        self.objects.borrow().caller.get().unwrap_or(self.pack)
+    }
+
     /// Run `f` and record it in the trace as `label(args)`.
     fn traced<T>(&mut self, label: String, args: String, f: impl FnOnce(&mut Self) -> Result<T>, show: impl Fn(&T) -> String) -> Result<T> {
         let started = Instant::now();
@@ -281,7 +290,7 @@ impl PageHost {
             Ok(v) => (TraceKind::Call, show(v)),
             Err(e) => (TraceKind::Error, format!("ERROR {e:#}")),
         };
-        record(TraceEntry { pack: self.pack, kind, page: self.page.clone(), call: label, args, result: shown, micros: started.elapsed().as_micros() as u64 });
+        record(TraceEntry { pack: self.trace_pack(), kind, page: self.page.clone(), call: label, args, result: shown, micros: started.elapsed().as_micros() as u64 });
         result
     }
 
@@ -486,7 +495,7 @@ impl PageHost {
                 let line = args.iter().map(|a| a.display()).collect::<Vec<_>>().join(" ");
                 // The level travels in `call` ("console.warn"), so the console can filter by it.
                 let call = if method == "log" { "console".to_string() } else { format!("console.{method}") };
-                record(TraceEntry { pack: self.pack, kind: TraceKind::Console, page: self.page.clone(), call, args: line, result: String::new(), micros: 0 });
+                record(TraceEntry { pack: self.trace_pack(), kind: TraceKind::Console, page: self.page.clone(), call, args: line, result: String::new(), micros: 0 });
                 HostValue::Undefined
             }
             (Obj::Math, "random") => {
@@ -540,7 +549,7 @@ impl Host for PageHost {
     }
 
     fn console(&mut self, text: &str) {
-        record(TraceEntry { pack: self.pack, kind: TraceKind::Console, page: self.page.clone(), call: "console".into(), args: text.to_string(), result: String::new(), micros: 0 });
+        record(TraceEntry { pack: self.trace_pack(), kind: TraceKind::Console, page: self.page.clone(), call: "console".into(), args: text.to_string(), result: String::new(), micros: 0 });
     }
 
     fn now(&mut self) -> f64 {

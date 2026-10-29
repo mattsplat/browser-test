@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use blitz_traits::net::Url;
 use dioxus_native::prelude::*;
 use serde_json::{Value, json};
 
@@ -81,6 +82,21 @@ fn control_decision(settings: &Settings, control_on: bool, origin: &str) -> Resu
         Some(Grant::Allow) => Ok(()),
         _ => Err(format!("AI control works only on sites with a dev-mode grant, and {origin} has none.")),
     }
+}
+
+/// The origin a control tool acts on. eval and click run in the tab's loaded page, which
+/// during a navigation is still the previous one; they act only once it's from the site the
+/// tab shows (whose grant is checked). reload acts on the tab's URL.
+fn control_origin(tool: &str, tab_origin: &str, page_url: Option<&str>) -> Result<String, String> {
+    if tool == "reload" {
+        return Ok(tab_origin.to_string());
+    }
+    let page_url = page_url.ok_or("no script runs on this page")?;
+    let page_origin = Url::parse(page_url).map(|u| settings::origin_of(&u)).map_err(|_| "the page's URL is unreadable")?;
+    if page_origin != tab_origin {
+        return Err(format!("the tab's loaded page isn't from {tab_origin} yet (a navigation is pending)"));
+    }
+    Ok(page_origin)
 }
 
 pub fn last_error() -> Option<String> {
@@ -397,14 +413,22 @@ fn answer(tool: &str, args: &Value, tabs: Store<Vec<Tab>>, active: TabId, gate: 
     let tab = debug::tab(tabs, active, wanted).ok_or_else(|| format!("no tab {}", wanted.unwrap_or(active)))?;
     let origin = tab.origin();
     let detail = [&args["expression"], &args["selector"]].iter().find_map(|v| v.as_str()).map(|v| format!(": {v}")).unwrap_or_default();
-    trace_call(tool, format!("tab {}{detail}", tab.id), tab.url.as_str());
+    // eval traces itself (with its result) when it runs.
+    if tool != "eval" {
+        trace_call(tool, format!("tab {}{detail}", tab.id), tab.url.as_str());
+    }
+    // The pack is taken once: the one checked is the one that runs.
+    let pack = tab.page.as_ref().and_then(|p| p.pack());
     if CONTROL_TOOLS.contains(&tool) {
-        if let Err(refused) = control_decision(&settings::get(), control_on(), &origin) {
-            host::record(TraceEntry { pack: "ai", kind: TraceKind::Error, page: tab.url.to_string(), call: tool.to_string(), args: format!("tab {}{detail}", tab.id), result: format!("ERROR refused: {refused}"), micros: 0 });
+        let decided = control_origin(tool, &origin, pack.as_ref().map(|p| p.page.as_str()))
+            .and_then(|target| control_decision(&settings::get(), control_on(), &target));
+        if let Err(refused) = decided {
+            // Not named "eval", so the console shows it as an error rather than input.
+            host::record(TraceEntry { pack: "ai", kind: TraceKind::Error, page: tab.url.to_string(), call: format!("{tool} (refused)"), args: format!("tab {}{detail}", tab.id), result: format!("ERROR {refused}"), micros: 0 });
             return Err(refused);
         }
     }
-    let pack = || tab.page.as_ref().and_then(|p| p.pack()).ok_or("no script runs on this page");
+    let pack = || pack.clone().ok_or("no script runs on this page");
     match tool {
         "eval" => {
             let expression = args["expression"].as_str().ok_or("eval needs an expression")?;
@@ -421,8 +445,9 @@ fn answer(tool: &str, args: &Value, tabs: Store<Vec<Tab>>, active: TabId, gate: 
         }
         "read_page" => {
             let page = tab.page.and_then(|p| p.doc()).ok_or("the tab has no page loaded")?;
-            let outline = debug::outline(&page.borrow());
-            Ok(json!({ "url": redact(tab.url.as_str()), "outline": outline }))
+            let page = page.borrow();
+            // The page's own URL: during a navigation the tab's URL is already the next one.
+            Ok(json!({ "url": redact(page.url().as_str()), "outline": debug::outline(&page) }))
         }
         "console" => {
             let errors_only = args["errors_only"].as_bool().unwrap_or(false);
@@ -523,6 +548,20 @@ mod tests {
     }
 
     /// Control is its own switch, needs dev mode, and works only where dev mode was granted.
+    /// During a navigation the tab's URL is the new site but its loaded page (where eval and
+    /// click run) is still the old one: control acts only on the page that will run.
+    #[test]
+    fn control_acts_only_on_the_page_that_runs() {
+        let granted = "http://localhost:3000";
+        let err = control_origin("eval", granted, Some("https://bank.example/account")).unwrap_err();
+        assert!(err.contains("navigation is pending"), "{err}");
+        assert!(control_origin("click", granted, Some("https://bank.example/")).is_err());
+        assert!(control_origin("eval", granted, None).is_err());
+        assert_eq!(control_origin("eval", granted, Some("http://localhost:3000/app")).unwrap(), granted);
+        // reload acts on the tab's own URL.
+        assert_eq!(control_origin("reload", granted, Some("https://bank.example/")).unwrap(), granted);
+    }
+
     #[test]
     fn control_needs_its_own_switch_dev_mode_and_a_grant() {
         let mut s = Settings { dev_mode: true, ..Default::default() };

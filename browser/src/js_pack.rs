@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use wasmtime::*;
 
-use crate::dart_pack::{Host, HostValue};
+use crate::dart_pack::{Host, HostValue, RAN_TOO_LONG, STOPPED, TIME_LIMIT_TICKS, interrupted};
 use crate::page_document::PackRuntime;
 
 /// Where `packs/js/build.sh` puts the engine.
@@ -29,6 +29,9 @@ struct State {
 pub struct JsRuntime {
     store: Store<State>,
     instance: Instance,
+    /// Stopped for running too long. The engine was interrupted mid-call (its context is
+    /// left borrowed), so it can't run again.
+    stopped: bool,
 }
 
 /// The engine compiles once per process; each page gets a fresh instance.
@@ -78,6 +81,7 @@ impl JsRuntime {
         let module = engine_module()?;
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
         let mut store = Store::new(crate::dart_pack::engine(), State { host, rng: seed | 1, started: Instant::now() });
+        store.set_epoch_deadline(TIME_LIMIT_TICKS);
         let mut linker = Linker::new(crate::dart_pack::engine());
         linker.func_wrap("host", "request", host_request)?;
         add_wasi(&mut linker)?;
@@ -86,32 +90,53 @@ impl JsRuntime {
         if let Some(init) = instance.get_typed_func::<(), ()>(&mut store, "_initialize").ok() {
             init.call(&mut store, ())?;
         }
-        Ok(Self { store, instance })
+        Ok(Self { store, instance, stopped: false })
+    }
+
+    /// Start a call into the engine: refused once stopped, otherwise with a fresh time limit.
+    fn enter(&mut self) -> Result<()> {
+        if self.stopped {
+            bail!("{STOPPED}");
+        }
+        self.store.set_epoch_deadline(TIME_LIMIT_TICKS);
+        Ok(())
+    }
+
+    /// Call engine export `name`, reporting the time limit stopping it.
+    fn call<P: WasmParams, R: WasmResults>(&mut self, name: &str, params: P) -> Result<R> {
+        let f = self.instance.get_typed_func::<P, R>(&mut self.store, name)?;
+        f.call(&mut self.store, params).map_err(|e| {
+            if interrupted(&e) {
+                self.stopped = true;
+                anyhow!("{RAN_TOO_LONG} (JS)")
+            } else {
+                anyhow!("{e:#}")
+            }
+        })
     }
 
     /// Run a page script; `name` shows in error locations and stack traces.
     pub fn run(&mut self, name: &str, source: &str) -> Result<()> {
+        self.enter()?;
         let (ptr, len) = write_str(&mut self.store, &self.instance, source)?;
         let (name_ptr, name_len) = write_str(&mut self.store, &self.instance, name)?;
-        let run = self.instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut self.store, "js_run")?;
-        let status = run.call(&mut self.store, (ptr, len, name_ptr, name_len))?;
+        let status = self.call::<(u32, u32, u32, u32), u64>("js_run", (ptr, len, name_ptr, name_len))?;
         self.check(status)
     }
 
     /// Give the engine module `url`'s source.
     pub fn add_module(&mut self, url: &str, source: &str) -> Result<()> {
+        self.enter()?;
         let (u, ul) = write_str(&mut self.store, &self.instance, url)?;
         let (s, sl) = write_str(&mut self.store, &self.instance, source)?;
-        let add = self.instance.get_typed_func::<(u32, u32, u32, u32), ()>(&mut self.store, "js_add_module")?;
-        add.call(&mut self.store, (u, ul, s, sl))?;
-        Ok(())
+        self.call::<(u32, u32, u32, u32), ()>("js_add_module", (u, ul, s, sl))
     }
 
     /// The imports of module graph `url` that aren't loaded yet (empty when complete).
     pub fn discover(&mut self, url: &str) -> Result<Vec<String>> {
+        self.enter()?;
         let (u, ul) = write_str(&mut self.store, &self.instance, url)?;
-        let discover = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_discover")?;
-        let status = discover.call(&mut self.store, (u, ul))?;
+        let status = self.call::<(u32, u32), u64>("js_discover", (u, ul))?;
         if status == 0 {
             return Ok(Vec::new());
         }
@@ -124,9 +149,9 @@ impl JsRuntime {
 
     /// Link and evaluate module graph `url` (once `discover` reports it complete).
     pub fn run_module(&mut self, url: &str) -> Result<()> {
+        self.enter()?;
         let (u, ul) = write_str(&mut self.store, &self.instance, url)?;
-        let run = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_run_module")?;
-        let status = run.call(&mut self.store, (u, ul))?;
+        let status = self.call::<(u32, u32), u64>("js_run_module", (u, ul))?;
         self.check(status)
     }
 
@@ -142,9 +167,9 @@ impl JsRuntime {
 
 impl PackRuntime for JsRuntime {
     fn eval(&mut self, source: &str) -> Result<String> {
+        self.enter()?;
         let (ptr, len) = write_str(&mut self.store, &self.instance, source)?;
-        let eval = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_eval")?;
-        let packed = eval.call(&mut self.store, (ptr, len))?;
+        let packed = self.call::<(u32, u32), u64>("js_eval", (ptr, len))?;
         let reply: Value = serde_json::from_str(&take_str(&mut self.store, &self.instance, packed)?)?;
         match (reply["ok"].as_str(), reply["err"].as_str()) {
             (Some(shown), _) => Ok(shown.to_string()),
@@ -154,17 +179,21 @@ impl PackRuntime for JsRuntime {
     }
 
     fn release_callback(&mut self, id: usize) {
-        if let Ok(release) = self.instance.get_typed_func::<u32, ()>(&mut self.store, "js_release") {
-            let _ = release.call(&mut self.store, id as u32);
+        if self.enter().is_ok() {
+            let _ = self.call::<u32, ()>("js_release", id as u32);
         }
     }
 
     fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
+        self.enter()?;
         let encoded = Value::Array(args.iter().map(encode).collect::<Result<_>>()?).to_string();
         let (ptr, len) = write_str(&mut self.store, &self.instance, &encoded)?;
-        let fire = self.instance.get_typed_func::<(u32, u32, u32), u64>(&mut self.store, "js_fire")?;
-        let status = fire.call(&mut self.store, (id as u32, ptr, len))?;
+        let status = self.call::<(u32, u32, u32), u64>("js_fire", (id as u32, ptr, len))?;
         self.check(status)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped
     }
 }
 

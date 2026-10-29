@@ -73,6 +73,8 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
     let mut expanded: Signal<(DocKey, HashSet<NodeId>)> = use_signal(|| (0, HashSet::new()));
     let mut selected: Signal<Option<(DocKey, NodeId)>> = use_signal(|| None);
     let highlighted: Rc<RefCell<Option<Weak<RefCell<BaseDocument>>>>> = use_hook(Default::default);
+    // The snapshot whose DOM outline is shown.
+    let show_dom: Signal<Option<u64>> = use_signal(|| None);
 
     let tab = debug::tab(tabs, active_tab_id(), None);
     let origin = tab.as_ref().map(|t| t.origin()).unwrap_or_default();
@@ -161,7 +163,8 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
             }
         },
         View::Console => rsx!(ConsoleView { page: page.clone(), entries: console, origin: origin.clone() }),
-        View::Exceptions => rsx!(ExceptionsView { page: page.clone(), origin: origin.clone() }),
+        // A plain function, not a component: it must re-render on every tick.
+        View::Exceptions => exceptions_view(page.clone(), origin.clone(), tick, show_dom),
     };
 
     rsx!(
@@ -394,9 +397,8 @@ fn ConsoleView(page: Option<PageRef>, entries: Signal<Vec<ConsoleEntry>>, origin
 
 // ---- Exceptions
 
-#[component]
-fn ExceptionsView(page: Option<PageRef>, origin: String) -> Element {
-    let mut show_dom: Signal<Option<u64>> = use_signal(|| None);
+/// Its actions bump `tick` so the Inspector re-reads what they changed.
+fn exceptions_view(page: Option<PageRef>, origin: String, mut tick: Signal<u64>, mut show_dom: Signal<Option<u64>>) -> Element {
     let pack = page.as_ref().and_then(|p| p.pack());
     let paused = pack.as_ref().is_some_and(|p| p.is_paused());
     let snapshots = debug::exceptions(&origin);
@@ -407,7 +409,10 @@ fn ExceptionsView(page: Option<PageRef>, origin: String) -> Element {
                 span { "Pause on exceptions" }
                 div {
                     class: if on { "request-toggle on" } else { "request-toggle" },
-                    onclick: move |_| debug::set_pause_on_exceptions(!on),
+                    onclick: move |_| {
+                        debug::set_pause_on_exceptions(!on);
+                        tick += 1;
+                    },
                     if on { "ON" } else { "OFF" }
                 }
             }
@@ -423,6 +428,7 @@ fn ExceptionsView(page: Option<PageRef>, origin: String) -> Element {
                             if let Some(p) = &pack {
                                 p.resume();
                             }
+                            tick += 1;
                         },
                         "Resume"
                     }
@@ -431,7 +437,14 @@ fn ExceptionsView(page: Option<PageRef>, origin: String) -> Element {
         }
         div { class: "request-panel-controls",
             span { class: "request-panel-counts", "{snapshots.len()} snapshots for {origin}" }
-            div { class: "request-clear", onclick: move |_| debug::clear_exceptions(&origin), "Clear" }
+            div {
+                class: "request-clear",
+                onclick: move |_| {
+                    debug::clear_exceptions(&origin);
+                    tick += 1;
+                },
+                "Clear"
+            }
         }
         div { class: "request-list",
             for snap in snapshots {

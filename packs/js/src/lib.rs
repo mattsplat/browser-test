@@ -99,6 +99,13 @@ unsafe fn read_str(ptr: *const u8, len: u32) -> String {
     String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len as usize) }).into_owned()
 }
 
+/// Read a string the host wrote into our memory (with `js_alloc`) and free it.
+unsafe fn take_input(ptr: *const u8, len: u32) -> String {
+    let s = unsafe { read_str(ptr, len) };
+    unsafe { js_free(ptr as *mut u8, len.max(1)) };
+    s
+}
+
 fn pack_string(s: String) -> u64 {
     let len = s.len() as u32;
     let ptr = js_alloc(len.max(1));
@@ -144,8 +151,8 @@ fn with_context(f: impl FnOnce(&mut Context) -> Result<(), String>) -> u64 {
 /// error locations and stack traces.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_run(ptr: *const u8, len: u32, name_ptr: *const u8, name_len: u32) -> u64 {
-    let source = unsafe { read_str(ptr, len) };
-    let name = unsafe { read_str(name_ptr, name_len) };
+    let source = unsafe { take_input(ptr, len) };
+    let name = unsafe { take_input(name_ptr, name_len) };
     with_context(|ctx| {
         let result = ctx.eval(Source::from_bytes(source.as_bytes()).with_path(std::path::Path::new(&name))).map(drop);
         // Promise jobs (e.g. `.then`) run before control returns to the host.
@@ -156,7 +163,7 @@ pub unsafe extern "C" fn js_run(ptr: *const u8, len: u32, name_ptr: *const u8, n
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_fire(id: u32, args_ptr: *const u8, args_len: u32) -> u64 {
-    let args = unsafe { read_str(args_ptr, args_len) };
+    let args = unsafe { take_input(args_ptr, args_len) };
     with_context(|ctx| {
         let call = format!("__fire({id}, {})", serde_json_string(&args));
         let result = ctx.eval(Source::from_bytes(call.as_bytes())).map(drop);
@@ -170,7 +177,7 @@ pub unsafe extern "C" fn js_fire(id: u32, args_ptr: *const u8, args_len: u32) ->
 /// `{"ok": text}` or `{"err": message}`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_eval(ptr: *const u8, len: u32) -> u64 {
-    let source = unsafe { read_str(ptr, len) };
+    let source = unsafe { take_input(ptr, len) };
     let mut shown = String::new();
     let status = with_context(|ctx| {
         let value = ctx.eval(Source::from_bytes(source.as_bytes()).with_path(std::path::Path::new("console")));
@@ -194,7 +201,7 @@ pub unsafe extern "C" fn js_eval(ptr: *const u8, len: u32) -> u64 {
 /// Give the engine the source of module `url` (fetched by the host through the gate).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_add_module(url_ptr: *const u8, url_len: u32, src_ptr: *const u8, src_len: u32) {
-    let (url, source) = unsafe { (read_str(url_ptr, url_len), read_str(src_ptr, src_len)) };
+    let (url, source) = unsafe { (take_input(url_ptr, url_len), take_input(src_ptr, src_len)) };
     MODULE_SOURCES.with(|s| s.borrow_mut().insert(url, source));
 }
 
@@ -203,7 +210,7 @@ pub unsafe extern "C" fn js_add_module(url_ptr: *const u8, url_len: u32, src_ptr
 /// `{"missing": [urls]}` or `{"error": message}`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_discover(url_ptr: *const u8, url_len: u32) -> u64 {
-    let url = unsafe { read_str(url_ptr, url_len) };
+    let url = unsafe { take_input(url_ptr, url_len) };
     let mut ctx = match new_context() {
         Ok(ctx) => ctx,
         Err(e) => return pack_string(format!("{{\"error\":{}}}", serde_json_string(&e))),
@@ -230,7 +237,7 @@ pub unsafe extern "C" fn js_discover(url_ptr: *const u8, url_len: u32) -> u64 {
 /// reported it complete). 0 on success, else a packed error message.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_run_module(url_ptr: *const u8, url_len: u32) -> u64 {
-    let url = unsafe { read_str(url_ptr, url_len) };
+    let url = unsafe { take_input(url_ptr, url_len) };
     with_context(|ctx| {
         let loader = ctx.downcast_module_loader::<PageModuleLoader>().expect("our loader");
         let module = loader.module(&url, ctx).map_err(|e| format!("Uncaught {e}"))?;

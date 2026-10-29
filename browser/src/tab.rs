@@ -82,6 +82,8 @@ impl<Lens> Store<Tab, Lens> {
     {
         *self.title().write_unchecked() = page.title().to_string();
         *self.favicon_url().write_unchecked() = None;
+        // The previous page is gone from view; the tools mustn't keep reaching it.
+        *self.page().write_unchecked() = None;
     }
 }
 

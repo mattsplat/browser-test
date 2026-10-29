@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
@@ -122,6 +123,9 @@ enum Callback {
 pub struct DartRuntime {
     store: Store<State>,
     instance: Instance,
+    /// Stopped for running too long. Dart's runtime state is unknown after that (an
+    /// interrupted call may be mid-update), so the program doesn't run again.
+    stopped: bool,
 }
 
 struct State {
@@ -136,14 +140,39 @@ struct State {
     describe_error: Option<usize>,
 }
 
-/// The wasmtime engine every pack runs on (GC and exceptions enabled).
+/// The wasmtime engine every pack runs on (GC and exceptions enabled), with epoch
+/// interruption so a pack that never returns can be stopped (see `TIME_LIMIT_TICKS`).
 pub(crate) fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::new();
-        config.wasm_gc(true).wasm_function_references(true).wasm_exceptions(true);
-        Engine::new(&config).expect("wasmtime engine with GC and exceptions")
+        config.wasm_gc(true).wasm_function_references(true).wasm_exceptions(true).epoch_interruption(true);
+        let engine = Engine::new(&config).expect("wasmtime engine with GC and exceptions");
+        let ticking = engine.clone();
+        std::thread::Builder::new()
+            .name("pack-clock".into())
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticking.increment_epoch();
+            })
+            .expect("failed to spawn the pack clock");
+        engine
     })
+}
+
+/// How often the engine's epoch advances.
+const EPOCH_TICK: Duration = Duration::from_millis(100);
+/// How long one call into a pack may run, in ticks: about 5 s (2 s in tests, so the
+/// runaway-script tests stay quick). Packs run on the UI thread, so a call that never
+/// returns would hang the browser.
+pub(crate) const TIME_LIMIT_TICKS: u64 = if cfg!(test) { 20 } else { 50 };
+
+pub(crate) const RAN_TOO_LONG: &str = "script ran too long and was stopped";
+pub(crate) const STOPPED: &str = "this page's script was stopped after running too long; reload the page to run it again";
+
+/// Whether `err` is the time limit stopping a pack.
+pub(crate) fn interrupted(err: &wasmtime::Error) -> bool {
+    err.downcast_ref::<Trap>() == Some(&Trap::Interrupt)
 }
 
 impl DartRuntime {
@@ -156,6 +185,8 @@ impl DartRuntime {
         let module = Module::new(engine(), wasm)?;
         let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None };
         let mut store = Store::new(engine(), state);
+        // Instantiating may run code too.
+        store.set_epoch_deadline(TIME_LIMIT_TICKS);
 
         let mut imports: Vec<Extern> = Vec::new();
         for import in module.imports() {
@@ -194,10 +225,24 @@ impl DartRuntime {
         }
 
         let instance = Instance::new(&mut store, &module, &imports)?;
-        Ok(Self { store, instance })
+        Ok(Self { store, instance, stopped: false })
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Start a call into Dart: refused once stopped, otherwise with a fresh time limit.
+    fn enter(&mut self) -> Result<()> {
+        if self.stopped {
+            bail!("{STOPPED}");
+        }
+        self.store.set_epoch_deadline(TIME_LIMIT_TICKS);
+        Ok(())
     }
 
     pub fn run_main(&mut self) -> Result<()> {
+        self.enter()?;
         let main = self.instance.get_func(&mut self.store, "$invokeMain").context("no $invokeMain export")?;
         let args = ExternRef::new(&mut self.store, HostValue::Undefined)?;
         let ran = main.call(&mut self.store, &[Val::ExternRef(Some(args))], &mut []);
@@ -229,6 +274,7 @@ impl DartRuntime {
 
     /// Invoke a callback the page registered, e.g. an event listener, with `args`.
     pub fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
+        self.enter()?;
         let (func, closure) = match self.store.data().callbacks.get(id).cloned().flatten() {
             Some(Callback::Function(func, closure)) => (func, closure),
             Some(Callback::Task(task)) => return self.run_task(task),
@@ -292,6 +338,10 @@ impl DartRuntime {
     /// Turn an error out of Dart into something a developer can act on: the thrown Dart
     /// error's message and a stack trace in Dart source lines.
     fn explain(&mut self, err: wasmtime::Error) -> anyhow::Error {
+        if interrupted(&err) {
+            self.stopped = true;
+            return anyhow!("{RAN_TOO_LONG} (Dart)");
+        }
         let mut strings = Vec::new();
         let mut described = None;
         if err.downcast_ref::<ThrownException>().is_some() {

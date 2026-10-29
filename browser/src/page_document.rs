@@ -32,6 +32,8 @@ pub trait PackRuntime {
     fn release_callback(&mut self, id: usize);
     /// Evaluate console input in the page's running program; the result formatted to read.
     fn eval(&mut self, source: &str) -> Result<String>;
+    /// The pack was stopped for running too long and can't run again.
+    fn stopped(&self) -> bool;
 }
 
 impl PackRuntime for DartRuntime {
@@ -43,6 +45,9 @@ impl PackRuntime for DartRuntime {
     }
     fn eval(&mut self, _source: &str) -> Result<String> {
         bail!("Dart pages can't evaluate code: dart2wasm compiles ahead of time and the page ships no compiler. Inspect the page in Elements, or print from the Dart source.")
+    }
+    fn stopped(&self) -> bool {
+        DartRuntime::stopped(self)
     }
 }
 
@@ -93,6 +98,9 @@ pub struct RunningPack {
     /// Set by an uncaught error while pause on exceptions is on. The pack gets no events or
     /// timers until resumed (timers due meanwhile run on resume).
     paused: Cell<bool>,
+    /// Wakes the event loop when the next timer is due (set from `poll`).
+    waker: Arc<Mutex<Option<Waker>>>,
+    timer_thread: RefCell<Option<Sender<Instant>>>,
 }
 
 impl RunningPack {
@@ -103,7 +111,11 @@ impl RunningPack {
         let started = Instant::now();
         let result = match self.runtime.try_borrow_mut() {
             Ok(mut runtime) => {
+                // Host calls the input makes are traced as the caller's, not the page's, so
+                // the AI's redacted views can leave out what the user typed.
+                self.objects.borrow().caller.set(Some(by));
                 let result = runtime.eval(source);
+                self.objects.borrow().caller.set(None);
                 release_unused(&self.objects, runtime.as_mut());
                 result
             }
@@ -114,8 +126,9 @@ impl RunningPack {
             Err(e) => (TraceKind::Error, format!("ERROR {e:#}")),
         };
         host::record(TraceEntry { pack: by, kind, page: self.page.clone(), call: "eval".into(), args: source.to_string(), result: shown, micros: started.elapsed().as_micros() as u64 });
-        // The input may have changed the page.
+        // The input may have changed the page or started timers.
         self.doc.borrow().shell_provider.request_redraw();
+        self.arm_timers();
         result
     }
 
@@ -137,6 +150,7 @@ impl RunningPack {
         let mut doc = self.doc.clone();
         PackEventHandler { pack: self }.handle_event(&chain, &mut event, &mut doc, &mut EventState::default());
         self.doc.borrow().shell_provider.request_redraw();
+        self.arm_timers();
         Ok(debug::describe(&self.doc.borrow(), node))
     }
 
@@ -144,6 +158,54 @@ impl RunningPack {
     pub fn resume(&self) {
         self.paused.set(false);
         self.doc.borrow().shell_provider.request_redraw();
+        // Timers that came due while paused: wake the loop to run them.
+        self.arm_timers();
+    }
+
+    /// Paused, or stopped for running too long: the pack gets no events or timers.
+    fn idle(&self) -> bool {
+        self.paused.get() || self.runtime.try_borrow().is_ok_and(|r| r.stopped())
+    }
+
+    /// Run every timer that is due. Returns whether any ran. Idle, none run. A batch that
+    /// pauses partway still finishes: its one-shot timers are already out of the table, and
+    /// dropping them would break the page on resume.
+    fn run_due_timers(&self) -> bool {
+        if self.idle() {
+            return false;
+        }
+        let due = self.objects.borrow_mut().take_due_timers(Instant::now());
+        for timer in &due {
+            if let Err(e) = self.fire(timer.callback, &timer.args) {
+                self.uncaught("timer", String::new(), &e);
+            }
+        }
+        self.objects.borrow_mut().after_timers_ran(&due);
+        release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
+        !due.is_empty()
+    }
+
+    /// Make sure the event loop wakes when the next timer is due. Not while idle: a due
+    /// timer that can't run would wake it again at once, forever.
+    fn arm_timers(&self) {
+        if self.idle() {
+            return;
+        }
+        let Some(deadline) = self.objects.borrow().next_deadline() else { return };
+        let mut slot = self.timer_thread.borrow_mut();
+        let sender = slot.get_or_insert_with(|| {
+            let (tx, rx) = channel::<Instant>();
+            let waker = Arc::clone(&self.waker);
+            std::thread::Builder::new()
+                .name("pack-timers".into())
+                .spawn(move || timer_thread(rx, waker))
+                .expect("failed to spawn the timer thread");
+            tx
+        });
+        // A dead thread (disconnected channel) is replaced next time.
+        if sender.send(deadline).is_err() {
+            *slot = None;
+        }
     }
 
     /// An error the page didn't catch: into the trace, and with pause on exceptions on, a
@@ -162,9 +224,6 @@ impl RunningPack {
 
 pub struct PackDocument {
     pack: Rc<RunningPack>,
-    /// Wakes the event loop when the next timer is due (set from `poll`).
-    waker: Arc<Mutex<Option<Waker>>>,
-    timer_thread: Option<Sender<Instant>>,
 }
 
 impl PackDocument {
@@ -182,8 +241,8 @@ impl PackDocument {
     }
 
     fn running(name: &'static str, page: String, doc: Rc<RefCell<BaseDocument>>, objects: Rc<RefCell<Objects>>, runtime: Box<dyn PackRuntime>, paused: bool) -> Self {
-        let pack = RunningPack { name, page, doc, objects, runtime: RefCell::new(runtime), paused: Cell::new(paused) };
-        Self { pack: Rc::new(pack), waker: Default::default(), timer_thread: None }
+        let pack = RunningPack { name, page, doc, objects, runtime: RefCell::new(runtime), paused: Cell::new(paused), waker: Default::default(), timer_thread: Default::default() };
+        Self { pack: Rc::new(pack) }
     }
 
     /// Load a Dart program against `doc` and run its `main`.
@@ -255,44 +314,6 @@ impl PackDocument {
         }
         Ok(Self::running("js", page, doc, objects, Box::new(runtime), paused))
     }
-
-    /// Run every timer that is due. Returns whether any ran.
-    /// Paused, none run. A batch that pauses partway still finishes: its one-shot timers are
-    /// already out of the table, and dropping them would break the page on resume.
-    fn run_due_timers(&mut self) -> bool {
-        let pack = &self.pack;
-        if pack.paused.get() {
-            return false;
-        }
-        let due = pack.objects.borrow_mut().take_due_timers(Instant::now());
-        for timer in &due {
-            if let Err(e) = pack.fire(timer.callback, &timer.args) {
-                pack.uncaught("timer", String::new(), &e);
-            }
-        }
-        pack.objects.borrow_mut().after_timers_ran(&due);
-        release_unused(&pack.objects, pack.runtime.borrow_mut().as_mut());
-        !due.is_empty()
-    }
-
-    /// Make sure the event loop wakes when the next timer is due.
-    fn arm_timer_thread(&mut self) {
-        let Some(deadline) = self.pack.objects.borrow().next_deadline() else { return };
-        let sender = self.timer_thread.get_or_insert_with(|| {
-            let (tx, rx) = channel::<Instant>();
-            let waker = Arc::clone(&self.waker);
-            std::thread::Builder::new()
-                .name("pack-timers".into())
-                .spawn(move || timer_thread(rx, waker))
-                .expect("failed to spawn the timer thread");
-            tx
-        });
-        // A dead thread (disconnected channel) is replaced next time.
-        if sender.send(deadline).is_err() {
-            self.timer_thread = None;
-        }
-    }
-
 }
 
 /// Wakes the event loop at the earliest deadline it has been sent.
@@ -418,18 +439,18 @@ impl Document for PackDocument {
         driver.handle_ui_event(event);
         // The pack may have changed the DOM or started timers.
         self.pack.doc.borrow().shell_provider.request_redraw();
-        self.arm_timer_thread();
+        self.pack.arm_timers();
     }
 
     fn poll(&mut self, task_context: Option<TaskContext>) -> bool {
         if let Some(cx) = &task_context {
-            let mut waker = self.waker.lock().unwrap();
+            let mut waker = self.pack.waker.lock().unwrap();
             if !waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
                 *waker = Some(cx.waker().clone());
             }
         }
-        let ran = self.run_due_timers();
-        self.arm_timer_thread();
+        let ran = self.pack.run_due_timers();
+        self.pack.arm_timers();
         ran
     }
 }
@@ -444,8 +465,8 @@ impl EventHandler for PackEventHandler<'_> {
         let kind = event.data.name();
         let Some(&target) = chain.first() else { return };
         let listening = |node: &NodeId| pack.objects.borrow().listeners.contains_key(&(*node, kind.to_string()));
-        // Paused on an exception, the page's listeners don't run (Blitz's defaults still do).
-        if pack.paused.get() || !chain.iter().any(listening) {
+        // Paused on an exception or stopped, the page's listeners don't run (Blitz's defaults still do).
+        if pack.idle() || !chain.iter().any(listening) {
             return;
         }
         // One event object for the whole dispatch, released when it ends.
@@ -703,7 +724,7 @@ mod tests {
         let until = Instant::now() + std::time::Duration::from_secs(1);
         while page.pack.objects.borrow().next_deadline().is_some() && Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(2));
-            page.run_due_timers();
+            page.pack.run_due_timers();
         }
     }
 
@@ -842,7 +863,8 @@ mod tests {
         let trace = host::trace();
         assert!(trace.iter().any(|e| e.pack == "console" && e.call == "eval" && e.args == "bump()" && e.result == "42"));
         assert!(trace.iter().any(|e| e.pack == "console" && e.kind == TraceKind::Error && e.args == "missing.x"));
-        assert!(trace.iter().any(|e| e.pack == "js" && e.call == "Element.textContent =" && e.args.ends_with("set from the console")));
+        // The DOM write went through the host, traced as the console's (not the page's).
+        assert!(trace.iter().any(|e| e.pack == "console" && e.call == "Element.textContent =" && e.args.ends_with("set from the console")));
     }
 
     /// With pause on exceptions on, an uncaught error keeps a snapshot of the page and stops
@@ -894,5 +916,66 @@ mod tests {
 
         assert_eq!(page.pack.eval("document.querySelector('#out').textContent", "ai").unwrap(), "\"clicked by ai\"");
         assert!(host::trace().iter().any(|e| e.pack == "ai" && e.call == "eval" && e.result == "\"clicked by ai\""));
+    }
+
+    /// What the user types into the console never reaches the AI's views, including the host
+    /// calls and logs it makes (they're traced as the console's, not the page's).
+    #[test]
+    fn console_input_and_its_effects_stay_out_of_ai_views() {
+        let page = js_page("<p id=out></p>", &[]);
+        page.pack.eval("console.log('typed-log-7781'); document.querySelector('#out').textContent = 'typed-text-7781'", debug::CONSOLE_PACK).unwrap();
+        let origin = crate::settings::origin_of(&blitz_traits::net::Url::parse(&page.pack.page).unwrap());
+        let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
+        assert!(!console.iter().any(|e| format!("{e:?}").contains("7781")), "console leaked");
+        let trace = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+        assert!(!trace.iter().any(|e| format!("{e:?}").contains("7781")), "trace leaked");
+        // The user's own console still shows the log.
+        assert!(debug::console(&origin, debug::Privacy::Full, usize::MAX).iter().any(|e| e.text == "typed-log-7781"));
+    }
+
+    /// A paused page doesn't arm the timer thread (a due timer would wake the loop forever);
+    /// resuming arms it so timers that came due meanwhile run.
+    #[test]
+    fn paused_pages_dont_arm_timers_until_resumed() {
+        let page = js_page("<p id=out>waiting</p>", &["setTimeout(() => { document.querySelector('#out').textContent = 'ran'; }, 0);"]);
+        page.pack.paused.set(true);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        page.pack.arm_timers();
+        assert!(page.pack.timer_thread.borrow().is_none());
+        assert!(!page.pack.run_due_timers());
+        assert_eq!(output(&page), "waiting");
+
+        page.pack.resume();
+        assert!(page.pack.timer_thread.borrow().is_some());
+        assert!(page.pack.run_due_timers());
+        assert_eq!(output(&page), "ran");
+    }
+
+    /// A JS listener that never returns is stopped by the time limit and reported; the pack
+    /// is then stopped (its engine state is unusable) and gets no more events.
+    #[test]
+    fn runaway_js_is_stopped() {
+        let mut page = js_page("<button id=b>go</button><p id=out></p>", &[
+            "document.querySelector('#b').addEventListener('click', function spin() { while (true) {} });",
+        ]);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        assert!(host::trace().iter().any(|e| e.pack == "js" && e.result.contains("script ran too long and was stopped (JS)")));
+        assert!(page.pack.idle());
+        let err = page.pack.eval("1", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.contains("stopped after running too long"), "{err}");
+    }
+
+    /// The same for Dart.
+    #[tokio::test]
+    async fn runaway_dart_is_stopped() {
+        let wasm = compile("tests/fixtures/spins.dart").await;
+        let doc = HtmlDocument::from_html("<button id=go>go</button>", DocumentConfig::default()).into_inner();
+        let page = PackDocument::start_dart(doc, &wasm).unwrap();
+        let (button, id) = listener(&page, "#go", "click");
+        let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
+        let err = page.pack.fire(id, &[event.clone()]).unwrap_err().to_string();
+        assert!(err.contains("script ran too long and was stopped (Dart)"), "{err}");
+        let err = page.pack.fire(id, &[event]).unwrap_err().to_string();
+        assert!(err.contains("stopped after running too long"), "{err}");
     }
 }

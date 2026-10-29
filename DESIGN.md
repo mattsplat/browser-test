@@ -558,18 +558,38 @@ tab's origin; anything else is refused with the reason, and the refusal is trace
 error. Tools:
 - `eval`: JS pages only, through `RunningPack::eval`, traced as pack "ai". Its output isn't
   redacted: control is only for sites the user has granted dev mode, and eval can reach only
-  what the host exposes (no cookies; no form field values yet).
+  what the host exposes (no cookies; no form field values yet). **It shares the page's realm
+  with console input**, so globals the user declared in the console (`let token = ...`) are
+  readable by AI eval on a granted site.
 - `click`: runs the page's click listeners on the element a selector matches, like
   `element.click()`, with no default action (a link isn't followed). Typing isn't supported.
 - `reload`: reloads the tab (dev-mode Dart source recompiles).
 
 The tools are always listed (MCP clients cache the list) and say they need control.
+eval and click run in the tab's *loaded* page, which during a navigation is still the
+previous one, so the grant is checked against that page's own URL and they're refused
+unless it's the site the tab shows (`control_origin`, tested). About pages drop the tab's
+page reference.
+
+**All `file://` pages share one origin** (`settings::origin_of`), so one dev-mode Allow grant
+for a local file covers every local file, for compiling and for AI control. A future fix is
+to key `file://` grants by directory; not done, since dev-mode compile grants share the key.
+
+**Console input stays the user's.** While `RunningPack::eval` runs, `Objects::caller` makes
+the host trace its calls and logs under the caller ("console" or "ai") instead of the page's
+pack, so the AI's redacted views leave out the console's input and everything it caused.
 
 **Limitations:**
-- Code that never returns (`while (true) {}`) hangs the browser: packs run on the UI thread
-  with no time limit. That was already true for page scripts; console input and AI `eval`
-  share it. wasmtime's epoch interruption could bound each call; not done, since it changes
-  every pack's engine configuration.
+- **Time limit:** packs run on the UI thread, so code that never returns would hang the
+  browser. The shared wasmtime engine uses epoch interruption (a clock thread ticks every
+  100 ms) and each call into a pack (script, listener, timer, console or AI eval, Dart's
+  `main`) gets about 5 s. A call over it is stopped and traced as "script ran too long and
+  was stopped". The pack is then marked stopped and gets no more events, timers or input
+  (reload to run it again): an interrupted Boa call leaves its context borrowed, and
+  Dart's runtime may be mid-update, so neither can safely continue. The compiled-JS-engine
+  cache is invalidated once by the config change (it recompiles and re-saves).
+- A paused or stopped page doesn't arm the timer thread; resuming arms it, as do console
+  eval and AI click, so timers they start run without waiting for another event.
 - Elements selection is keyed by document address; after a reload the tree starts fresh.
 - Snapshots are kept in memory (the last 20, all tabs) and lost on quit.
 
