@@ -5,8 +5,9 @@ Dart is first-class; JS is just one more language pack, off by default.
 
 Status: experiment. Current plan: "Roadmap (2026-10-28)". Phases 0–3 built in `browser/` (started from Blitz's reference
 browser): the gate, the Dart pack (with dev mode and source maps), the JS pack, and the
-per-site policy screen. Phase A is done and Phase B is done apart from breakpoints and DAP
-(the Inspector, AI access and AI control; see "Step 7 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+per-site policy screen. Phase A is done, Phase B is done apart from breakpoints and DAP
+(the Inspector, AI access and AI control; see "Step 7 notes"), and Phase C is done apart
+from bookmarks (see "Phase C notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -284,6 +285,8 @@ runs the same page in Dart and JS and expects identical output):
 Command palette (keyboard navigation), vertical tabs, automatic tab management (pinned and
 temporary tabs), spaces and profiles. Profiles get genuinely separate cookies, storage,
 sessions and permissions; spaces only organise.
+**Done**, see "Phase C notes". **Not done:** bookmarks (the page is still a stub, so the
+palette has no bookmark results), and per-tab back/forward lists across restarts.
 
 **Phase D: language extensibility**
 Document exactly what a pack implements (initialisation, module loading, imports, DOM
@@ -339,11 +342,11 @@ each relates to what's built.
 
 | Feature | Value to users | Engineering complexity | Notes |
 |---|---|---|---|
-| Vertical tabs | High | Low–medium | Browser UI only; the tab strip is Dioxus in `browser/src/tab_strip.rs` |
-| Spaces and profiles | Very high | Medium–high | Needs separate cookies, storage, history and settings per profile; today all of these are global |
-| Command palette | High | Low | Browser UI only; could reuse the URL bar's suggestion list (`url_suggestions.rs`) |
+| Vertical tabs | High | Low–medium | **Done** (Phase C): Settings → Tab layout; `tab_strip.rs` |
+| Spaces and profiles | Very high | Medium–high | **Done** (Phase C): spaces in `tab_manager.rs`; a profile is its own data folder and process (`profile.rs`) |
+| Command palette | High | Low | **Done** (Phase C): `command_palette.rs`, Cmd+K / Cmd+Shift+P |
 | Split View | High | Medium–high | Two page documents side by side in one window; each already gets its own gate view and pack |
-| Automatic tab management | High | Low–medium | Browser UI over the existing tab store (e.g. grouping, closing idle tabs) |
+| Automatic tab management | High | Low–medium | **Done** (Phase C): pinned tabs, closing idle tabs, reopen closed, session restore (`tab_manager.rs`) |
 | Website CSS customization | Medium | Medium | Per-site user stylesheets; would sit alongside the Site panel's per-site settings |
 | Rust/WASM scripting | Specialized | Very high | Partly built: the Dart pack already runs Wasm on the host dispatcher. A Rust pack would need its own way to describe host calls (Rust has no dart2wasm-style import table) |
 | `document.cookie` for Wasm and JS | High | Low–medium | See "Web platform parity": expose the existing cookie jar per origin, hiding `HttpOnly` cookies |
@@ -359,7 +362,7 @@ implemented once in the host (`browser/src/host.rs`), so Dart and JS get it toge
 | `document.cookie` (read and write) | Missing | The network layer already keeps a cookie jar; expose it per page origin, hiding `HttpOnly` cookies from page code as browsers do, and applying third-party rules |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | Missing | Needs the event loop to wake the pack; time comes from the host (principle 4) |
 | Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Missing | Must go through the gate with the page's URL (`fetch_for_page`), so third-party rules apply |
-| Storage: `localStorage`, `sessionStorage`, IndexedDB | Missing | Per origin, and per profile once profiles exist |
+| Storage: `localStorage`, `sessionStorage`, IndexedDB | Missing | Per origin, and per profile: keep it under `profile::dir()` |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
 | `window` and `location`: URL, navigation, `history`, viewport size | Missing | |
@@ -592,6 +595,96 @@ pack, so the AI's redacted views leave out the console's input and everything it
   eval and AI click, so timers they start run without waiting for another event.
 - Elements selection is keyed by document address; after a reload the tree starts fresh.
 - Snapshots are kept in memory (the last 20, all tabs) and lost on quit.
+
+## Phase C notes: palette, tabs, spaces and profiles
+
+**Command palette** (`browser/src/command_palette.rs`). Cmd+K or Cmd+Shift+P (Ctrl
+elsewhere) opens one list: open tabs (every space's), commands, recently closed tabs and,
+once you type, history. Arrows move, Enter runs, Esc or a click outside closes. Commands:
+new/close/reload/pin tab, close other tabs, reopen closed, each panel (Inspect, Trace,
+Requests, Site), dev mode, AI access, JavaScript for this site (the Site panel's change,
+then a reload), history, bookmarks, settings, tab layout, switch/move to/remove a space,
+and open a profile. Typing a name also offers "New space “name”" and "New profile “name”".
+- Matching is nucleo's fuzzy matcher, as in the URL bar, run synchronously: the list is at
+  most ~1,100 items (history is capped at 1,000), which scores in well under a frame.
+  `rank` (tested) orders by score, then tabs, commands, closed tabs, history; history rows
+  are capped at 8 and pages already open in a tab are left out. It reuses the URL bar's
+  input and suggestion-row styles.
+- It runs only what the menu and panels already run (settings, `ai_access`, the tab
+  manager), so it adds no new permission paths. Shortcuts are read from winit window events
+  (`use_window_event`), like Cmd+T/W before, so they work while a page has focus.
+- **Bookmarks don't exist yet** (about:bookmarks is a stub), so there are no bookmark
+  results. When they're built they belong in the profile's folder and the palette list.
+
+**Tabs** (`browser/src/tab_manager.rs`, `tab_strip.rs`). `TabManager` (a context of Copy
+signals over the tab store) is the one place tabs are activated, opened and closed; the
+rules are pure functions (`display_order`, `next_active_after_close`, `idle_tabs`), tested,
+plus a test that drives the real store.
+- **Vertical tabs:** Settings → Tab layout (or the palette) switches between the top strip
+  and a 220px sidebar; saved as `vertical_tabs` in settings.json. Both show the same items:
+  favicon, title, close, active state, new tab, pinned tabs and the space switcher. Side
+  panels now start below `--chrome-top`, since the toolbar sits higher without the strip.
+- **Pinned tabs:** first (left or top), favicon only (or the title's initial), no close
+  button, shown in every space, skipped by "close other tabs" and by idle closing. Pin or
+  unpin from the palette (there's no tab context menu).
+- **Idle ("temporary") tabs:** an unpinned tab nobody has looked at for
+  `close_idle_tabs_hours` (default 12; Settings cycles 1h, 4h, 12h, 1d, 3d, 7d, never) is
+  closed by a once-a-minute check. A tab's idle time starts when you leave it; the tab on
+  screen is never idle. Closed tabs (by hand or idle, last 20) reopen with Cmd+Shift+T or
+  from the palette; that list is in memory only.
+- **Session restore:** open tabs (URL, title, pin, space, last-left time), the spaces and
+  the current space are written to the profile's `session.json` whenever they change
+  (write-then-rename) and reopened at startup. Tabs come back at their current page
+  **without their back/forward list**, and every restored tab loads at startup (no lazy
+  loading). Tabs idle past the limit while the browser was closed are closed a moment after
+  startup, which is the point of temporary tabs. A URL on the command line opens in a new
+  tab, or focuses an open tab already showing it.
+
+**Spaces** only organise: each tab has a space name, the window shows the current space's
+tabs plus pinned ones, and switching shows that space's most recently used tab (or a new
+tab page). Selecting a tab from another space (palette) switches to its space. Removing a
+space closes its tabs. Cookies, settings and history are shared between spaces.
+
+**Profiles** (`browser/src/profile.rs`) are genuinely separate. **Decided: one profile per
+process.** `browser --profile <name>` runs a profile (default "Default"); about:settings and
+the palette list profiles and open or create one, which starts a new process.
+- **Why a process, not in-process separation:** settings (`settings::get()`), the gate and
+  its request log, the trace, the JS "allow this visit" list, AI access and the cookie jar
+  (reqwest's, inside blitz-net's one `Provider`, created by dioxus-native) are all
+  process-wide. Making each per-profile would mean threading a profile through the gate,
+  every settings read, the loader and the packs, plus a second dioxus-native provider, and
+  any missed global would leak between profiles. A process boundary makes leaks impossible
+  by construction and needed no changes to those modules. The cost: profiles are separate
+  windows in separate processes (more memory; no dragging tabs between them), and opening
+  an already-open profile does nothing (it's shown as "Open in another window").
+- **What's separate:** each profile's folder (`<data dir>/profiles/<name>/`) holds
+  `settings.json` (dev mode, per-site JS/Dart/dev-mode/third-party grants, tab settings),
+  `history.sqlite3`, `session.json`, `ai-access.json` and `http-cache/`. Cookies are in the
+  process's memory, so per profile (they still aren't saved across restarts at all; that
+  predates profiles). Web storage doesn't exist yet; it should live in the profile folder.
+- **HTTP cache:** blitz-net kept one cache for everything under Blitz's own folder, which
+  would serve one profile's cached (possibly personalised) responses to another. The fork
+  gained `blitz_net::set_cache_dir` (vendor/blitz, branch `browser-test`) and each profile
+  sets its own. The old shared cache folder is simply no longer used.
+- **Still shared, deliberately:** the compiled JS engine and the dev-mode Dart compile
+  cache. Both are compiled code keyed by a hash of their input, with no user data.
+- **Lock:** a `lock` file (`File::try_lock`) stops two processes using one profile, which
+  would otherwise overwrite each other's session and settings. The OS releases it on exit.
+- **AI access** uses a fixed port, so only one profile can have it on at a time; the other
+  reports the port is in use. Each profile writes its own token file.
+- **Migration:** on the first run, `settings.json` (from the config folder) and
+  `history.sqlite3` with its journal files (from the data folder) move into
+  `profiles/Default/`. A file only moves when the profile doesn't already have one, so it
+  never overwrites, and an interrupted move completes on the next start (tested).
+- Profile names become folder names, so they're limited to letters, digits, spaces, `-` and
+  `_` (1–32 characters, no leading or trailing space). Window titles name non-default
+  profiles. There's no rename or delete yet (delete the folder by hand).
+
+**Testing note:** Dioxus swallows panics during a render, so a test that asserts inside a
+`VirtualDom` app passes even when the assertion fails. `tab_manager`'s store test catches
+the panic and checks the outcome after `rebuild_in_place`; the older
+`tab_lens_survives_webview_props_replacement` test in `tab.rs` asserts inside the render
+and so can't fail.
 
 ## Known local setup notes
 

@@ -49,6 +49,7 @@ mod site_panel;
 mod source_map;
 mod trace_panel;
 mod browser_history;
+mod command_palette;
 #[cfg(any(feature = "screenshot", feature = "capture"))]
 mod capture;
 mod document_loader;
@@ -192,10 +193,11 @@ fn app() -> Element {
         }
     });
 
+    let mut palette_open: Signal<bool> = use_signal(|| false);
     let open_panel: Signal<Panel> = use_signal(|| Panel::None);
 
     // Keyboard shortcuts (Cmd on macOS, Ctrl elsewhere): T new tab, W close tab,
-    // Shift+T reopen the last closed tab.
+    // Shift+T reopen the last closed tab, K or Shift+P the command palette.
     {
         let home_url = home_url.clone();
         let mut modifiers = ModifiersState::empty();
@@ -217,6 +219,8 @@ fn app() -> Element {
                     PhysicalKey::Code(KeyCode::KeyT) => open_new_tab(home_url.clone()),
                     // Keep at least one tab open, matching the close button.
                     PhysicalKey::Code(KeyCode::KeyW) => manager.close(active_tab_id()),
+                    PhysicalKey::Code(KeyCode::KeyK) => palette_open.toggle(),
+                    PhysicalKey::Code(KeyCode::KeyP) if modifiers.shift_key() => palette_open.toggle(),
                     _ => {}
                 }
             }
@@ -306,6 +310,9 @@ fn app() -> Element {
                     Panel::None => rsx!(),
                 }
                 StatusBar { tabs, active_tab_id }
+                if palette_open() {
+                    command_palette::CommandPalette { open: palette_open, open_panel, open_new_tab }
+                }
             }
         }
     )

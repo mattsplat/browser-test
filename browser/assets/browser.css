@@ -810,3 +810,39 @@ body,
   border-bottom: 1px solid #E8E8E8;
 }
 
+/* Phase C: the command palette (reuses the URL bar's input and suggestion rows) */
+
+.palette-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.15);
+  z-index: 200;
+}
+
+.palette {
+  position: fixed;
+  top: calc(60px + var(--safe-area-top));
+  left: calc(50% - 300px);
+  width: 600px;
+  display: flex;
+  padding: 8px;
+  background: #F9F9F9;
+  border: 1px solid #CCC;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  z-index: 201;
+}
+
+.palette-list {
+  max-height: 420px;
+  overflow-y: scroll;
+}
+
+.suggestion-row .palette-group {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #999;
+}
