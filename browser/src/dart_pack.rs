@@ -498,7 +498,8 @@ fn classify(body: &str) -> Helper {
     match b {
         "b => !!b" => Helper::Truthy,
         "(p, s, f) => p.then(s, (e) => f(e, e === undefined))" => Helper::PromiseThen,
-        "(o, p, v) => o[p] = v" => Helper::SetIndex,
+        // package:web's `operator []=` (`dataset['x'] = v`) has the second form.
+        "(o, p, v) => o[p] = v" | "(x0,x1,x2) => { x0[x1] = x2 }" => Helper::SetIndex,
         "(string, token) => string.split(token)" => Helper::Split,
         "o => o instanceof Array" => Helper::IsArray,
         "(l, r) => l === r" => Helper::StrictEquals,
@@ -514,7 +515,7 @@ fn classify(body: &str) -> Helper {
         "s => JSON.stringify(s)" => Helper::JsonStringify,
         "o => o" => Helper::Identity,
         "o => o.length" | "a => a.length" => Helper::Get("length".into()),
-        "(o, i) => o[i]" | "(o, p) => o[p]" | "(a, i) => a[i]" => Helper::Index,
+        "(o, i) => o[i]" | "(o, p) => o[p]" | "(a, i) => a[i]" | "(x0,x1) => x0[x1]" => Helper::Index,
         "(string, times) => string.repeat(times)" => Helper::Repeat,
         // DateTime.now() imports `Date.now` itself.
         "() => Date.now()" | "Date.now" => Helper::DateNow,

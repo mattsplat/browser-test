@@ -12,7 +12,8 @@ from bookmarks (see "Phase C notes"). Phase D is done: the pack contract is writ
 CSS, Split View, hot reload with state restoration, the Handles and Profiler views, a Dart
 compiled-code cache and time-travel replay (see "Phase E notes"). Web platform parity part 1
 is done: `document.cookie`, `fetch`, `localStorage`/`sessionStorage`, `location`/`history`
-and window basics in all three packs (see "Web platform parity notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+and window basics in all three packs (see "Web platform parity notes"). Part 2 adds DOM
+breadth and form events (see "Web platform parity part 2 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -374,8 +375,8 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | **Done** | Phase A: host-owned timers, woken by the event loop |
 | Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). `XMLHttpRequest` and `WebSocket` deferred |
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | Partly | **`localStorage` and `sessionStorage` done** (`storage.rs`; see "Web platform parity notes"). IndexedDB deferred |
-| Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners, details, `preventDefault`, propagation, `popstate`/`hashchange`/`resize` work; form events and `value` don't |
-| DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
+| Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | **Done** (part 2) | Listeners, details, `preventDefault`, propagation, `popstate`/`hashchange`/`resize`, and form events: `input`, `change`, `submit` (cancellable), `focus`/`blur`; see "Web platform parity part 2 notes" |
+| DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | **Done** (part 2) | Queries, tree walking and editing, `classList`, `dataset`, `style`, `innerHTML`/`outerHTML`, `getBoundingClientRect`, `focus`/`blur`, form `value`/`checked`/`disabled`; see "Web platform parity part 2 notes" |
 | `window` and `location`: URL, navigation, `history`, viewport size | **Done** (part 1) | `location`, `history`, `innerWidth`/`innerHeight`, `devicePixelRatio`, scroll, `navigator.userAgent`/`language`, `resize`; see "Web platform parity notes" |
 | `console.*` with objects, `print` to a console view | Partly | Both packs log as text, with levels, to the Inspector's Console and the Trace panel; objects are shown by handle, not expanded |
 | Canvas, WebGL, audio, media | Missing | Large; depends on what Blitz can render |
@@ -801,7 +802,7 @@ are generalisations:
   built-in modules (`sys`, `time`, `itertools`). Use `Math.random()` for randomness. Adding
   RustPython's native stdlib crate would cost size and needs auditing for host access.
 - **No imports between page files, and no `async`/`await` tied to the event loop.**
-- **Values:** lists and dicts can't be passed to the host (as for JS). Members use Web IDL
+- **Values:** lists and dicts of data can be passed to the host (part 2; before, they couldn't), but not ones holding functions or host objects. Members use Web IDL
   camelCase names. The prelude's method list must track `host.rs` (as for JS).
 - **Stopped packs:** a pack the time limit interrupts is stopped for good, as before. So now
   is a pack that **traps** (a guest panic, a stack overflow, running out of memory).
@@ -1233,6 +1234,91 @@ profile folder is 0700, since it holds cookies, storage and history.
 - **Prelude method lists** remain hand-kept (`METHODS` in both preludes), now with
   `STORAGE_METHODS` for the one name clash (`key`). A per-interface table generated from the
   host would remove that upkeep; three packs share it today, so it waits.
+
+## Web platform parity part 2 notes
+
+Part 2 of principle 6: DOM breadth and form events, `WebSocket`, a subset of IndexedDB and
+a basic canvas, the same in Dart, JS and Python. As in part 1, each is a host member under
+its Web IDL name, and each has a cross-pack test that runs one page in all three packs and
+expects identical output, then replays it.
+
+**DOM breadth** (`host.rs`; cross-pack test `the_dom_and_form_events_behave_the_same_in_dart_js_and_python`,
+fixtures `tests/fixtures/dom.*`).
+- **Queries:** `getElementById`, `querySelectorAll` (on documents and elements). A `NodeList`
+  has `length`, `item(i)` and indexing; JS iterates it (`for...of`, spread, `forEach`) and
+  Python too (`len`, `[i]`, `for`); Dart uses `length`/`item`. `children` and `childNodes`
+  are NodeLists too. **They're snapshots**, not live collections (a `querySelectorAll`
+  result is static in browsers anyway; `children` and `childNodes` are live there).
+- **The tree:** `parentElement`/`parentNode`, `first`/`last`/`next`/`previousSibling` and their
+  `...ElementChild`/`...ElementSibling` forms, `childElementCount`, `nodeType`, `nodeName`,
+  `nodeValue`/`data` for text, `documentElement`, `head`, `createTextNode`, `insertBefore`,
+  `replaceChild`, `removeChild`, `cloneNode(deep)`, `contains`, `hasAttribute`, `className`
+  (read). Inserting a node into itself or its own subtree throws `HierarchyRequestError`
+  (`appendChild` too, which before could make the tree a loop and hang the browser);
+  removing or replacing a node that isn't a child throws `NotFoundError`.
+- **`classList`** (`add`, `remove`, `toggle(token, force)`, `contains`, `item`, `length`,
+  `value`), **`dataset`** (`el.dataset.userId` ↔ `data-user-id`; Dart's `dataset['userId']`)
+  and **`style`** (`setProperty` with priority, `getPropertyValue`, `removeProperty`,
+  `cssText`, `length`, and camelCase properties such as `style.marginTop`). Each is a view of
+  the element's attribute, one object per element. `style` reads and writes the `style`
+  attribute as written: values aren't normalised as browsers do (`#f00` stays `#f00`), and a
+  `;` inside a quoted string or `url()` would split a declaration.
+- **`innerHTML`** (get and set) and **`outerHTML`** (get). Setting parses with Blitz's HTML
+  parser (`DocumentHtmlParser::parse_inner_html_into_mutator`). **Nothing in it runs:** a page
+  picks its pack and runs its scripts once, at load, so an inserted `<script>` is inert, as
+  in browsers (tested), and pack selection and permissions are untouched. What it loads
+  (images, stylesheets) goes through the page's gate like any subresource. Serialising is
+  the host's own (void elements, escaping, raw-text elements), since Blitz's writes empty
+  elements as `<p />`.
+- **Dropped nodes:** replacing an element's `textContent` or `innerHTML` drops its old
+  children for good. Blitz reuses node ids, so their handles, views and listeners are now
+  forgotten (`Objects::forget_nodes`): a stale handle fails ("this object is no longer
+  available") instead of reaching whatever new node gets the id. (Before, `textContent`
+  could alias a stale handle onto a new node.)
+- **Form fields:** `value` (text fields' text; other inputs' `value` attribute), `checked`,
+  `disabled`. Setting `value` changes the field's text, not its attribute, and puts the
+  caret at the end. Blitz makes a field's editing state when it first lays the field out;
+  page code can run before that, so the host makes it the same way first
+  (`ensure_field_state`). Reads of `value` and `checked` are on the tape (`Read::Field`):
+  the user changes them by typing and clicking, Blitz's default actions, which a replay
+  doesn't repeat. `<select>` values aren't supported.
+- **`getBoundingClientRect`** returns a plain object (`x`, `y`, `width`, `height`, `top`,
+  `left`, `right`, `bottom`) from **the layout Blitz last computed** (the last frame), less
+  the scroll. No layout is forced, unlike browsers: right after a change, or during the
+  page's first scripts (before the first layout), it's out of date or zero. Forcing one
+  means calling Blitz's `resolve` with an animation time the host doesn't know (the shell
+  owns it), which would restart CSS transitions; reading the last frame is the safe
+  choice. On the tape (`Read::Layout`): layout depends on the window and the fonts.
+- **`focus()`/`blur()`** move Blitz's focus (only to focusable elements) and queue `blur`,
+  `focusout`, `focus` and `focusin`, dispatched once the page's code returns (browsers
+  dispatch them synchronously; the host can't re-enter a pack mid-call).
+- **Form events.** Blitz already reports `input` (text fields, checkboxes, radios), `focus`,
+  `blur`, `focusin` and `focusout`. The page document adds what browsers fire around them
+  (`RunningPack::form_events`), with no fork change:
+  - `change`: when a text field loses focus with a value other than the one it had when it
+    got it (before `blur`, as in browsers), and after `input` on a checkbox or radio;
+  - `submit` on the form, before a click on an enabled submit button or Enter in a one-line
+    text field would submit it. `preventDefault` on `submit` cancels Blitz's default action
+    (the click's or the key's), so the form isn't submitted (tested, with a navigation
+    provider that records submissions). Enter fires `submit` whenever the field has a form,
+    without the spec's implicit-submission conditions (Blitz checks those itself, so an
+    Enter can fire `submit` where Blitz then doesn't submit). `form.submit()` and
+    `requestSubmit()` aren't supported.
+  - Each is dispatched (and recorded) like any other event, so a replay gets them as steps.
+- **AI:** `Element.value`, `Element.checked`, `Element.innerHTML` and `Element.outerHTML` calls
+  are hidden in redacted views (`debug::holds_secrets`). `innerHTML`/`outerHTML` are hidden
+  on every element, not only forms: any element's HTML can contain a field's value. The
+  cross-pack test plants a password field's value, reads it in every pack, and checks it
+  never reaches the redacted trace or console.
+- **Handles:** NodeLists are releasable (JS and Python free them as their wrappers go) and
+  bounded: a page holds at most 4 Mi listed nodes (Dart never releases). `classList`,
+  `style` and `dataset` objects are one per element, like elements.
+- **Dart:** `package:web`'s `operator []` and `operator []=` (`dataset`) compile to
+  `(x0,x1) => x0[x1]` and `(x0,x1,x2) => { x0[x1] = x2 }`, now recognised. Dart can't
+  catch host errors (part 1's gap), so the cross-pack fixture avoids them; `dom_edge_cases`
+  tests them in JS.
+- **Wire format:** arrays now cross from the interpreters (`{"arr": [...]}`), for data such
+  as IndexedDB values.
 
 ## Known local setup notes
 

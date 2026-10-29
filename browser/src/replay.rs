@@ -47,12 +47,18 @@ pub enum Read {
     State,
     /// The window's size, pixel ratio or scroll position (`innerWidth`, `scrollY`...).
     Viewport,
+    /// A form field's `value` or `checked` (text): the user changes them by typing and
+    /// clicking, Blitz's own default actions, which a replay doesn't repeat.
+    Field,
+    /// An element's box (`getBoundingClientRect`, as JSON text): layout depends on the window
+    /// and the fonts.
+    Layout,
 }
 
 impl Read {
     /// Whether the tape value is an index into the recording's texts.
     fn is_text(self) -> bool {
-        matches!(self, Read::Cookie | Read::Storage | Read::State)
+        matches!(self, Read::Cookie | Read::Storage | Read::State | Read::Field | Read::Layout)
     }
 }
 

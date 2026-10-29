@@ -171,11 +171,11 @@ not read time or randomness any other way.
   - `{"cb": id}` is a callback;
   - `{"obj": {name: value}}` is a plain object of data, which the host turns into a host
     object (`Host::object`);
+  - `{"arr": [...]}` is an array of data (`Host::array`);
   - `{"o": handle, "r": 1}` from the host marks an object made for the pack (a response,
     its headers, parsed data, a promise): when the pack drops its last wrapper it sends
     `{"op": "release", "target": handle}` (`Host::release`). Dart doesn't release.
 
-  Arrays can't cross from an interpreter yet.
 - **Promises:** host methods that return a promise (`fetch`, `Response.text`, `json`) return
   a host `Promise` object with `then(onFulfilled, onRejected)`. Its callbacks run later, as
   zero-delay timers. The JS prelude wraps them in real Promises; Python's in a `Promise` class
@@ -190,6 +190,9 @@ not read time or randomness any other way.
     to properties (read). Keep it in step with `host.rs`.
   - Storage objects have their own list (`STORAGE_METHODS`), since `key` is a Storage
     method but a keyboard event property.
+  - Lists (a `NodeList`, an array of data) work as the language's own: JS iterates any
+    wrapper by `length` and index (`for...of`, spread, `forEach`); Python's `HostObject` has
+    `len`, `[i]` (and `[name]`, for `dataset`) and iteration, and is always true.
   - The prelude also defines the globals: `window`, `document`, `console`, the timer
     functions, `fetch`, `localStorage`, `sessionStorage`, `location`, `history`,
     `navigator`, `Math.random` for JS and `Math` for Python (JS also gets the window's size
@@ -393,5 +396,6 @@ packed JSON reply.
   - Importing other page files.
   - `async`/`await` with the browser's event loop.
   - Host object identity with `is` (use `==`).
-  - Passing lists or dicts to the host (as for JS).
+  - Passing lists or dicts holding functions or host objects to the host (as for JS):
+    only data crosses.
   - Snake_case aliases for Web IDL names.

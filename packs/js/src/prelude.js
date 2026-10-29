@@ -20,6 +20,9 @@
     'fetch', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
     'scrollTo', 'scroll', 'scrollBy',
+    'getElementById', 'querySelectorAll', 'createTextNode', 'item', 'insertBefore', 'replaceChild',
+    'removeChild', 'cloneNode', 'hasAttribute', 'contains', 'getBoundingClientRect', 'focus', 'blur',
+    'add', 'toggle', 'setProperty', 'getPropertyValue', 'removeProperty',
   ]);
   // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
   const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
@@ -28,7 +31,7 @@
   const PROMISES = new Set(['fetch', 'text']);
 
   // Values cross as JSON: undefined → {u:1}, host object → {o:h}, function → {cb:id}, a
-  // plain object (a fetch init, a history state) → {obj: {...}}.
+  // plain object (a fetch init, a history state) → {obj: {...}}, an array → {arr: [...]}.
   const encode = (v) => {
     if (v === undefined) return { u: 1 };
     if (typeof v === 'function') {
@@ -41,6 +44,7 @@
     }
     if (v !== null && typeof v === 'object') {
       if (v[HANDLE] !== undefined) return { o: v[HANDLE] };
+      if (Array.isArray(v)) return { arr: v.map(encode) };
       const proto = Object.getPrototypeOf(v);
       if (proto === Object.prototype || proto === null) {
         return { obj: Object.fromEntries(Object.entries(v).map(([k, x]) => [k, encode(x)])) };
@@ -87,10 +91,23 @@
       // they're called.
       get(_, prop, self) {
         if (prop === HANDLE) return h;
+        // Lists (a NodeList, an array of data) iterate by index, as in browsers.
+        if (prop === Symbol.iterator) {
+          return function* () {
+            const n = self.length;
+            for (let i = 0; i < n; i++) yield self[i];
+          };
+        }
         // Not thenable: resolving a JS promise with a host object mustn't call it.
         if (typeof prop !== 'string' || prop === 'then') return undefined;
         // Response.json() parses in JS, so the page gets ordinary objects and arrays.
         if (prop === 'json') return () => promised(request({ op: 'call', target: self[HANDLE], name: 'text', args: [] })).then((t) => JSON.parse(t));
+        if (prop === 'forEach' && !methods.has(prop)) {
+          return (f) => {
+            const n = self.length;
+            for (let i = 0; i < n; i++) f(self[i], i, self);
+          };
+        }
         if (STORAGE.has(prop)) {
           // Wrapped with Storage's methods (not by `decode`, which would wrap it generically).
           const reply = JSON.parse(__host(JSON.stringify({ op: 'get', target: h, name: prop })));

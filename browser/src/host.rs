@@ -184,6 +184,13 @@ pub enum Obj {
     Location,
     History,
     Navigator,
+    /// `querySelectorAll`, `children`, `childNodes`: a snapshot of nodes (not live).
+    NodeList(Rc<Vec<NodeId>>),
+    /// An element's `classList`, `style` and `dataset`: views of its attributes, one each per
+    /// element (`Objects::views`), so they live as long as the element does.
+    ClassList(NodeId),
+    Style(NodeId),
+    Dataset(NodeId),
 }
 
 impl Obj {
@@ -204,6 +211,10 @@ impl Obj {
             Obj::Location => "Location",
             Obj::History => "History",
             Obj::Navigator => "Navigator",
+            Obj::NodeList(_) => "NodeList",
+            Obj::ClassList(_) => "DOMTokenList",
+            Obj::Style(_) => "CSSStyleDeclaration",
+            Obj::Dataset(_) => "DOMStringMap",
         }
     }
 }
@@ -222,6 +233,9 @@ fn can_rewrite(current: &Url, url: &Url) -> bool {
 
 /// The most response body a page may hold at once (in `Response` objects it hasn't released).
 const MAX_HELD_BODIES: usize = 256 << 20;
+
+/// The most nodes a page may hold in `NodeList`s at once (about 32 MB of node ids).
+const MAX_LISTED: usize = 4 << 20;
 
 /// `navigator.language`. Fixed rather than the system's, so pages can't use it to tell
 /// machines apart beyond what the User-Agent already says.
@@ -345,9 +359,14 @@ pub struct Objects {
     /// `history.state` for the page's current entry, as JSON text; None until first read
     /// from the tab.
     pub history_state: Option<Option<String>>,
-    /// Events for `window` the page caused (`hashchange` after setting `location.hash`), to
+    /// Events the page caused (`hashchange` after setting `location.hash` on `window`, `focus`
+    /// and `blur` after `element.focus()`), by target node (the root for `window`), to
     /// dispatch as a task once its code returns.
-    pub queued_events: Vec<(String, EventDetails)>,
+    pub queued_events: Vec<(NodeId, String, EventDetails)>,
+    /// Each element's `classList`, `style` and `dataset` objects, once made.
+    views: HashMap<(NodeId, &'static str), u32>,
+    /// Nodes listed in the `NodeList`s the page holds, which are host memory: bounded.
+    listed: usize,
 }
 
 impl Default for Objects {
@@ -373,6 +392,8 @@ impl Default for Objects {
             waker: Default::default(),
             history_state: None,
             queued_events: Vec::new(),
+            views: HashMap::new(),
+            listed: 0,
         }
     }
 }
@@ -427,11 +448,15 @@ impl Objects {
     }
 
     pub fn release(&mut self, handle: u32) {
-        if let Some(Obj::Response(r)) = self.objects.remove(&handle) {
-            self.body_bytes -= r.body.len().min(self.body_bytes);
-            if let Some(headers) = self.headers_of.remove(&handle) {
-                self.objects.remove(&headers);
+        match self.objects.remove(&handle) {
+            Some(Obj::Response(r)) => {
+                self.body_bytes -= r.body.len().min(self.body_bytes);
+                if let Some(headers) = self.headers_of.remove(&handle) {
+                    self.objects.remove(&headers);
+                }
             }
+            Some(Obj::NodeList(nodes)) => self.listed -= nodes.len().min(self.listed),
+            _ => {}
         }
         self.promises.remove(&handle);
         self.headers_of.retain(|_, h| *h != handle);
@@ -441,7 +466,53 @@ impl Objects {
     /// values made for it (responses, their headers, parsed data, promises), not the page's
     /// elements or the singletons.
     pub fn releasable(&self, handle: u32) -> bool {
-        matches!(self.objects.get(&handle), Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_)))
+        matches!(self.objects.get(&handle), Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_) | Obj::NodeList(_)))
+    }
+
+    /// A `NodeList` of `nodes`, unless the page already holds too many listed nodes (host
+    /// memory; Dart never releases them).
+    fn node_list(&mut self, nodes: Vec<NodeId>) -> Result<HostValue> {
+        if self.listed + nodes.len() > MAX_LISTED {
+            bail!("the page holds over {MAX_LISTED} nodes in NodeLists; release some first");
+        }
+        self.listed += nodes.len();
+        Ok(HostValue::Object(self.add(Obj::NodeList(Rc::new(nodes)))))
+    }
+
+    /// Element `node`'s `classList`, `style` or `dataset` (`kind`): one object per element.
+    fn view(&mut self, node: NodeId, kind: &'static str) -> HostValue {
+        if let Some(h) = self.views.get(&(node, kind)) {
+            return HostValue::Object(*h);
+        }
+        let handle = self.add(match kind {
+            "classList" => Obj::ClassList(node),
+            "style" => Obj::Style(node),
+            _ => Obj::Dataset(node),
+        });
+        self.views.insert((node, kind), handle);
+        HostValue::Object(handle)
+    }
+
+    /// Nodes the page dropped from the document for good (their parent's `textContent` or
+    /// `innerHTML` was replaced): their handles, views and listeners go, so a stale handle
+    /// fails instead of reaching a new node Blitz gives the same id.
+    fn forget_nodes(&mut self, dropped: &[NodeId]) {
+        for node in dropped {
+            if let Some(h) = self.element_handles.remove(node) {
+                self.objects.remove(&h);
+            }
+            for kind in ["classList", "style", "dataset"] {
+                if let Some(h) = self.views.remove(&(*node, kind)) {
+                    self.objects.remove(&h);
+                }
+            }
+        }
+        let gone: Vec<(NodeId, String)> = self.listeners.keys().filter(|(n, _)| dropped.contains(n)).cloned().collect();
+        for key in gone {
+            for id in self.listeners.remove(&key).unwrap_or_default() {
+                self.release_if_unused(id);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -747,8 +818,9 @@ impl PageHost {
             objects.history_state = Some(None);
             if !replaying {
                 let details = EventDetails { old_url: Some(current.to_string()), new_url: Some(url.to_string()), ..Default::default() };
-                objects.queued_events.push(("popstate".into(), EventDetails::default()));
-                objects.queued_events.push(("hashchange".into(), details));
+                let root = self.doc.borrow().root_node().id;
+                objects.queued_events.push((root, "popstate".into(), EventDetails::default()));
+                objects.queued_events.push((root, "hashchange".into(), details));
                 if let Some(w) = objects.waker.lock().unwrap().as_ref() {
                     w.wake_by_ref();
                 }
@@ -912,6 +984,112 @@ impl PageHost {
         }
     }
 
+    /// A node as the page sees it, or null.
+    fn node_or_null(&mut self, node: Option<NodeId>) -> HostValue {
+        match node {
+            Some(id) => self.objects.borrow_mut().element(id),
+            None => HostValue::Null,
+        }
+    }
+
+    /// The node `id`'s parent, first or last child, or next or previous sibling (`which`, by
+    /// its DOM name; the `...Element...` forms skip text).
+    fn relative(&self, id: NodeId, which: &str) -> Result<Option<NodeId>> {
+        let doc = self.doc.borrow();
+        let node = doc.get_node(id).context("this node was removed")?;
+        let elements_only = which.contains("Element") && which != "parentElement";
+        let is_wanted = |n: &NodeId| !elements_only || doc.get_node(*n).is_some_and(|n| n.is_element());
+        let siblings = || node.parent.and_then(|p| doc.get_node(p)).map(|p| p.children.as_slice()).unwrap_or_default();
+        let position = || siblings().iter().position(|c| *c == id).unwrap_or(0);
+        Ok(match which {
+            "parentElement" | "parentNode" => node.parent,
+            "firstChild" | "firstElementChild" => node.children.iter().copied().find(is_wanted),
+            "lastChild" | "lastElementChild" => node.children.iter().rev().copied().find(is_wanted),
+            "nextSibling" | "nextElementSibling" => siblings().iter().skip(position() + 1).copied().find(is_wanted),
+            _ => siblings()[..position()].iter().rev().copied().find(is_wanted),
+        })
+    }
+
+    /// Attribute `name` of element `id`, or empty.
+    fn attr(&self, id: NodeId, name: &str) -> String {
+        self.doc.borrow().get_node(id).and_then(|n| n.attr(LocalName::from(name))).unwrap_or_default().to_string()
+    }
+
+    /// Set attribute `name` of element `id` (None removes it).
+    fn set_attr(&self, id: NodeId, name: &str, value: Option<&str>) {
+        let name = QualName::new(None, ns!(), LocalName::from(name));
+        let mut doc = self.doc.borrow_mut();
+        match value {
+            Some(v) => doc.mutate().set_attribute(id, name, v),
+            None => doc.mutate().clear_attribute(id, name),
+        }
+    }
+
+    /// Drop element `id`'s children for good, forgetting their handles (see `forget_nodes`).
+    fn drop_children(&self, id: NodeId) {
+        let mut dropped = Vec::new();
+        let mut doc = self.doc.borrow_mut();
+        let children: Vec<NodeId> = doc.get_node(id).map(|n| n.children.to_vec()).unwrap_or_default();
+        let mut m = doc.mutate();
+        for child in children {
+            m.remove_and_drop_node_with(child, &mut |n| dropped.push(n));
+        }
+        drop(m);
+        drop(doc);
+        self.objects.borrow_mut().forget_nodes(&dropped);
+    }
+
+    /// Whether `child` may go into `parent`: not into itself or its own subtree, which would
+    /// make the tree a loop (`HierarchyRequestError`), and not the document's root.
+    fn check_insert(&self, parent: NodeId, child: NodeId) -> Result<()> {
+        let doc = self.doc.borrow();
+        if doc.node_chain(parent).contains(&child) || child == doc.root_node().id {
+            bail!("HierarchyRequestError: the new child contains the parent");
+        }
+        Ok(())
+    }
+
+    /// Whether `child` is a child of `parent` (`NotFoundError` otherwise).
+    fn check_child(&self, parent: NodeId, child: NodeId) -> Result<()> {
+        if self.doc.borrow().get_node(child).and_then(|n| n.parent) != Some(parent) {
+            bail!("NotFoundError: the node is not a child of this node");
+        }
+        Ok(())
+    }
+
+    /// Move the focus to element `to` (if it can take focus), or nowhere, as `focus()` and
+    /// `blur()` do. The `blur`/`focusout` and `focus`/`focusin` events go once the page's
+    /// code returns (a replay gets them as recorded steps).
+    fn focus(&mut self, to: Option<NodeId>) {
+        let mut doc = self.doc.borrow_mut();
+        let root_element = doc.try_root_element().map(|n| n.id);
+        let focused = |doc: &BaseDocument| doc.get_focussed_node_id().filter(|f| Some(*f) != root_element);
+        let old = focused(&doc);
+        match to {
+            Some(id) if doc.get_node(id).and_then(|n| n.element_data()).is_some_and(|el| el.is_focussable) => {
+                doc.set_focus_to(id);
+            }
+            Some(_) => return,
+            None => doc.clear_focus(),
+        }
+        let new = focused(&doc);
+        drop(doc);
+        let mut objects = self.objects.borrow_mut();
+        if old == new || objects.tape.replaying() {
+            return;
+        }
+        for (node, kinds) in [(old, ["blur", "focusout"]), (new, ["focus", "focusin"])] {
+            if let Some(node) = node {
+                for kind in kinds {
+                    objects.queued_events.push((node, kind.into(), EventDetails::default()));
+                }
+            }
+        }
+        if let Some(w) = objects.waker.lock().unwrap().as_ref() {
+            w.wake_by_ref();
+        }
+    }
+
     /// The node a query or listener on `obj` is scoped to. Window listeners sit on the root.
     fn scope(&self, obj: &Obj) -> Option<NodeId> {
         match obj {
@@ -1018,6 +1196,113 @@ impl PageHost {
                 let live = crate::cookies::jar().document_cookie(self.doc.borrow().url());
                 HostValue::str(&self.objects.borrow_mut().tape.read_text(Read::Cookie, live))
             }
+            (Obj::Document, "documentElement" | "head") => {
+                let doc = self.doc.borrow();
+                let found = match prop {
+                    "head" => doc.find_head_node().map(|n| n.id),
+                    _ => doc.try_root_element().map(|n| n.id),
+                };
+                drop(doc);
+                self.node_or_null(found)
+            }
+            (Obj::Element(id), "children" | "childNodes") => {
+                let doc = self.doc.borrow();
+                let node = doc.get_node(*id).context("this node was removed")?;
+                let nodes = node.children.iter().copied().filter(|c| prop == "childNodes" || doc.get_node(*c).is_some_and(|n| n.is_element())).collect();
+                drop(doc);
+                self.objects.borrow_mut().node_list(nodes)?
+            }
+            (Obj::Element(id), "parentElement" | "parentNode" | "firstChild" | "lastChild" | "nextSibling" | "previousSibling"
+                | "firstElementChild" | "lastElementChild" | "nextElementSibling" | "previousElementSibling") => {
+                let found = self.relative(*id, prop)?;
+                // The document node is `parentNode` of the root element, never `parentElement`.
+                if found == Some(self.doc.borrow().root_node().id) {
+                    return Ok(match prop {
+                        "parentNode" => self.objects.borrow_mut().singleton("document", Obj::Document),
+                        _ => HostValue::Null,
+                    });
+                }
+                self.node_or_null(found)
+            }
+            (Obj::Element(id), "childElementCount") => {
+                let doc = self.doc.borrow();
+                let node = doc.get_node(*id).context("this node was removed")?;
+                HostValue::Num(node.children.iter().filter(|c| doc.get_node(**c).is_some_and(|n| n.is_element())).count() as f64)
+            }
+            (Obj::Element(id), "nodeType" | "nodeName" | "nodeValue" | "data") => {
+                let doc = self.doc.borrow();
+                let node = doc.get_node(*id).context("this node was removed")?;
+                match (prop, node.element_data(), node.text_data()) {
+                    ("nodeType", Some(_), _) => HostValue::Num(1.0),
+                    ("nodeType", _, Some(_)) => HostValue::Num(3.0),
+                    ("nodeType", _, _) => HostValue::Num(8.0),
+                    ("nodeName", Some(el), _) => HostValue::str(&el.name.local.to_ascii_uppercase()),
+                    ("nodeName", _, Some(_)) => HostValue::str("#text"),
+                    ("nodeName", _, _) => HostValue::str("#comment"),
+                    (_, _, Some(text)) => HostValue::str(&text.content),
+                    ("nodeValue", _, _) => HostValue::Null,
+                    _ => HostValue::Undefined,
+                }
+            }
+            (Obj::Element(id), "className") => HostValue::str(self.doc.borrow().get_node(*id).and_then(|n| n.attr(LocalName::from("class"))).unwrap_or("")),
+            (Obj::Element(id), "classList" | "style" | "dataset") => {
+                let kind = match prop {
+                    "classList" => "classList",
+                    "style" => "style",
+                    _ => "dataset",
+                };
+                self.element(target)?;
+                self.objects.borrow_mut().view(*id, kind)
+            }
+            (Obj::Element(id), "innerHTML" | "outerHTML") => {
+                let doc = self.doc.borrow();
+                doc.get_node(*id).context("this node was removed")?;
+                HostValue::str(&serialize(&doc, *id, prop == "outerHTML"))
+            }
+            // A form field's state: the user changes it by typing and clicking, which a replay
+            // doesn't repeat, so reads are on the tape.
+            (Obj::Element(id), "value" | "checked") => {
+                ensure_field_state(&mut self.doc.borrow_mut(), *id);
+                let doc = self.doc.borrow();
+                let el = doc.get_node(*id).and_then(|n| n.element_data()).context("not an element")?;
+                let live = match prop {
+                    "checked" => el.checkbox_input_checked().unwrap_or(false).to_string(),
+                    _ => field_value(el),
+                };
+                drop(doc);
+                let text = self.objects.borrow_mut().tape.read_text(Read::Field, live);
+                match prop {
+                    "checked" => HostValue::Bool(text == "true"),
+                    _ => HostValue::str(&text),
+                }
+            }
+            (Obj::Element(id), "disabled") => HostValue::Bool(self.doc.borrow().get_node(*id).and_then(|n| n.attr(LocalName::from("disabled"))).is_some()),
+            (Obj::NodeList(nodes), _) => match prop {
+                "length" => HostValue::Num(nodes.len() as f64),
+                _ => match prop.parse::<usize>().ok().and_then(|i| nodes.get(i)) {
+                    Some(node) => self.objects.borrow_mut().element(*node),
+                    None => HostValue::Undefined,
+                },
+            },
+            (Obj::ClassList(id), "length" | "value") => {
+                let classes = self.attr(*id, "class");
+                match prop {
+                    "length" => HostValue::Num(classes.split_ascii_whitespace().count() as f64),
+                    _ => HostValue::str(&classes),
+                }
+            }
+            (Obj::Dataset(id), _) => match self.doc.borrow().get_node(*id).and_then(|n| n.attr(LocalName::from(data_attribute(prop).as_str()))) {
+                Some(v) => HostValue::str(v),
+                None => HostValue::Undefined,
+            },
+            (Obj::Style(id), _) => {
+                let declarations = parse_style(&self.attr(*id, "style"));
+                match prop {
+                    "cssText" => HostValue::str(&write_style(&declarations)),
+                    "length" => HostValue::Num(declarations.len() as f64),
+                    _ => HostValue::str(&style_value(&declarations, &kebab(prop))),
+                }
+            }
             (Obj::Element(id), "textContent") => HostValue::str(&self.doc.borrow().get_node(*id).context("removed")?.text_content()),
             (Obj::Element(id), "tagName") => {
                 let doc = self.doc.borrow();
@@ -1089,6 +1374,26 @@ impl PageHost {
                 self.go_to(&target, false)?;
                 return Ok(());
             }
+            (Obj::Dataset(id), _) => {
+                self.set_attr(*id, &data_attribute(prop), Some(&value.display()));
+                return Ok(());
+            }
+            (Obj::Style(id), _) => {
+                let text = match prop {
+                    "cssText" => write_style(&parse_style(&value.display())),
+                    _ => {
+                        let mut declarations = parse_style(&self.attr(*id, "style"));
+                        set_style(&mut declarations, &kebab(prop), &value.display());
+                        write_style(&declarations)
+                    }
+                };
+                self.set_attr(*id, "style", Some(&text));
+                return Ok(());
+            }
+            (Obj::ClassList(id), "value") => {
+                self.set_attr(*id, "class", Some(&value.display()));
+                return Ok(());
+            }
             (Obj::Document, "cookie") => {
                 // A replay reads cookies from its tape; it mustn't change the real jar.
                 if !self.objects.borrow().tape.replaying() {
@@ -1099,18 +1404,54 @@ impl PageHost {
             _ => bail!("{}.{prop} = ... is not supported yet", obj.interface()),
         }
         let id = self.element(target).with_context(|| format!("setting {prop}"))?;
-        let mut doc = self.doc.borrow_mut();
-        let mut m = doc.mutate();
         match prop {
             // Replaces the element's children with one text node.
             "textContent" => {
-                m.remove_and_drop_all_children(id);
+                self.drop_children(id);
+                let mut doc = self.doc.borrow_mut();
+                let mut m = doc.mutate();
                 let text = m.create_text_node(&value.display());
                 m.append_children(id, &[text]);
             }
+            // Parsed by Blitz's HTML parser. Nothing in it runs: a page picks its pack and runs
+            // its scripts once, at load, so an inserted `<script>` is inert, as in browsers.
+            // What it loads (images, stylesheets) goes through the page's gate like any other
+            // subresource.
+            "innerHTML" => {
+                self.drop_children(id);
+                let mut doc = self.doc.borrow_mut();
+                let mut m = doc.mutate();
+                blitz_html::DocumentHtmlParser::parse_inner_html_into_mutator(&mut m, id, &value.display());
+            }
             "id" | "className" => {
                 let attr = if prop == "id" { "id" } else { "class" };
-                m.set_attribute(id, QualName::new(None, ns!(), LocalName::from(attr)), &value.display());
+                self.set_attr(id, attr, Some(&value.display()));
+            }
+            "disabled" => self.set_attr(id, "disabled", value.truthy().then_some("")),
+            "value" => {
+                let mut doc = self.doc.borrow_mut();
+                ensure_field_state(&mut doc, id);
+                let el = doc.get_node_mut(id).and_then(|n| n.element_data_mut()).context("not an element")?;
+                match el.text_input_data_mut() {
+                    // The caret goes to the end, as in browsers.
+                    Some(input) => {
+                        input.editor.set_text(&value.display());
+                        doc.with_text_input(id, |mut driver| driver.move_to_text_end());
+                    }
+                    // Not a text field: the attribute is its value.
+                    None => {
+                        drop(doc);
+                        self.set_attr(id, "value", Some(&value.display()));
+                    }
+                }
+            }
+            "checked" => {
+                let mut doc = self.doc.borrow_mut();
+                ensure_field_state(&mut doc, id);
+                if let Some(el) = doc.get_node_mut(id).and_then(|n| n.element_data_mut()) {
+                    el.set_checkbox_input_checked(value.truthy());
+                }
+                doc.shell_provider.request_redraw();
             }
             _ => bail!("Element.{prop} = ... is not supported yet"),
         }
@@ -1167,8 +1508,171 @@ impl PageHost {
             (Obj::Element(parent), "appendChild") => {
                 let child_value = args.first().context("appendChild: missing child")?;
                 let child = self.element(child_value)?;
+                self.check_insert(*parent, child)?;
                 self.doc.borrow_mut().mutate().append_children(*parent, &[child]);
                 child_value.clone()
+            }
+            (Obj::Document, "getElementById") => {
+                let found = self.doc.borrow().get_element_by_id(&text(0)?);
+                self.node_or_null(found)
+            }
+            (Obj::Document | Obj::Element(_), "querySelectorAll") => {
+                let scope = self.scope(&obj).context("no scope")?;
+                let selector = text(0)?;
+                let found = self.doc.borrow().query_selector_all_in(scope, &selector).map_err(|e| anyhow::anyhow!("SyntaxError: bad selector {selector:?}: {e:?}"))?;
+                self.objects.borrow_mut().node_list(found.into_iter().collect())?
+            }
+            (Obj::Document, "createTextNode") => {
+                let id = self.doc.borrow_mut().mutate().create_text_node(&text(0)?);
+                self.objects.borrow_mut().element(id)
+            }
+            (Obj::Element(parent), "insertBefore") => {
+                let new_value = args.first().context("insertBefore: missing node")?;
+                let new = self.element(new_value)?;
+                self.check_insert(*parent, new)?;
+                match args.get(1) {
+                    Some(r @ HostValue::Object(_)) => {
+                        let anchor = self.element(r)?;
+                        self.check_child(*parent, anchor)?;
+                        if anchor != new {
+                            self.doc.borrow_mut().mutate().insert_nodes_before(anchor, &[new]);
+                        }
+                    }
+                    _ => self.doc.borrow_mut().mutate().append_children(*parent, &[new]),
+                }
+                new_value.clone()
+            }
+            (Obj::Element(parent), "replaceChild") => {
+                let (new, old) = (self.element(args.first().context("replaceChild: missing node")?)?, self.element(args.get(1).context("replaceChild: missing child")?)?);
+                self.check_insert(*parent, new)?;
+                self.check_child(*parent, old)?;
+                if new != old {
+                    self.doc.borrow_mut().mutate().replace_node_with(old, &[new]);
+                }
+                args[1].clone()
+            }
+            (Obj::Element(parent), "removeChild") => {
+                let child = self.element(args.first().context("removeChild: missing child")?)?;
+                self.check_child(*parent, child)?;
+                self.doc.borrow_mut().mutate().remove_node(child);
+                args[0].clone()
+            }
+            (Obj::Element(id), "cloneNode") => {
+                let deep = args.first().is_some_and(HostValue::truthy);
+                let mut doc = self.doc.borrow_mut();
+                let mut m = doc.mutate();
+                let copy = match (deep, m.element_name(*id).cloned()) {
+                    (true, _) => m.deep_clone_node(*id),
+                    (false, Some(name)) => {
+                        let attrs = m.doc.get_node(*id).and_then(|n| n.element_data()).map(|el| el.attrs().to_vec()).unwrap_or_default();
+                        m.create_element(name, attrs)
+                    }
+                    (false, None) => {
+                        let text = m.doc.get_node(*id).and_then(|n| n.text_data()).map(|t| t.content.clone()).unwrap_or_default();
+                        m.create_text_node(&text)
+                    }
+                };
+                drop(m);
+                drop(doc);
+                self.objects.borrow_mut().element(copy)
+            }
+            (Obj::Element(id), "hasAttribute") => {
+                let name = text(0)?;
+                HostValue::Bool(self.doc.borrow().get_node(*id).and_then(|n| n.attr(LocalName::from(name.as_str()))).is_some())
+            }
+            (Obj::Element(id), "contains") => match args.first() {
+                Some(v @ HostValue::Object(_)) => {
+                    let other = self.element(v)?;
+                    HostValue::Bool(self.doc.borrow().node_chain(other).contains(id))
+                }
+                _ => HostValue::Bool(false),
+            },
+            // From the layout Blitz last computed (the last frame): no layout is forced, so
+            // right after a change it's out of date. On the tape: layout depends on the window
+            // and the fonts.
+            (Obj::Element(id), "getBoundingClientRect") => {
+                let doc = self.doc.borrow();
+                let node = doc.get_node(*id).context("this node was removed")?;
+                let (at, size, scroll) = (node.absolute_position(0.0, 0.0), node.final_layout().size, doc.viewport_scroll());
+                let (x, y) = (at.x as f64 - scroll.x, at.y as f64 - scroll.y);
+                let (w, h) = (size.width as f64, size.height as f64);
+                drop(doc);
+                let live = serde_json::json!({"x": x, "y": y, "width": w, "height": h, "left": x, "top": y, "right": x + w, "bottom": y + h});
+                let mut objects = self.objects.borrow_mut();
+                let text = objects.tape.read_text(Read::Layout, live.to_string());
+                objects.from_json(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+            }
+            (Obj::Element(id), "focus") => {
+                self.focus(Some(*id));
+                HostValue::Undefined
+            }
+            (Obj::Element(id), "blur") => {
+                if self.doc.borrow().get_focussed_node_id() == Some(*id) {
+                    self.focus(None);
+                }
+                HostValue::Undefined
+            }
+            (Obj::NodeList(nodes), "item") => match args.first().and_then(|v| v.as_num()).filter(|i| *i >= 0.0).and_then(|i| nodes.get(i as usize)) {
+                Some(node) => self.objects.borrow_mut().element(*node),
+                None => HostValue::Null,
+            },
+            (Obj::ClassList(id), "add" | "remove" | "toggle" | "contains" | "item") => {
+                let mut classes: Vec<String> = self.attr(*id, "class").split_ascii_whitespace().map(str::to_string).collect();
+                let before = classes.clone();
+                let result = match method {
+                    "contains" => HostValue::Bool(classes.contains(&text(0)?)),
+                    "item" => match args.first().and_then(|v| v.as_num()).filter(|i| *i >= 0.0).and_then(|i| classes.get(i as usize)) {
+                        Some(c) => HostValue::str(c),
+                        None => HostValue::Null,
+                    },
+                    "toggle" => {
+                        let token = text(0)?;
+                        let on = match args.get(1) {
+                            Some(HostValue::Undefined) | None => !classes.contains(&token),
+                            Some(force) => force.truthy(),
+                        };
+                        match on {
+                            true if !classes.contains(&token) => classes.push(token),
+                            true => {}
+                            false => classes.retain(|c| *c != token),
+                        }
+                        HostValue::Bool(on)
+                    }
+                    _ => {
+                        for token in args.iter().map(HostValue::display) {
+                            if token.is_empty() || token.contains(char::is_whitespace) {
+                                bail!("SyntaxError: {token:?} isn't a valid class name");
+                            }
+                            match method {
+                                "add" if !classes.contains(&token) => classes.push(token),
+                                "add" => {}
+                                _ => classes.retain(|c| *c != token),
+                            }
+                        }
+                        HostValue::Undefined
+                    }
+                };
+                if classes != before {
+                    self.set_attr(*id, "class", Some(&classes.join(" ")));
+                }
+                result
+            }
+            (Obj::Style(id), "getPropertyValue") => HostValue::str(&style_value(&parse_style(&self.attr(*id, "style")), &text(0)?.to_ascii_lowercase())),
+            (Obj::Style(id), "setProperty" | "removeProperty") => {
+                let mut declarations = parse_style(&self.attr(*id, "style"));
+                let name = text(0)?.to_ascii_lowercase();
+                let old = style_value(&declarations, &name);
+                let value = match (method, args.get(1)) {
+                    ("setProperty", Some(v)) if !matches!(v, HostValue::Null | HostValue::Undefined) => v.display(),
+                    _ => String::new(),
+                };
+                let important = args.get(2).is_some_and(|p| p.display().eq_ignore_ascii_case("important"));
+                set_style(&mut declarations, &name, &if important && !value.is_empty() { format!("{value} !important") } else { value });
+                self.set_attr(*id, "style", Some(&write_style(&declarations)));
+                match method {
+                    "removeProperty" => HostValue::str(&old),
+                    _ => HostValue::Undefined,
+                }
             }
             (Obj::Element(id), "remove") => {
                 self.doc.borrow_mut().mutate().remove_node(*id);
@@ -1339,6 +1843,166 @@ impl PageHost {
             }
             _ => bail!("{}.{method}() is not supported yet", obj.interface()),
         })
+    }
+}
+
+// ---- DOM helpers: serialising, form fields, inline styles, `dataset` names
+
+/// Elements with no end tag, which never have children in HTML.
+const VOID_ELEMENTS: &[&str] = &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
+
+/// Node `id` as HTML, as `outerHTML` (`outer`) or `innerHTML` serialise it.
+fn serialize(doc: &BaseDocument, id: NodeId, outer: bool) -> String {
+    fn escape(text: &str, attribute: bool, out: &mut String) {
+        for c in text.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '\u{a0}' => out.push_str("&nbsp;"),
+                '"' if attribute => out.push_str("&quot;"),
+                '<' if !attribute => out.push_str("&lt;"),
+                '>' if !attribute => out.push_str("&gt;"),
+                c => out.push(c),
+            }
+        }
+    }
+    fn write(doc: &BaseDocument, id: NodeId, out: &mut String) {
+        let Some(node) = doc.get_node(id) else { return };
+        if let Some(text) = node.text_data() {
+            let raw = node.parent.and_then(|p| doc.get_node(p)).and_then(|p| p.element_data()).is_some_and(|el| {
+                matches!(el.name.local.as_ref(), "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext")
+            });
+            match raw {
+                true => out.push_str(&text.content),
+                false => escape(&text.content, false, out),
+            }
+        } else if let Some(el) = node.element_data() {
+            let tag = el.name.local.as_ref();
+            out.push('<');
+            out.push_str(tag);
+            for attr in el.attrs() {
+                out.push(' ');
+                out.push_str(&attr.name.local);
+                out.push_str("=\"");
+                escape(&attr.value, true, out);
+                out.push('"');
+            }
+            out.push('>');
+            if VOID_ELEMENTS.contains(&tag) {
+                return;
+            }
+            for child in &node.children {
+                write(doc, *child, out);
+            }
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
+        }
+    }
+    let mut out = String::new();
+    match outer {
+        true => write(doc, id, &mut out),
+        false => {
+            if let Some(node) = doc.get_node(id) {
+                for child in &node.children {
+                    write(doc, *child, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Blitz makes a form field's state (a text field's editor, a checkbox's checked state) when
+/// it first lays the field out, but page code can reach the field before that: make it the
+/// same way first (as `blitz_dom`'s layout construction does), and layout keeps it.
+fn ensure_field_state(doc: &mut BaseDocument, id: NodeId) {
+    use blitz_dom::node::{SpecialElementData, TextInputData};
+    let Some(node) = doc.get_node_mut(id) else { return };
+    let text = node.text_content();
+    let Some(el) = node.element_data_mut() else { return };
+    if !matches!(el.special_data, SpecialElementData::None) {
+        return;
+    }
+    let text_field = |initial: &str, multiline: bool| {
+        let mut data = TextInputData::new(multiline);
+        data.editor.set_text(initial);
+        SpecialElementData::TextInput(data)
+    };
+    el.special_data = match (el.name.local.as_ref(), el.attr(LocalName::from("type"))) {
+        ("textarea", _) => text_field(&text, true),
+        ("input", None | Some("text" | "password" | "email" | "number" | "search" | "tel" | "url")) => {
+            let value = el.attr(LocalName::from("value")).unwrap_or_default().to_string();
+            text_field(&value, false)
+        }
+        ("input", Some("checkbox" | "radio")) => SpecialElementData::CheckboxInput(el.attr(LocalName::from("checked")).is_some()),
+        _ => return,
+    };
+}
+
+/// A form field's `value`: a text field's text, otherwise its `value` attribute (a checkbox's
+/// defaults to "on").
+pub(crate) fn field_value(el: &blitz_dom::node::ElementData) -> String {
+    if let Some(input) = el.text_input_data() {
+        return input.editor.raw_text().to_string();
+    }
+    match el.attr(LocalName::from("value")) {
+        Some(v) => v.to_string(),
+        None if el.checkbox_input_checked().is_some() => "on".into(),
+        None => String::new(),
+    }
+}
+
+/// A camelCase name as CSS or a `data-` attribute writes it: `backgroundColor` →
+/// `background-color`.
+fn kebab(name: &str) -> String {
+    if name == "cssFloat" {
+        return "float".into();
+    }
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The attribute behind `dataset.<name>`: `userId` → `data-user-id`.
+fn data_attribute(name: &str) -> String {
+    format!("data-{}", kebab(name))
+}
+
+/// An inline style attribute's declarations, in order, as written: `(name, value)`. Values
+/// keep `!important`. (A `;` inside a quoted string or `url(...)` would split it: rare in
+/// inline styles.)
+fn parse_style(text: &str) -> Vec<(String, String)> {
+    text.split(';')
+        .filter_map(|d| d.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .filter(|(n, v)| !n.is_empty() && !v.is_empty())
+        .collect()
+}
+
+/// Declarations back as `cssText` writes them: `color: red; width: 10px;`.
+fn write_style(declarations: &[(String, String)]) -> String {
+    declarations.iter().map(|(n, v)| format!("{n}: {v};")).collect::<Vec<_>>().join(" ")
+}
+
+/// `getPropertyValue`: the value without `!important`, or empty.
+fn style_value(declarations: &[(String, String)], name: &str) -> String {
+    let value = declarations.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.as_str()).unwrap_or_default();
+    value.trim_end_matches("!important").trim_end().to_string()
+}
+
+/// Set (or, with an empty value, remove) one declaration, keeping its place.
+fn set_style(declarations: &mut Vec<(String, String)>, name: &str, value: &str) {
+    match (declarations.iter().position(|(n, _)| n == name), value.trim().is_empty()) {
+        (Some(i), false) => declarations[i].1 = value.trim().to_string(),
+        (None, false) => declarations.push((name.to_string(), value.trim().to_string())),
+        (_, true) => declarations.retain(|(n, _)| n != name),
     }
 }
 

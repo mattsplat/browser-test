@@ -183,6 +183,8 @@ pub struct RunningPack {
     fires: RefCell<HashMap<usize, u64>>,
     /// The window size last seen, to notice a resize.
     window_size: Cell<(u32, u32)>,
+    /// The field that has the focus and its value then, for `change` when it loses it.
+    focused_value: RefCell<Option<(NodeId, Option<String>)>>,
 }
 
 /// What a page's pack holds, as the Inspector's Handles view shows it.
@@ -371,18 +373,98 @@ impl RunningPack {
         true
     }
 
-    /// Dispatch the events the page's own code queued for `window` (`hashchange` after it set
-    /// `location.hash`). Returns whether there were any.
+    /// Dispatch the events the page's own code queued (`hashchange` on `window` after it set
+    /// `location.hash`, `focus` after `element.focus()`). Returns whether there were any.
     fn run_queued_events(&self) -> bool {
         if self.idle() {
             return false;
         }
         let queued = std::mem::take(&mut self.objects.borrow_mut().queued_events);
-        let root = [self.doc.borrow().root_node().id];
-        for (kind, details) in &queued {
-            self.dispatch(&root, kind, details.clone());
+        for (node, kind, details) in &queued {
+            // A node removed meanwhile gets nothing.
+            if self.doc.borrow().get_node(*node).is_none() {
+                continue;
+            }
+            let chain = self.doc.borrow().node_chain(*node);
+            self.deliver(&chain, kind, details.clone(), None, false);
         }
         !queued.is_empty()
+    }
+
+    /// Dispatch an event and the form events that go with it (`form_events`; `change` goes
+    /// before the `blur` that causes it, as in browsers). Returns whether Blitz's default
+    /// action is cancelled.
+    fn deliver(&self, chain: &[NodeId], kind: &str, details: EventDetails, key: Option<&str>, cancelled: bool) -> bool {
+        if kind == "blur" {
+            self.form_events(chain, kind, key, cancelled);
+            return self.dispatch(chain, kind, details);
+        }
+        let prevented = self.dispatch(chain, kind, details);
+        self.form_events(chain, kind, key, cancelled || prevented) || prevented
+    }
+
+    /// The events browsers fire around the ones Blitz reports, for forms: `change` when a
+    /// text field loses focus with a new value, or a checkbox or radio is toggled; `submit`
+    /// on the form before a submit button's click or Enter in a text field submits it.
+    /// Returns whether the page cancelled the submission (`preventDefault` on `submit`), so
+    /// the caller can cancel Blitz's default action. `cancelled`: that action was already
+    /// cancelled. Each event is dispatched (and recorded) like any other, so a replay gets
+    /// them as steps.
+    fn form_events(&self, chain: &[NodeId], kind: &str, key: Option<&str>, cancelled: bool) -> bool {
+        let Some(&target) = chain.first() else { return false };
+        let field = |id: NodeId| self.doc.borrow().get_node(id).and_then(|n| n.element_data()).map(host::field_value);
+        match kind {
+            "focus" => {
+                *self.focused_value.borrow_mut() = Some((target, field(target)));
+                false
+            }
+            "blur" => {
+                let focused = self.focused_value.borrow_mut().take();
+                if let Some((node, value)) = focused.filter(|(node, _)| *node == target) {
+                    let text_field = self.doc.borrow().get_node(node).and_then(|n| n.element_data()).is_some_and(|el| el.text_input_data().is_some());
+                    if text_field && value != field(node) {
+                        self.dispatch(chain, "change", EventDetails::default());
+                    }
+                }
+                false
+            }
+            "input" => {
+                let toggle = self.doc.borrow().get_node(target).and_then(|n| n.element_data()).is_some_and(|el| el.checkbox_input_checked().is_some());
+                if toggle {
+                    self.dispatch(chain, "change", EventDetails::default());
+                }
+                false
+            }
+            "click" | "keydown" if !cancelled => {
+                let Some(form) = self.submitted_form(chain, kind, key) else { return false };
+                let form_chain = self.doc.borrow().node_chain(form);
+                self.dispatch(&form_chain, "submit", EventDetails::default())
+            }
+            _ => false,
+        }
+    }
+
+    /// The form a click or key on `chain` would submit: a click on an enabled submit button,
+    /// or Enter in a one-line text field, inside a form (or naming one with `form=`).
+    fn submitted_form(&self, chain: &[NodeId], kind: &str, key: Option<&str>) -> Option<NodeId> {
+        let doc = self.doc.borrow();
+        let element = |id: &NodeId| doc.get_node(*id).and_then(|n| n.element_data());
+        let control = match kind {
+            "click" => chain.iter().copied().find(|id| element(id).is_some_and(|el| matches!(el.name.local.as_ref(), "button" | "input")))?,
+            _ => *chain.first()?,
+        };
+        let el = element(&control)?;
+        let submits = match kind {
+            "click" => el.is_submit_button() || el.attr(blitz_dom::LocalName::from("type")) == Some("submit"),
+            _ => key == Some("Enter") && el.text_input_data().is_some_and(|t| !t.is_multiline),
+        };
+        if !submits || el.attr(blitz_dom::LocalName::from("disabled")).is_some() {
+            return None;
+        }
+        if let Some(form_id) = el.attr(blitz_dom::LocalName::from("form")) {
+            return doc.get_element_by_id(form_id).filter(|f| element(f).is_some_and(|el| &*el.name.local == "form"));
+        }
+        doc.node_chain(control).into_iter().find(|id| element(id).is_some_and(|el| &*el.name.local == "form"))
     }
 
     /// Settle the promises of fetches that finished (each one a recorded step), so their
@@ -600,6 +682,7 @@ impl Startup {
             timer_thread: Default::default(),
             fires: Default::default(),
             window_size: Cell::new(window_size),
+            focused_value: Default::default(),
         };
         PackDocument { pack: Rc::new(pack) }
     }
@@ -812,7 +895,11 @@ struct PackEventHandler<'a> {
 
 impl EventHandler for PackEventHandler<'_> {
     fn handle_event(&mut self, chain: &[NodeId], event: &mut DomEvent, _doc: &mut dyn Document, state: &mut EventState) {
-        if self.pack.dispatch(chain, event.data.name(), event_details(&event.data)) {
+        let key = match &event.data {
+            DomEventData::KeyDown(k) => Some(k.key.to_string()),
+            _ => None,
+        };
+        if self.pack.deliver(chain, event.data.name(), event_details(&event.data), key.as_deref(), state.is_cancelled()) {
             state.prevent_default();
         }
     }
@@ -830,7 +917,11 @@ mod tests {
     }
 
     /// Compile a Dart file with the dev-mode compiler (cached, so only the first run is slow).
+    /// One at a time: the fixtures share a Dart project folder, which concurrent first-time
+    /// compiles would race on.
     async fn compile(path: &str) -> Vec<u8> {
+        static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _turn = ONE_AT_A_TIME.lock().await;
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path).canonicalize().unwrap();
         let url = blitz_traits::net::Url::from_file_path(&src).unwrap();
         let gate = std::sync::Arc::new(crate::gate::Gate::new(std::sync::Arc::new(blitz_net::Provider::new(None))));
@@ -1328,6 +1419,158 @@ mod tests {
             }
             assert!(full.iter().any(|e| e.result.contains("S3CRET-STORE") || e.args.contains("S3CRET-STORE")), "{pack}: the user's own trace keeps it");
         }
+    }
+
+    // ---- Cross-pack: DOM breadth and form events (`tests/fixtures/dom.*`).
+
+    const DOM_HTML: &str = include_str!("../tests/fixtures/dom.html");
+
+    /// Navigations a document asks for (a form submission), kept.
+    #[derive(Default)]
+    struct Navigations(Mutex<Vec<String>>);
+
+    impl blitz_traits::navigation::NavigationProvider for Navigations {
+        fn navigate_to(&self, options: blitz_traits::navigation::NavigationOptions) {
+            self.0.lock().unwrap().push(options.url.to_string());
+        }
+    }
+
+    /// Deliver `data` to the element `selector` matches the way the browser does: through
+    /// Blitz's event driver, so its default actions (typing, toggling, submitting) happen.
+    fn drive(page: &PackDocument, selector: &str, data: DomEventData) {
+        let node = page.pack.doc.borrow().query_selector(selector).unwrap().unwrap();
+        let mut doc = page.pack.doc.clone();
+        let mut driver = EventDriver::new(&mut doc, PackEventHandler { pack: &page.pack });
+        driver.handle_dom_event(DomEvent::new(node, data));
+        page.pack.run_queued_events();
+    }
+
+    fn key(key: Key, text: Option<&str>) -> DomEventData {
+        DomEventData::KeyDown(BlitzKeyEvent {
+            key,
+            code: Code::KeyX,
+            modifiers: Modifiers::empty(),
+            location: Location::Standard,
+            is_auto_repeating: false,
+            is_composing: false,
+            state: KeyState::Pressed,
+            text: text.map(Into::into),
+        })
+    }
+
+    /// What the DOM page prints, in every pack.
+    const DOM_OUTPUT: &[&str] = &[
+        "query:2,p1,p2,null,one+two,null",
+        "tree:3,SPAN,root,p2,p2,three,3,BODY",
+        "mutate:p1+EM+p3,p2,0,one,true,false",
+        "class:false,true,true,false,2,c d",
+        "data:7,x",
+        "style:color: red; background-color: blue; margin-top: 4px;,red,red,,10px,width: 10px;",
+        r#"html:2,<b class="x">bold &amp; <i>it</i></b><script>document.getElementById("out").textContent = "RAN"</script>,<b class="x">bold &amp; <i>it</i></b>"#,
+        "form:init,typed,init,true,true,false,false",
+        "secret:12,true",
+        "focus",
+        "input:typedx",
+        "submit",
+        "toggle:false",
+        "change:typedx",
+        "blur",
+        "submit",
+        "rect:10,20,30,40,40,60",
+    ];
+
+    /// One page using the DOM's breadth (queries, the tree, classList, dataset, style,
+    /// innerHTML, form fields) and form events (focus, input, change, blur, a cancelled
+    /// submit), driven through Blitz's own event handling, the same in every pack. A replay
+    /// ends with the same DOM; a password the page reads never reaches the AI's views.
+    #[tokio::test]
+    async fn the_dom_and_form_events_behave_the_same_in_dart_js_and_python() {
+        let wasm = compile("tests/fixtures/dom.dart").await;
+        for pack in ["dart", "js", "python"] {
+            let url = format!("https://dom-{pack}.test/page.html");
+            replay::arm(&url);
+            let navigations = Arc::new(Navigations::default());
+            let viewport = blitz_traits::shell::Viewport::new(800, 600, 1.0, blitz_traits::shell::ColorScheme::Light);
+            let config = DocumentConfig { base_url: Some(url.clone()), viewport: Some(viewport), navigation_provider: Some(navigations.clone()), ..Default::default() };
+            let doc = HtmlDocument::from_html(DOM_HTML, config).into_inner();
+            let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+            let (page, program) = match pack {
+                "dart" => (crate::dart_pack::start(doc, Default::default(), &wasm).unwrap(), replay::Program::Dart(wasm.clone())),
+                "python" => {
+                    let scripts = script("dom.py", include_str!("../tests/fixtures/dom.py"));
+                    (crate::python_pack::start(doc, Default::default(), &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+                }
+                _ => {
+                    let scripts = script("dom.js", include_str!("../tests/fixtures/dom.js"));
+                    let page = crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                    (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
+                }
+            };
+            page.attach_recording(DOM_HTML, None, program);
+            // name.focus() queued `focus`; then the user types, presses Enter (submitting,
+            // cancelled), ticks the checkbox (the field loses focus), clicks Send (cancelled
+            // again), and clicks the box once it's laid out.
+            page.pack.run_queued_events();
+            drive(&page, "#name", key(Key::Character("x".into()), Some("x")));
+            drive(&page, "#name", key(Key::Named(keyboard_types::NamedKey::Enter), None));
+            drive(&page, "#agree", click_at(0.0, 0.0, false));
+            drive(&page, "#send", click_at(0.0, 0.0, false));
+            page.pack.doc.borrow_mut().resolve(0.0);
+            drive(&page, "#box", click_at(0.0, 0.0, false));
+            assert_eq!(output(&page).split('|').collect::<Vec<_>>(), DOM_OUTPUT, "{pack}: {:?}", errors_on(&url));
+            assert!(navigations.0.lock().unwrap().is_empty(), "{pack}: the cancelled submits didn't navigate");
+
+            let recording = page.pack.stop_recording().unwrap();
+            assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Field), "{pack}: field values are on the tape");
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            assert_eq!(outcome.diverged, None, "{pack}");
+            assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
+
+            let origin = format!("https://dom-{pack}.test");
+            let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+            let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
+            assert!(redacted.iter().any(|e| e.call == "Element.value") && redacted.iter().any(|e| e.call == "Element.innerHTML"), "{pack}");
+            let texts = redacted.iter().flat_map(|e| [e.call.clone(), e.args.clone(), e.result.clone()]).chain(console.iter().flat_map(|c| [c.context.clone(), c.text.clone()]));
+            for text in texts {
+                assert!(!text.contains("S3CRET-FIELD"), "{pack}: the password reached the AI's view in {text:?}");
+            }
+            let full = debug::trace(&origin, debug::Privacy::Full, usize::MAX);
+            assert!(full.iter().any(|e| e.result.contains("S3CRET-FIELD")), "{pack}: the user's own trace keeps it");
+        }
+    }
+
+    /// The DOM refuses to make the tree a loop; nodes dropped by `innerHTML` leave stale
+    /// handles that fail (and their listeners go); a submit nobody cancels submits; and
+    /// NodeLists the pack drops are freed.
+    #[test]
+    fn dom_edge_cases() {
+        let navigations = Arc::new(Navigations::default());
+        let config = DocumentConfig { base_url: Some("https://edge.test/".into()), navigation_provider: Some(navigations.clone()), ..Default::default() };
+        let html = "<div id=root><p id=p>x</p></div><form action=done><button id=go>go</button></form><p id=out></p>";
+        let doc = HtmlDocument::from_html(html, config).into_inner();
+        let script = r#"
+            const r = [];
+            const root = document.getElementById('root');
+            const p = document.getElementById('p');
+            p.addEventListener('click', () => {});
+            try { p.appendChild(root); } catch (e) { r.push(e.message.split(':')[0]); }
+            try { root.removeChild(document.body); } catch (e) { r.push(e.message.split(':')[0]); }
+            root.innerHTML = '<i>new</i>';
+            try { p.id; } catch (e) { r.push(e.message); }
+            for (let i = 0; i < 200; i++) document.querySelectorAll('p');
+            document.getElementById('out').textContent = r.join('|');
+        "#;
+        let scripts = [Script { name: "edge.js".into(), source: script.into(), module: false }];
+        let page = futures_lite_block_on(crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        assert_eq!(output(&page), "HierarchyRequestError|NotFoundError|this object is no longer available");
+        assert!(page.pack.objects.borrow().listeners.values().all(|ids| ids.is_empty()), "the dropped node's listener went");
+        drive(&page, "#go", click_at(0.0, 0.0, false));
+        assert_eq!(*navigations.0.lock().unwrap(), ["https://edge.test/done?"], "an uncancelled submit submits");
+
+        // Python frees each NodeList as its wrapper goes.
+        let page = python_page("<p></p><p></p>", &["for i in range(200):\n    document.querySelectorAll('p').length"]);
+        assert!(page.pack.objects.borrow().live_of("NodeList") <= 1);
     }
 
     /// Storage over the limit throws, as `QuotaExceededError`; a page with no origin has no

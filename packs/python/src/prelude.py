@@ -17,6 +17,9 @@ METHODS = {
     'fetch', 'then', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
     'scrollTo', 'scroll', 'scrollBy',
+    'getElementById', 'querySelectorAll', 'createTextNode', 'item', 'insertBefore', 'replaceChild',
+    'removeChild', 'cloneNode', 'hasAttribute', 'contains', 'getBoundingClientRect', 'focus', 'blur',
+    'add', 'toggle', 'setProperty', 'getPropertyValue', 'removeProperty',
 }
 # Storage's methods. Kept apart because `key` is also a property (of keyboard events).
 STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}
@@ -32,7 +35,7 @@ next_callback = 0
 
 def encode(v):
     """A value as it crosses to the host: None → null, host object → {o: h}, function → {cb: id},
-    a dict (a fetch init, a history state) → {obj: {...}}."""
+    a dict (a fetch init, a history state) → {obj: {...}}, a list or tuple → {arr: [...]}."""
     global next_callback
     if isinstance(v, HostObject):
         return {'o': v._handle}
@@ -40,6 +43,8 @@ def encode(v):
         return {'o': v._host._handle}
     if isinstance(v, dict):
         return {'obj': {str(k): encode(x) for k, x in v.items()}}
+    if isinstance(v, (list, tuple)):
+        return {'arr': [encode(x) for x in v]}
     if v is None or isinstance(v, (bool, int, float, str)):
         return v
     if callable(v):
@@ -116,6 +121,28 @@ class HostObject:
     def __setattr__(self, name, value):
         h = self._handle
         request({'op': 'set', 'target': h, 'name': name, 'value': encode(value)})
+
+    # Lists (a NodeList, an array of data) have a length and items; a DOMStringMap (`dataset`)
+    # has items by name.
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, key):
+        value = request({'op': 'get', 'target': self._handle, 'name': str(key)})
+        if value is None and isinstance(key, int) and not 0 <= key < len(self):
+            raise IndexError(key)
+        return value
+
+    def __setitem__(self, key, value):
+        request({'op': 'set', 'target': self._handle, 'name': str(key), 'value': encode(value)})
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    # A host object is always true, whether or not it has a length.
+    def __bool__(self):
+        return True
 
     # Wrappers aren't cached (so none outlive their use); the same object compares equal.
     def __eq__(self, other):

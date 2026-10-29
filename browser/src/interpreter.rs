@@ -294,8 +294,9 @@ fn dispatch(host: &mut dyn Host, request: &Value) -> Result<Value> {
 }
 
 /// JSON → host value. Undefined, host objects, callbacks and plain objects use small tagged
-/// objects: `{"u": 1}`, `{"o": handle}`, `{"cb": id}`, `{"obj": {name: value, ...}}` (a plain
-/// object the page built, which becomes a host object).
+/// objects: `{"u": 1}`, `{"o": handle}`, `{"cb": id}`, `{"obj": {name: value, ...}}` and
+/// `{"arr": [...]}` (a plain object or array of data the page built, which becomes a host
+/// object).
 fn decode(host: &mut dyn Host, v: &Value) -> Result<HostValue> {
     Ok(match v {
         Value::Null => HostValue::Null,
@@ -308,6 +309,10 @@ fn decode(host: &mut dyn Host, v: &Value) -> Result<HostValue> {
         Value::Object(o) if o.contains_key("obj") => {
             let fields = o["obj"].as_object().context("bad object")?.iter().map(|(k, v)| Ok((k.clone(), decode(host, v)?))).collect::<Result<Vec<_>>>()?;
             host.object(fields)?
+        }
+        Value::Object(o) if o.contains_key("arr") => {
+            let items = o["arr"].as_array().context("bad array")?.iter().map(|v| decode(host, v)).collect::<Result<Vec<_>>>()?;
+            host.array(items)?
         }
         other => bail!("the value {other} cannot be passed to the host yet"),
     })
