@@ -4,8 +4,8 @@
 //! page can reach goes through one import, `host.request`, which takes a JSON request and
 //! returns a JSON reply (see prelude.js for the shapes).
 //!
-//! Exports: `js_alloc`/`js_free` (memory for strings), `js_run` (run a page script) and
-//! `js_fire` (call a listener). `js_run` and `js_fire` return 0 on success, or a packed
+//! Exports: `js_alloc`/`js_free` (memory for strings), `js_run` (run a page script),
+//! `js_fire` (call a listener or timer) and `js_release` (forget one). `js_run` and `js_fire` return 0 on success, or a packed
 //! (ptr << 32 | len) error message the host must `js_free`.
 
 use std::cell::RefCell;
@@ -98,6 +98,14 @@ pub unsafe extern "C" fn js_fire(id: u32, args_ptr: *const u8, args_len: u32) ->
         let _ = ctx.run_jobs();
         result.map_err(|e| format!("Uncaught {e}"))
     })
+}
+
+/// Forget callback `id`: the host no longer refers to it.
+#[unsafe(no_mangle)]
+pub extern "C" fn js_release(id: u32) {
+    let _ = with_context(|ctx| {
+        ctx.eval(Source::from_bytes(format!("__release({id})").as_bytes())).map(drop).map_err(|e| e.to_string())
+    });
 }
 
 /// `s` as a JS string literal.

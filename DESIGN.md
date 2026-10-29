@@ -204,6 +204,22 @@ marked **Decision needed**.
 ### Order
 
 **Phase A: reliability and compatibility (now)**
+
+Done so far (`page_document.rs` cross-pack test `events_and_timers_behave_the_same_in_dart_and_js`
+runs the same page in Dart and JS and expects identical output):
+- Timers (`setTimeout`, `setInterval` (clamped to ≥ 4 ms), `clearTimeout`/`clearInterval`,
+  `requestAnimationFrame`/`cancelAnimationFrame`) live in the host; the page document runs due
+  timers on `poll` and wakes the event loop at the next deadline.
+- Listener identity: a function has one callback id for its lifetime, so `removeEventListener`
+  works (Dart's `StreamSubscription.cancel` too); duplicate `addEventListener` is ignored.
+- Event objects carry mouse (`clientX`/`Y`, `pageX`/`Y`, `screenX`/`Y`, `button`, `buttons`)
+  and keyboard (`key`, `code`, `repeat`) details plus modifier keys, `currentTarget` and
+  `defaultPrevented`; `preventDefault` cancels Blitz's default action; `stopPropagation`
+  and `stopImmediatePropagation` work.
+- Leak fixed: one event object per dispatch, released when it ends; handles are never reused
+  (a stale one errors instead of aliasing); callbacks nothing refers to are released in the
+  pack; the JS prelude holds wrappers weakly.
+- `window` and `console` (log/info/warn/error/debug) globals; `Date.now` from the host.
 - Timers: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` (plus
   `requestAnimationFrame`), host-owned so time comes from the host (principle 4).
 - `removeEventListener` with correct listener identity and cleanup.

@@ -70,3 +70,4 @@ directories = "6.0.0"
 # Step 6: third-party checks use registrable domains
 psl = "2"
 url = "2"
+keyboard-types = "0.8"

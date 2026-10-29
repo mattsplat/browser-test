@@ -29,10 +29,8 @@ pub enum HostValue {
     Undefined,
     /// JavaScript `null`: a null reference.
     Null,
-    /// A Dart closure wrapped so the host can call it later: (trampoline, closure).
-    /// The host never sees this: it is swapped for a `CallbackId` before reaching the `Host`.
-    Callback(Func, OwnedRooted<AnyRef>),
-    /// A callback as the host sees it; fire it with `DartRuntime::fire_callback`.
+    /// A function the page handed over (a listener, a timer task); fire it with the pack's
+    /// `fire_callback`. The same function always has the same id, so it can be removed.
     CallbackId(usize),
     /// A Dart object passed out by reference. The host can hold it and hand it back,
     /// but not look inside, just as a JS engine treats it.
@@ -53,7 +51,6 @@ impl HostValue {
             HostValue::Bool(b) => b.to_string(),
             HostValue::Undefined => "undefined".into(),
             HostValue::Null => "null".into(),
-            HostValue::Callback(..) => "function".into(),
             HostValue::CallbackId(id) => format!("function#{id}"),
             HostValue::Opaque(_) => "[dart object]".into(),
             HostValue::Object(h) => format!("#{h}"),
@@ -108,6 +105,17 @@ pub trait Host {
     fn call(&mut self, target: &HostValue, method: &str, args: &[HostValue]) -> Result<HostValue>;
     /// Dart's `print`.
     fn console(&mut self, text: &str);
+    /// The current time in milliseconds since the Unix epoch (`Date.now()`).
+    fn now(&mut self) -> f64;
+}
+
+/// Something the page asked the host to call later.
+#[derive(Clone)]
+enum Callback {
+    /// A Dart function wrapped with `.toJS`: its trampoline and closure.
+    Function(Func, OwnedRooted<AnyRef>),
+    /// A task dart2wasm scheduled (a timer); run with `$invokeCallback`.
+    Task(HostValue),
 }
 
 /// A loaded Dart program.
@@ -118,8 +126,8 @@ pub struct DartRuntime {
 
 struct State {
     host: Box<dyn Host>,
-    /// Callbacks the page registered, by id, so the host can fire them later.
-    callbacks: Vec<HostValue>,
+    /// Callbacks by id. A released slot is `None`; ids are never reused.
+    callbacks: Vec<Option<Callback>>,
     /// Work Dart queued with `queueMicrotask`; run after every entry into Dart.
     microtasks: std::collections::VecDeque<HostValue>,
     /// From the `dart2wasm-sourcemap` section, when the build embedded one.
@@ -197,8 +205,10 @@ impl DartRuntime {
 
     /// Invoke a callback the page registered, e.g. an event listener, with `args`.
     pub fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
-        let Some(HostValue::Callback(func, closure)) = self.store.data().callbacks.get(id).cloned() else {
-            bail!("no callback {id}");
+        let (func, closure) = match self.store.data().callbacks.get(id).cloned().flatten() {
+            Some(Callback::Function(func, closure)) => (func, closure),
+            Some(Callback::Task(task)) => return self.run_task(task),
+            None => bail!("callback {id} was released"),
         };
         // The trampoline is `wasmFunction(f, arguments.length, x0, ...)`: closure, argument
         // count, then the arguments, converted to whatever types the trampoline declares.
@@ -217,6 +227,28 @@ impl DartRuntime {
         self.run_microtasks()
     }
 
+    /// Forget a callback the host no longer needs (a fired timeout, a removed listener).
+    pub fn release_callback(&mut self, id: usize) {
+        if let Some(slot) = self.store.data_mut().callbacks.get_mut(id) {
+            *slot = None;
+        }
+    }
+
+    /// Run one task dart2wasm scheduled (a timer firing), then its microtasks.
+    fn run_task(&mut self, task: HostValue) -> Result<()> {
+        let invoke = self
+            .instance
+            .get_func(&mut self.store, "$invokeCallback")
+            .context("no $invokeCallback export")?;
+        let pty = invoke.ty(&self.store).params().next().context("$invokeCallback takes no arguments")?;
+        let arg = from_host(&mut self.store, task, &pty)?;
+        // Some programs' $invokeCallback returns a value; give it somewhere to go.
+        let mut out = result_slots(&self.store, &invoke);
+        let ran = invoke.call(&mut self.store, &[arg], &mut out);
+        ran.map_err(|e| self.explain(e))?;
+        self.run_microtasks()
+    }
+
     /// Run everything Dart queued with `queueMicrotask`, including work queued meanwhile.
     fn run_microtasks(&mut self) -> Result<()> {
         let invoke = self
@@ -226,7 +258,8 @@ impl DartRuntime {
         let pty = invoke.ty(&self.store).params().next().context("$invokeCallback takes no arguments")?;
         while let Some(task) = self.store.data_mut().microtasks.pop_front() {
             let arg = from_host(&mut self.store, task, &pty)?;
-            let ran = invoke.call(&mut self.store, &[arg], &mut []);
+            let mut out = result_slots(&self.store, &invoke);
+            let ran = invoke.call(&mut self.store, &[arg], &mut out);
             ran.map_err(|e| self.explain(e))?;
         }
         Ok(())
@@ -259,6 +292,11 @@ impl DartRuntime {
         };
         anyhow!("{headline}\n{}", stack.unwrap_or_default())
     }
+}
+
+/// Placeholder result values for calling `func`, one per declared result.
+fn result_slots(store: &Store<State>, func: &Func) -> Vec<Val> {
+    func.ty(store).results().map(|_| Val::null_extern_ref()).collect()
 }
 
 /// Collect host strings inside a Dart value: the strings an error object holds.
@@ -348,7 +386,26 @@ enum Helper {
     JsonStringify,
     Identity,
     WrapCallback,
+    /// `o => typeof o === 'function' && o[jsWrappedDartFunctionSymbol] === true`
+    IsDartFunction,
+    /// `f => f.dartFunction`
+    DartFunction,
     ClassifyNumber,
+    /// `0` null/undefined, `1` boolean, `2` other.
+    ClassifyBool,
+    /// `0` null/undefined, `1` string, `2` other.
+    ClassifyString,
+    /// dart2wasm's type switch: 1 undefined, 2 boolean, 3 number, 4 string, 19 other object.
+    TypeCode,
+    /// `(o, i) => o[i]`
+    Index,
+    /// `(string, times) => string.repeat(times)`
+    Repeat,
+    DateNow,
+    /// `(ms, c) => setTimeout(...)` / `setInterval(...)`: run task `c` later.
+    SetTimer { repeat: bool },
+    /// `clearTimeout(handle)` / `clearInterval(handle)`
+    ClearTimer,
     Unsupported(String),
 }
 
@@ -383,6 +440,18 @@ fn classify(body: &str) -> Helper {
         "o => String(o)" => Helper::ToStr,
         "s => JSON.stringify(s)" => Helper::JsonStringify,
         "o => o" => Helper::Identity,
+        "o => o.length" => Helper::Get("length".into()),
+        "(o, i) => o[i]" => Helper::Index,
+        "(string, times) => string.repeat(times)" => Helper::Repeat,
+        "() => Date.now()" => Helper::DateNow,
+        "f => f.dartFunction" => Helper::DartFunction,
+        "(handle) => clearTimeout(handle)" | "(handle) => clearInterval(handle)" => Helper::ClearTimer,
+        _ if b.starts_with("(ms, c) =>") && b.contains("setTimeout(") => Helper::SetTimer { repeat: false },
+        _ if b.starts_with("(ms, c) =>") && b.contains("setInterval(") => Helper::SetTimer { repeat: true },
+        _ if b.contains("o[jsWrappedDartFunctionSymbol] === true") => Helper::IsDartFunction,
+        _ if b.contains("ArrayBuffer.isView(o)") && b.contains("return 19") => Helper::TypeCode,
+        _ if b.contains("typeof o === 'boolean'") && b.contains("return 2") => Helper::ClassifyBool,
+        _ if b.contains("typeof(o) === 'string'") && b.contains("return 2") => Helper::ClassifyString,
         _ if b.starts_with("(exn) =>") && b.contains("frames.slice(drop)") => Helper::TrimStack,
         _ if b.starts_with("(exn) =>") => Helper::ExnStack,
         _ if b.starts_with("(wasmFunction,f) => finalizeWrapper") => Helper::WrapCallback,
@@ -590,28 +659,80 @@ fn js_string(name: &str, caller: &mut Caller<'_, State>, params: &[Val], results
     set_result(caller, results, ty, value)
 }
 
-/// Convert arguments for the host. Callbacks are kept here and handed over as ids.
+/// Convert arguments for the host.
 fn host_args(caller: &mut Caller<'_, State>, params: &[Val]) -> Result<Vec<HostValue>> {
-    let mut args = Vec::new();
-    for p in params {
-        args.push(match to_host(caller, p)? {
-            cb @ HostValue::Callback(..) => {
-                caller.data_mut().callbacks.push(cb);
-                HostValue::CallbackId(caller.data().callbacks.len() - 1)
-            }
-            other => other,
-        });
-    }
-    Ok(args)
+    params.iter().map(|p| to_host(caller, p)).collect()
+}
+
+fn add_callback(caller: &mut Caller<'_, State>, callback: Callback) -> usize {
+    caller.data_mut().callbacks.push(Some(callback));
+    caller.data().callbacks.len() - 1
 }
 
 fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], results: &mut [Val], ty: &FuncType) -> Result<()> {
     let value = match h {
         Helper::Global(name) => caller.data_mut().host.global(name)?,
-        Helper::Get(prop) => {
-            let target = to_host(caller, &params[0])?;
-            caller.data_mut().host.get(&target, prop)?
+        Helper::Get(prop) => match (to_host(caller, &params[0])?, prop.as_str()) {
+            // Strings are values, not host objects.
+            (HostValue::Str(s), "length") => HostValue::Num(s.len() as f64),
+            (target, _) => caller.data_mut().host.get(&target, prop)?,
+        },
+        Helper::Index => {
+            let (target, index) = (to_host(caller, &params[0])?, to_host(caller, &params[1])?);
+            match target {
+                HostValue::Str(s) => match index.as_num().and_then(|i| s.get(i as usize)) {
+                    Some(unit) => HostValue::Str(vec![*unit]),
+                    None => HostValue::Undefined,
+                },
+                other => caller.data_mut().host.get(&other, &index.display())?,
+            }
         }
+        Helper::Repeat => {
+            let s = to_host(caller, &params[0])?.display();
+            let times = to_host(caller, &params[1])?.as_num().unwrap_or(0.0).max(0.0) as usize;
+            HostValue::str(&s.repeat(times))
+        }
+        Helper::DateNow => HostValue::Num(caller.data_mut().host.now()),
+        Helper::SetTimer { repeat } => {
+            let ms = to_host(caller, &params[0])?;
+            let task = to_host(caller, &params[1])?;
+            let id = add_callback(caller, Callback::Task(task));
+            let host = &mut caller.data_mut().host;
+            let window = host.global("window")?;
+            let method = if *repeat { "setInterval" } else { "setTimeout" };
+            host.call(&window, method, &[HostValue::CallbackId(id), ms])?
+        }
+        Helper::ClearTimer => {
+            let handle = to_host(caller, &params[0])?;
+            let host = &mut caller.data_mut().host;
+            let window = host.global("window")?;
+            host.call(&window, "clearTimeout", &[handle])?
+        }
+        Helper::IsDartFunction => HostValue::Bool(matches!(to_host(caller, &params[0])?, HostValue::CallbackId(_))),
+        Helper::DartFunction => match to_host(caller, &params[0])? {
+            HostValue::CallbackId(id) => match caller.data().callbacks.get(id).cloned().flatten() {
+                Some(Callback::Function(_, closure)) => HostValue::Opaque(closure),
+                _ => bail!("callback {id} is not a Dart function"),
+            },
+            other => bail!("{} is not a Dart function", other.display()),
+        },
+        Helper::ClassifyBool => HostValue::Num(match to_host(caller, &params[0])? {
+            HostValue::Undefined | HostValue::Null => 0.0,
+            HostValue::Bool(_) => 1.0,
+            _ => 2.0,
+        }),
+        Helper::ClassifyString => HostValue::Num(match to_host(caller, &params[0])? {
+            HostValue::Undefined | HostValue::Null => 0.0,
+            HostValue::Str(_) => 1.0,
+            _ => 2.0,
+        }),
+        Helper::TypeCode => HostValue::Num(match to_host(caller, &params[0])? {
+            HostValue::Undefined => 1.0,
+            HostValue::Bool(_) => 2.0,
+            HostValue::Num(_) => 3.0,
+            HostValue::Str(_) => 4.0,
+            _ => 19.0,
+        }),
         Helper::Set(prop) => {
             let args = host_args(caller, params)?;
             caller.data_mut().host.set(&args[0], prop, &args[1])?;
@@ -683,7 +804,7 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
                 HostValue::Opaque(r) => r,
                 other => bail!("callback closure is {other:?}"),
             };
-            HostValue::Callback(func, closure)
+            HostValue::CallbackId(add_callback(caller, Callback::Function(func, closure)))
         }
         Helper::Unsupported(body) => bail!("unsupported dart2wasm import: {body}"),
     };

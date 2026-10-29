@@ -1,57 +1,132 @@
 //! The host dispatcher: the only way a language pack reaches the page. Packs see web
-//! platform objects (`document`, elements, events, `Math`) as small integer handles; the real
-//! nodes stay here. Every call is recorded in the trace (the boundary tracer), with its
-//! arguments, result and timing.
+//! platform objects (`window`, `document`, elements, events, `Math`, `console`) as small
+//! integer handles; the real nodes stay here. Every call is recorded in the trace (the
+//! boundary tracer), with its arguments, result and timing.
+//!
+//! Lifetimes: element handles last as long as the page; event objects are released when
+//! their dispatch ends; handles are never reused, so a stale one fails instead of aliasing.
+//! Timers live here too, so time comes from the host (principle 4) and every pack shares them.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use blitz_dom::{BaseDocument, LocalName, NodeId, QualName, ns};
 
 use crate::dart_pack::{Host, HostValue};
 
+/// Mouse and keyboard details of an event, as the DOM exposes them.
+#[derive(Clone, Debug, Default)]
+pub struct EventDetails {
+    pub client_x: Option<f64>,
+    pub client_y: Option<f64>,
+    pub page_x: Option<f64>,
+    pub page_y: Option<f64>,
+    pub screen_x: Option<f64>,
+    pub screen_y: Option<f64>,
+    pub button: Option<f64>,
+    pub buttons: Option<f64>,
+    pub key: Option<String>,
+    pub code: Option<String>,
+    pub repeat: Option<bool>,
+    pub alt_key: bool,
+    pub ctrl_key: bool,
+    pub shift_key: bool,
+    pub meta_key: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventObj {
+    pub kind: String,
+    pub target: NodeId,
+    pub current_target: NodeId,
+    pub details: EventDetails,
+    pub default_prevented: bool,
+    pub propagation_stopped: bool,
+    pub immediate_propagation_stopped: bool,
+}
+
 /// A web platform object a pack holds a handle to.
 #[derive(Clone, Debug)]
 pub enum Obj {
+    Window,
     Document,
     Math,
+    Console,
     Element(NodeId),
-    Event { kind: String, target: NodeId },
+    Event(EventObj),
 }
 
 impl Obj {
     fn interface(&self) -> &'static str {
         match self {
+            Obj::Window => "Window",
             Obj::Document => "Document",
             Obj::Math => "Math",
+            Obj::Console => "Console",
             Obj::Element(_) => "Element",
-            Obj::Event { .. } => "Event",
+            Obj::Event(_) => "Event",
         }
     }
 }
 
-/// Objects handed to the pack, and the event listeners it registered. Shared between the
-/// host (which the pack calls) and the document (which delivers events).
-#[derive(Default)]
+struct Timer {
+    due: Instant,
+    interval: Option<Duration>,
+    callback: usize,
+    /// requestAnimationFrame: called with a timestamp.
+    frame: bool,
+}
+
+/// A timer callback that is due, as `take_due_timers` hands it out.
+pub struct DueTimer {
+    pub callback: usize,
+    pub args: Vec<HostValue>,
+}
+
+/// Objects handed to the pack, its event listeners and its timers. Shared between the host
+/// (which the pack calls) and the document (which delivers events and runs timers).
 pub struct Objects {
-    /// objects[h - 1] is the object behind handle h. Handle 0 is never issued.
-    objects: Vec<Obj>,
+    objects: HashMap<u32, Obj>,
+    next_handle: u32,
     /// One handle per node, so the same element always compares equal.
     element_handles: HashMap<NodeId, u32>,
     singletons: HashMap<&'static str, u32>,
-    /// Callback ids registered with addEventListener, by (node, event type).
+    /// Callback ids registered with addEventListener, by (node, event type), in order.
     pub listeners: HashMap<(NodeId, String), Vec<usize>>,
+    timers: BTreeMap<u32, Timer>,
+    next_timer: u32,
+    started: Instant,
+    /// Callbacks nothing refers to any more; the document tells the pack to release them.
+    released_callbacks: Vec<usize>,
+}
+
+impl Default for Objects {
+    fn default() -> Self {
+        Self {
+            objects: HashMap::new(),
+            next_handle: 1,
+            element_handles: HashMap::new(),
+            singletons: HashMap::new(),
+            listeners: HashMap::new(),
+            timers: BTreeMap::new(),
+            next_timer: 1,
+            started: Instant::now(),
+            released_callbacks: Vec::new(),
+        }
+    }
 }
 
 impl Objects {
-    fn add(&mut self, obj: Obj) -> HostValue {
-        self.objects.push(obj);
-        HostValue::Object(self.objects.len() as u32)
+    fn add(&mut self, obj: Obj) -> u32 {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.objects.insert(handle, obj);
+        handle
     }
 
     fn element(&mut self, node: NodeId) -> HostValue {
@@ -59,32 +134,117 @@ impl Objects {
             return HostValue::Object(*h);
         }
         let handle = self.add(Obj::Element(node));
-        if let HostValue::Object(h) = handle {
-            self.element_handles.insert(node, h);
-        }
-        handle
+        self.element_handles.insert(node, handle);
+        HostValue::Object(handle)
     }
 
     fn singleton(&mut self, name: &'static str, obj: Obj) -> HostValue {
-        if let Some(h) = self.singletons.get(name) {
-            return HostValue::Object(*h);
-        }
-        let handle = self.add(obj);
-        if let HostValue::Object(h) = handle {
-            self.singletons.insert(name, h);
-        }
-        handle
+        let handle = match self.singletons.get(name) {
+            Some(h) => *h,
+            None => {
+                let h = self.add(obj);
+                self.singletons.insert(name, h);
+                h
+            }
+        };
+        HostValue::Object(handle)
     }
 
-    /// A new event object for a listener.
-    pub fn event(&mut self, kind: &str, target: NodeId) -> HostValue {
-        self.add(Obj::Event { kind: kind.to_string(), target })
+    /// A new event object for one dispatch. Release it with `release` when the dispatch ends.
+    pub fn event(&mut self, kind: &str, target: NodeId, details: EventDetails) -> u32 {
+        self.add(Obj::Event(EventObj {
+            kind: kind.to_string(),
+            target,
+            current_target: target,
+            details,
+            default_prevented: false,
+            propagation_stopped: false,
+            immediate_propagation_stopped: false,
+        }))
+    }
+
+    pub fn event_mut(&mut self, handle: u32) -> Option<&mut EventObj> {
+        match self.objects.get_mut(&handle) {
+            Some(Obj::Event(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    pub fn release(&mut self, handle: u32) {
+        self.objects.remove(&handle);
+    }
+
+    #[cfg(test)]
+    pub fn live_objects(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// A callback can be released once no listener or timer refers to it.
+    fn release_if_unused(&mut self, callback: usize) {
+        let in_listeners = self.listeners.values().any(|ids| ids.contains(&callback));
+        let in_timers = self.timers.values().any(|t| t.callback == callback);
+        if !in_listeners && !in_timers {
+            self.released_callbacks.push(callback);
+        }
+    }
+
+    pub fn take_released_callbacks(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.released_callbacks)
     }
 
     fn get(&self, value: &HostValue) -> Result<Obj> {
         match value {
-            HostValue::Object(h) => self.objects.get((*h as usize).wrapping_sub(1)).cloned().context("unknown object handle"),
+            HostValue::Object(h) => self.objects.get(h).cloned().context("this object is no longer available"),
             other => bail!("expected a web object, got {}", other.display()),
+        }
+    }
+
+    fn add_timer(&mut self, callback: usize, delay: Duration, interval: Option<Duration>, frame: bool) -> HostValue {
+        let handle = self.next_timer;
+        self.next_timer += 1;
+        self.timers.insert(handle, Timer { due: Instant::now() + delay, interval, callback, frame });
+        HostValue::Num(handle as f64)
+    }
+
+    fn clear_timer(&mut self, handle: u32) {
+        if let Some(timer) = self.timers.remove(&handle) {
+            self.release_if_unused(timer.callback);
+        }
+    }
+
+    /// When the next timer is due, if any.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.timers.values().map(|t| t.due).min()
+    }
+
+    /// Timers due at `now`, in due order. Intervals are rescheduled; the rest are removed.
+    pub fn take_due_timers(&mut self, now: Instant) -> Vec<DueTimer> {
+        let mut due: Vec<(Instant, u32)> = self.timers.iter().filter(|(_, t)| t.due <= now).map(|(h, t)| (t.due, *h)).collect();
+        due.sort();
+        let elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let mut out = Vec::new();
+        for (_, handle) in due {
+            let timer = self.timers.get_mut(&handle).unwrap();
+            let fired = DueTimer {
+                callback: timer.callback,
+                args: if timer.frame { vec![HostValue::Num(elapsed_ms)] } else { Vec::new() },
+            };
+            match timer.interval {
+                Some(every) => timer.due = now + every,
+                None => {
+                    // Released after it runs, so it must leave the table first.
+                    self.timers.remove(&handle);
+                }
+            }
+            out.push(fired);
+        }
+        out
+    }
+
+    /// One-shot timer callbacks that have just run and are referenced by nothing else.
+    pub fn after_timers_ran(&mut self, ran: &[DueTimer]) {
+        for t in ran {
+            self.release_if_unused(t.callback);
         }
     }
 }
@@ -100,7 +260,7 @@ pub struct PageHost {
 impl PageHost {
     pub fn new(pack: &'static str, doc: Rc<RefCell<BaseDocument>>, objects: Rc<RefCell<Objects>>) -> Self {
         // Randomness comes from the host so a recording can replay it (principle 4).
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
         Self { pack, doc, objects, rng: seed | 1 }
     }
 
@@ -136,18 +296,47 @@ impl PageHost {
         }
     }
 
-    /// The node a query or listener on `obj` is scoped to.
+    /// The node a query or listener on `obj` is scoped to. Window listeners sit on the root.
     fn scope(&self, obj: &Obj) -> Option<NodeId> {
         match obj {
-            Obj::Document => Some(self.doc.borrow().root_node().id),
+            Obj::Document | Obj::Window => Some(self.doc.borrow().root_node().id),
             Obj::Element(id) => Some(*id),
             _ => None,
         }
     }
 
+    fn event_prop(&mut self, e: &EventObj, prop: &str) -> Option<HostValue> {
+        let num = |v: Option<f64>| v.map(HostValue::Num).unwrap_or(HostValue::Undefined);
+        let d = &e.details;
+        Some(match prop {
+            "type" => HostValue::str(&e.kind),
+            "target" => self.objects.borrow_mut().element(e.target),
+            "currentTarget" => self.objects.borrow_mut().element(e.current_target),
+            "defaultPrevented" => HostValue::Bool(e.default_prevented),
+            "clientX" | "x" => num(d.client_x),
+            "clientY" | "y" => num(d.client_y),
+            "pageX" => num(d.page_x),
+            "pageY" => num(d.page_y),
+            "screenX" => num(d.screen_x),
+            "screenY" => num(d.screen_y),
+            "button" => num(d.button),
+            "buttons" => num(d.buttons),
+            "key" => d.key.as_deref().map(HostValue::str).unwrap_or(HostValue::Undefined),
+            "code" => d.code.as_deref().map(HostValue::str).unwrap_or(HostValue::Undefined),
+            "repeat" => d.repeat.map(HostValue::Bool).unwrap_or(HostValue::Undefined),
+            "altKey" => HostValue::Bool(d.alt_key),
+            "ctrlKey" => HostValue::Bool(d.ctrl_key),
+            "shiftKey" => HostValue::Bool(d.shift_key),
+            "metaKey" => HostValue::Bool(d.meta_key),
+            _ => return None,
+        })
+    }
+
     fn do_get(&mut self, target: &HostValue, prop: &str) -> Result<HostValue> {
         let obj = self.objects.borrow().get(target)?;
         Ok(match (&obj, prop) {
+            (Obj::Window, "document") => self.objects.borrow_mut().singleton("document", Obj::Document),
+            (Obj::Window, "console") => self.objects.borrow_mut().singleton("console", Obj::Console),
             (Obj::Document, "body") => match self.doc.borrow().query_selector("body").ok().flatten() {
                 Some(id) => self.objects.borrow_mut().element(id),
                 None => HostValue::Null,
@@ -159,8 +348,10 @@ impl PageHost {
                 HostValue::str(&el.name.local.to_ascii_uppercase())
             }
             (Obj::Element(id), "id") => HostValue::str(self.doc.borrow().get_node(*id).and_then(|n| n.attr(LocalName::from("id"))).unwrap_or("")),
-            (Obj::Event { kind, .. }, "type") => HostValue::str(kind),
-            (Obj::Event { target, .. }, "target") => self.objects.borrow_mut().element(*target),
+            (Obj::Event(e), _) => match self.event_prop(e, prop) {
+                Some(v) => v,
+                None => bail!("Event.{prop} is not supported yet"),
+            },
             _ => bail!("{}.{prop} is not supported yet", obj.interface()),
         })
     }
@@ -189,6 +380,11 @@ impl PageHost {
         let obj = self.objects.borrow().get(target)?;
         let text = |i: usize| args.get(i).map(|v| v.display()).with_context(|| format!("{method}: missing argument {i}"));
         let attr_name = |i: usize| text(i).map(|n| QualName::new(None, ns!(), LocalName::from(n.as_str())));
+        let callback = |i: usize| match args.get(i) {
+            Some(HostValue::CallbackId(id)) => Ok(*id),
+            _ => bail!("{method}: argument {i} is not a function"),
+        };
+        let millis = |i: usize| Duration::from_secs_f64(args.get(i).and_then(|v| v.as_num()).unwrap_or(0.0).max(0.0) / 1000.0);
 
         Ok(match (&obj, method) {
             (Obj::Document | Obj::Element(_), "querySelector") => {
@@ -200,12 +396,25 @@ impl PageHost {
                     None => HostValue::Null,
                 }
             }
-            (Obj::Document | Obj::Element(_), "addEventListener") => {
+            (Obj::Window | Obj::Document | Obj::Element(_), "addEventListener") => {
                 let node = self.scope(&obj).context("no scope")?;
-                let HostValue::CallbackId(callback) = args.get(1).context("addEventListener: missing listener")? else {
-                    bail!("addEventListener: listener is not a function");
-                };
-                self.objects.borrow_mut().listeners.entry((node, text(0)?)).or_default().push(*callback);
+                let (kind, id) = (text(0)?, callback(1)?);
+                let mut objects = self.objects.borrow_mut();
+                let ids = objects.listeners.entry((node, kind)).or_default();
+                // Adding the same listener twice has no effect (DOM spec).
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                HostValue::Undefined
+            }
+            (Obj::Window | Obj::Document | Obj::Element(_), "removeEventListener") => {
+                let node = self.scope(&obj).context("no scope")?;
+                let (kind, id) = (text(0)?, callback(1)?);
+                let mut objects = self.objects.borrow_mut();
+                if let Some(ids) = objects.listeners.get_mut(&(node, kind)) {
+                    ids.retain(|l| *l != id);
+                }
+                objects.release_if_unused(id);
                 HostValue::Undefined
             }
             (Obj::Document, "createElement") => {
@@ -240,6 +449,40 @@ impl PageHost {
                     None => HostValue::Null,
                 }
             }
+            (Obj::Event(_), "preventDefault" | "stopPropagation" | "stopImmediatePropagation") => {
+                let HostValue::Object(handle) = target else { bail!("not an event") };
+                let mut objects = self.objects.borrow_mut();
+                let e = objects.event_mut(*handle).context("this event is no longer available")?;
+                match method {
+                    "preventDefault" => e.default_prevented = true,
+                    "stopPropagation" => e.propagation_stopped = true,
+                    _ => {
+                        e.propagation_stopped = true;
+                        e.immediate_propagation_stopped = true;
+                    }
+                }
+                HostValue::Undefined
+            }
+            (Obj::Window, "setTimeout") => self.objects.borrow_mut().add_timer(callback(0)?, millis(1), None, false),
+            (Obj::Window, "setInterval") => {
+                // A zero interval would spin; browsers clamp nested timers to ~4 ms.
+                let every = millis(1).max(Duration::from_millis(4));
+                self.objects.borrow_mut().add_timer(callback(0)?, every, Some(every), false)
+            }
+            (Obj::Window, "requestAnimationFrame") => {
+                self.objects.borrow_mut().add_timer(callback(0)?, Duration::from_millis(16), None, true)
+            }
+            (Obj::Window, "clearTimeout" | "clearInterval" | "cancelAnimationFrame") => {
+                if let Some(handle) = args.first().and_then(|v| v.as_num()) {
+                    self.objects.borrow_mut().clear_timer(handle as u32);
+                }
+                HostValue::Undefined
+            }
+            (Obj::Console, "log" | "info" | "warn" | "error" | "debug") => {
+                let line = args.iter().map(|a| a.display()).collect::<Vec<_>>().join(" ");
+                self.console(&if method == "log" { line } else { format!("[{method}] {line}") });
+                HostValue::Undefined
+            }
             (Obj::Math, "random") => {
                 // xorshift64: fast, and good enough for a page's Math.random.
                 self.rng ^= self.rng << 13;
@@ -258,12 +501,17 @@ fn show_args(args: &[HostValue]) -> String {
 
 impl Host for PageHost {
     fn global(&mut self, name: &str) -> Result<HostValue> {
+        // Looking up `window` happens on every timer call; don't flood the trace with it.
+        if name == "window" {
+            return Ok(self.objects.borrow_mut().singleton("window", Obj::Window));
+        }
         self.traced(
             "globalThis".into(),
             name.to_string(),
             |h| match name {
                 "document" => Ok(h.objects.borrow_mut().singleton("document", Obj::Document)),
                 "Math" => Ok(h.objects.borrow_mut().singleton("Math", Obj::Math)),
+                "console" => Ok(h.objects.borrow_mut().singleton("console", Obj::Console)),
                 other => bail!("globalThis.{other} is not supported yet"),
             },
             |v| v.display(),
@@ -287,6 +535,10 @@ impl Host for PageHost {
 
     fn console(&mut self, text: &str) {
         record(TraceEntry { pack: self.pack, call: "console".into(), args: text.to_string(), result: String::new(), micros: 0 });
+    }
+
+    fn now(&mut self) -> f64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
     }
 }
 
@@ -374,7 +626,7 @@ mod tests {
         assert!(matches!(host.call(&document, "querySelector", &[s("#nope")]).unwrap(), HostValue::Null));
         let err = host.call(&document, "fooBar", &[]).unwrap_err().to_string();
         assert_eq!(err, "Document.fooBar() is not supported yet");
-        assert!(host.global("window").is_err());
+        assert!(host.global("indexedDB").is_err());
     }
 
     #[test]

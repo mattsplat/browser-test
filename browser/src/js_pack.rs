@@ -108,6 +108,12 @@ impl JsRuntime {
 }
 
 impl PackRuntime for JsRuntime {
+    fn release_callback(&mut self, id: usize) {
+        if let Ok(release) = self.instance.get_typed_func::<u32, ()>(&mut self.store, "js_release") {
+            let _ = release.call(&mut self.store, id as u32);
+        }
+    }
+
     fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
         let encoded = Value::Array(args.iter().map(encode).collect::<Result<_>>()?).to_string();
         let (ptr, len) = write_str(&mut self.store, &self.instance, &encoded)?;

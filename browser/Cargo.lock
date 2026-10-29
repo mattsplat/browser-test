@@ -709,6 +709,7 @@ dependencies = [
  "dioxus-native",
  "directories",
  "image",
+ "keyboard-types",
  "linebender_resource_handle",
  "mimalloc",
  "nucleo",
