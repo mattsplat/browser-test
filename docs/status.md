@@ -14,7 +14,7 @@ packs/js/build.sh                 # Boa JS pack → packs/js/target/wasm32-wasip
 packs/python/build.sh             # RustPython pack → packs/python/target/.../python_pack.wasm
 packs/php/build.sh                # PHP pack (downloads wasi-sdk + php-src) → packs/php/target/php_pack.wasm
 packs/dart/build.sh app.dart      # a Dart page program (wasm with embedded imports + source map)
-cd browser && cargo build --release && ./target/release/browser [--profile <name>] [url]
+cd browser && cargo build --release && ./target/release/unscripted [--profile <name>] [url]
 ```
 
 `vendor/blitz` is a submodule on the fork `mattsplat/blitz`, branch `browser-test`.
@@ -70,6 +70,6 @@ its own tests (`php_*` in `page_document.rs`) but isn't in the cross-pack ones y
 Connecting Claude Code to AI access (token is new each time access is turned on):
 
 ```sh
-claude mcp add --transport http browser http://127.0.0.1:7807/mcp \
-  --header "Authorization: Bearer $(jq -r .token ~/Library/Application\ Support/dev.mattsplat.browser-test/profiles/Default/ai-access.json)"
+claude mcp add --transport http unscripted http://127.0.0.1:7807/mcp \
+  --header "Authorization: Bearer $(jq -r .token ~/Library/Application\ Support/dev.mattsplat.unscripted/profiles/Default/ai-access.json)"
 ```

@@ -207,12 +207,12 @@ pages.
 def show(data):
     document.querySelector('#out').textContent = data.name
 
-fetch('https://api.github.com/repos/mattsplat/browser-test').then(lambda r: r.json().then(show))
+fetch('https://api.github.com/repos/mattsplat/unscripted').then(lambda r: r.json().then(show))
 ```
 
 ```php
 <?php
-fetch('https://api.github.com/repos/mattsplat/browser-test')->then(function ($r) {
+fetch('https://api.github.com/repos/mattsplat/unscripted')->then(function ($r) {
     $r->json()->then(fn($data) => $document->querySelector('#out')->textContent = $data->name);
 });
 ```

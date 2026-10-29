@@ -1,13 +1,13 @@
 # Phase 0 shell. Started from Blitz's reference browser (apps/browser, MIT/Apache-2.0,
 # see LICENSE-*), with every network request routed through `gate::Gate`.
 [package]
-name = "browser"
+name = "unscripted"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "browser"
+name = "unscripted"
 path = "src/main.rs"
 
 [features]

@@ -1,6 +1,7 @@
-# browser-test
+# Unscripted
 
-An experimental web browser where JavaScript isn't the language of the web, just one of several.
+The web, unscripted: an experimental browser where JavaScript isn't the language of the web,
+just one of several.
 
 Pages can be written in **Dart, JavaScript, Python or PHP**. Each language is a *pack*: a
 WebAssembly module running in [wasmtime](https://wasmtime.dev) that reaches the page only
@@ -80,8 +81,8 @@ You need:
 - The [Dart SDK](https://dart.dev/get-dart), only for Dart pages.
 
 ```sh
-git clone --recurse-submodules https://github.com/mattsplat/browser-test
-cd browser-test
+git clone --recurse-submodules https://github.com/mattsplat/unscripted
+cd unscripted
 
 packs/js/build.sh        # JS pack (Boa)
 packs/python/build.sh    # Python pack (RustPython)
@@ -118,7 +119,7 @@ These pages only come alive in this browser. Other browsers ignore `text/python`
 ## Layout
 
 ```
-browser/    the browser: shell, host, packs' Rust side, inspector, gate
+browser/    the browser (the `unscripted` binary): shell, host, packs' Rust side, inspector, gate
 packs/      the language packs (each builds to a .wasm the browser loads)
 examples/   demo pages, one per language
 docs/       pack contract (packs.md) and current status (status.md)

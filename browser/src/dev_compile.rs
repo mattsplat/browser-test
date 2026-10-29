@@ -24,7 +24,7 @@ const SANDBOX_PROFILE: &str = "(version 1)(allow default)(deny network-outbound 
 const WORKSPACE_PUBSPEC: &str = "name: dev_page\npublish_to: none\nenvironment:\n  sdk: ^3.6.0\ndependencies:\n  web: ^1.1.0\n";
 
 fn cache_dir() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "mattsplat", "browser-test").context("no cache folder")?;
+    let dirs = crate::profile::app_dirs().context("no cache folder")?;
     let dir = dirs.cache_dir().join("dart-dev");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)

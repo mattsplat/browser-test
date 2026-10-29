@@ -693,50 +693,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "browser"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "anyrender",
- "anyrender_serialize",
- "anyrender_vello_cpu",
- "blitz-dom",
- "blitz-html",
- "blitz-net",
- "blitz-paint",
- "blitz-traits",
- "browser-persistence",
- "cookie",
- "cookie_store",
- "dioxus-native",
- "directories",
- "image",
- "keyboard-types",
- "linebender_resource_handle",
- "mimalloc",
- "native-tls",
- "nucleo",
- "parley",
- "peniko",
- "png",
- "psl",
- "regex",
- "rfd",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tungstenite",
- "url",
- "usvg",
- "wasmtime",
- "webbrowser",
- "winit",
-]
-
-[[package]]
 name = "browser-persistence"
 version = "0.0.0"
 dependencies = [
@@ -6832,6 +6788,50 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unscripted"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "anyrender",
+ "anyrender_serialize",
+ "anyrender_vello_cpu",
+ "blitz-dom",
+ "blitz-html",
+ "blitz-net",
+ "blitz-paint",
+ "blitz-traits",
+ "browser-persistence",
+ "cookie",
+ "cookie_store",
+ "dioxus-native",
+ "directories",
+ "image",
+ "keyboard-types",
+ "linebender_resource_handle",
+ "mimalloc",
+ "native-tls",
+ "nucleo",
+ "parley",
+ "peniko",
+ "png",
+ "psl",
+ "regex",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tungstenite",
+ "url",
+ "usvg",
+ "wasmtime",
+ "webbrowser",
+ "winit",
+]
 
 [[package]]
 name = "untrusted"

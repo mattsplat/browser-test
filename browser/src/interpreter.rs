@@ -74,7 +74,7 @@ fn module(lang: &'static Language) -> Result<&'static Module> {
 /// changed config gets a new entry). Every profile's process shares the file: it holds no
 /// user data, and every browser has the same interpreters, so a cache hit reveals nothing.
 fn cached_compile(lang: &Language, wasm: &[u8]) -> Result<Module> {
-    let path = directories::ProjectDirs::from("dev", "mattsplat", "browser-test")
+    let path = crate::profile::app_dirs()
         .map(|d| d.cache_dir().join(format!("{}-engine-{}.cwasm", lang.prefix, code_key(wasm, ""))));
     let (module, compiled) = load_or_compile(wasm, path.as_deref(), &format!("{} pack", lang.label))?;
     if let Some(path) = path.filter(|p| compiled && p.exists()) {

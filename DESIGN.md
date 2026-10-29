@@ -1,4 +1,4 @@
-# Browser experiment: design
+# Unscripted: design
 
 An experimental browser where JavaScript is no longer the default language of the web.
 Dart is first-class; JS is just one more language pack, off by default.

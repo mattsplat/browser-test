@@ -2,16 +2,17 @@
 //! its settings (per-site permissions included), history, open tabs and HTTP cache, and its
 //! cookies live in its own process's memory, so nothing a site stores is shared.
 //!
-//! **One profile per process.** The browser runs as `browser --profile <name>` (no flag:
+//! **One profile per process.** The browser runs as `unscripted --profile <name>` (no flag:
 //! "Default"), and "open profile" starts another process. Settings, the gate, the trace and
 //! AI access are process-wide globals, so a process *is* the boundary: no per-profile
 //! plumbing is needed, and nothing in one profile can reach another's state. A lock file
 //! keeps two processes off the same profile.
 //!
-//! Layout, under the app's data folder (`~/Library/Application Support/dev.mattsplat.browser-test`
+//! Layout, under the app's data folder (`~/Library/Application Support/dev.mattsplat.unscripted`
 //! on macOS): `profiles/<name>/` with `settings.json`, `history.sqlite3`, `session.json`,
 //! `http-cache/` and `lock`. Data from before profiles existed moves into `profiles/Default`
-//! on the first run (`migrate_legacy`).
+//! on the first run (`migrate_legacy`), as do the folders from when the app was called
+//! browser-test (`adopt_old_folder`).
 
 use std::fs::File;
 use std::io;
@@ -69,8 +70,22 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
 }
 
-fn app_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("dev", "mattsplat", "browser-test")
+/// The app's folders: data and settings, and caches (which hold no user data).
+pub fn app_dirs() -> Option<directories::ProjectDirs> {
+    directories::ProjectDirs::from("dev", "mattsplat", "unscripted")
+}
+
+/// The app was called browser-test: its folder moves to the new name, whole, so profiles,
+/// history, cookies and settings carry over. Only when the new one doesn't exist yet, so it
+/// never overwrites. Caches stay behind; they rebuild.
+pub fn adopt_old_folder(old: &Path, new: &Path) -> io::Result<()> {
+    if !old.is_dir() || new.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = new.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(old, new)
 }
 
 /// Where every profile's folder lives.
@@ -128,6 +143,12 @@ pub fn init(name: &str) -> Result<(), String> {
     }
     // No app folder (some mobile targets): run with everything in memory, as before.
     let Some(dirs) = app_dirs() else { return Ok(()) };
+    if let Some(old) = directories::ProjectDirs::from("dev", "mattsplat", "browser-test") {
+        // On macOS settings and data share one folder; elsewhere they're two.
+        for (old, new) in [(old.data_dir(), dirs.data_dir()), (old.config_dir(), dirs.config_dir())] {
+            adopt_old_folder(old, new).map_err(|e| format!("couldn't move {} to {}: {e}", old.display(), new.display()))?;
+        }
+    }
     let root = dirs.data_dir().join("profiles");
     let name = spelling_in(&root, name);
     let dir = root.join(&name);
@@ -278,6 +299,27 @@ mod tests {
         for bad in ["", "..", "a/b", "a\\b", ".hidden", " lead", "trail ", "a.b", &"x".repeat(33)] {
             assert!(!valid_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_old_apps_folder_moves_whole_and_never_overwrites() {
+        let root = temp_dir("rename");
+        let (old, new) = (root.join("dev.mattsplat.browser-test"), root.join("dev.mattsplat.unscripted"));
+        std::fs::create_dir_all(old.join("profiles/Default")).unwrap();
+        std::fs::write(old.join("profiles/Default/settings.json"), "{}").unwrap();
+
+        adopt_old_folder(&old, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(new.join("profiles/Default/settings.json")).unwrap(), "{}");
+        assert!(!old.exists());
+
+        // Once the new folder exists, an old one (say, from running an older build) is left alone.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("stray"), "x").unwrap();
+        adopt_old_folder(&old, &new).unwrap();
+        assert!(old.join("stray").exists() && !new.join("stray").exists());
+        // Nothing to move is fine.
+        adopt_old_folder(&root.join("missing"), &root.join("other")).unwrap();
+        assert!(!root.join("other").exists());
     }
 
     #[test]

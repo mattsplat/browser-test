@@ -285,7 +285,7 @@ fn rpc(message: &Value) -> Option<Value> {
         "initialize" => json!({
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "browser-test", "version": env!("CARGO_PKG_VERSION") },
+            "serverInfo": { "name": "unscripted", "version": env!("CARGO_PKG_VERSION") },
             "instructions": "Read access to the browser: its tabs, page outlines, console and errors, \
                 the pack trace, and network requests. Form values, cookies, headers and URL query values are hidden. \
                 eval, click and reload need AI control, which the user turns on separately, and work only on sites \
