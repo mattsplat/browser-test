@@ -116,7 +116,7 @@ impl Step {
 #[derive(Clone, Debug)]
 pub enum Program {
     Dart(Vec<u8>),
-    /// "js" or "python": its scripts, and (JS) each module import fetched, URL → source.
+    /// "js", "python" or "php": its scripts, and (JS) each module import fetched, URL → source.
     Scripts { pack: &'static str, scripts: Vec<Script>, imports: Vec<(String, String)> },
 }
 
@@ -418,6 +418,7 @@ pub async fn replay(recording: &Recording, config: DocumentConfig, upto: Option<
     let started = match program {
         Program::Dart(wasm) => crate::dart_pack::start(doc, Default::default(), wasm),
         Program::Scripts { pack: "python", scripts, .. } => crate::python_pack::start(doc, Default::default(), scripts),
+        Program::Scripts { pack: "php", scripts, .. } => crate::php_pack::start(doc, Default::default(), scripts),
         Program::Scripts { scripts, imports, .. } => {
             let fetch = |url: String| {
                 let found = imports.iter().find(|(u, _)| *u == url).map(|(_, s)| s.clone()).with_context(|| format!("{url} wasn't fetched when this was recorded"));

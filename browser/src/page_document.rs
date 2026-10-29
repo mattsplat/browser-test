@@ -2889,6 +2889,146 @@ setInterval(tick, 1)
         assert!(err.contains("line 2, in f"), "{err}");
     }
 
+    // ---- The PHP pack (spike): php-src in wasm, the same contract, a fourth language.
+
+    fn php_page(html: &str, scripts: &[&str]) -> PackDocument {
+        let doc = HtmlDocument::from_html(html, DocumentConfig::default()).into_inner();
+        let scripts: Vec<Script> = scripts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Script { name: format!("test-{}.php", i + 1), source: s.to_string(), module: false })
+            .collect();
+        crate::php_pack::start(doc, Default::default(), &scripts).expect("PHP pack missing? run packs/php/build.sh")
+    }
+
+    /// The PHP counter example, end to end: its `main.php` in the PHP pack (php-src in
+    /// wasm), the same host as the other packs, the real Blitz DOM.
+    #[test]
+    fn php_counter_example_runs_and_handles_clicks() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/php-counter");
+        let html = std::fs::read_to_string(format!("{dir}/index.html")).unwrap();
+        assert!(html.contains(r#"<script type="text/php" src="main.php"></script>"#));
+        let script = std::fs::read_to_string(format!("{dir}/main.php")).unwrap();
+        let page = php_page(&html, &[&script]);
+        let status = text_of(&page.pack.doc.borrow(), "#status");
+        assert!(status.starts_with("PHP 8.4.") && status.ends_with("is running, as a pack in WebAssembly."), "{status}");
+
+        let (button, id) = listener(&page, "#increment", "click");
+        for _ in 0..2 {
+            let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
+            page.pack.fire(id, &[event]).unwrap();
+        }
+        let doc = page.pack.doc.borrow();
+        assert_eq!(text_of(&doc, "#count"), "2");
+        assert_eq!(text_of(&doc, "#log"), "Click 1, handled in PHP (click)Click 2, handled in PHP (click)");
+    }
+
+    /// PHP reaches the DOM through the host: properties, methods, a closure as a listener (the
+    /// page's globals are superglobals, so it needs no `use`), echo to the console, and one
+    /// global scope across scripts.
+    #[test]
+    fn php_runs_and_handles_clicks() {
+        let page = php_page("<button id=increment>+</button><p id=count>0</p><ul id=log></ul><p id=status></p>", &[
+            "<?php\n$clicks = 0;\n$document->querySelector('#status')->textContent = 'PHP ' . PHP_VERSION . ' is running';",
+            r#"$document->querySelector('#increment')->addEventListener('click', function ($event) {
+                global $clicks;
+                $clicks++;
+                $document->querySelector('#count')->textContent = (string) $clicks;
+                $item = $document->createElement('li');
+                $item->textContent = "Click $clicks ({$event->type})";
+                $document->querySelector('#log')->appendChild($item);
+                echo "clicked $clicks\n";
+            });
+            echo json_encode(['pcre' => preg_match('/^\d+$/', '42'), 'hash' => substr(hash('sha256', 'x'), 0, 8)]);"#,
+        ]);
+        let status = text_of(&page.pack.doc.borrow(), "#status");
+        assert!(status.starts_with("PHP 8.4."), "{status:?}; trace: {:#?}", host::trace().into_iter().filter(|e| e.pack == "php").collect::<Vec<_>>());
+        let (button, id) = listener(&page, "#increment", "click");
+        for _ in 0..2 {
+            let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
+            page.pack.fire(id, &[event]).unwrap();
+        }
+        let doc = page.pack.doc.borrow();
+        assert_eq!(text_of(&doc, "#count"), "2");
+        assert_eq!(text_of(&doc, "#log"), "Click 1 (click)Click 2 (click)");
+        let console: Vec<String> = host::trace().into_iter().filter(|e| e.pack == "php" && e.kind == TraceKind::Console).map(|e| e.args).collect();
+        assert!(console.iter().any(|t| t == r#"{"pcre":1,"hash":"2d711642"}"#), "{console:?}");
+        assert!(console.iter().any(|t| t == "clicked 2\n"), "{console:?}");
+    }
+
+    /// PHP's errors come back as messages with file and line; host errors are PHP exceptions
+    /// the page can catch; a failing script doesn't stop the next.
+    #[test]
+    fn php_errors_are_reported() {
+        let page = php_page("<p id=out></p>", &[
+            "function inner() { throw new RuntimeException('php broke'); }\ninner();",
+            "try { $document->fooBar(); } catch (Error $e) { $document->querySelector('#out')->textContent = $e->getMessage(); }",
+            "function broken( {",
+            "$f = new Fiber(fn() => 1); $f->start();",
+            "echo $undefined_variable;",
+        ]);
+        let trace = host::trace();
+        let err = |script: &str| trace.iter().find(|e| e.pack == "php" && e.args == script).map(|e| e.result.clone()).unwrap_or_default();
+        let first = err("test-1.php");
+        assert!(first.contains("Uncaught RuntimeException: php broke in test-1.php:1"), "{first}");
+        assert_eq!(output(&page), "Document.fooBar() is not supported yet");
+        assert!(err("test-3.php").contains("syntax error") && err("test-3.php").contains("test-3.php:1"), "{}", err("test-3.php"));
+        assert!(err("test-4.php").contains("Fibers are not supported in this browser"), "{}", err("test-4.php"));
+        // A warning isn't an error: it goes to the console and the script finishes.
+        assert_eq!(err("test-5.php"), "");
+        assert!(trace.iter().any(|e| e.pack == "php" && e.kind == TraceKind::Console && e.args.contains("Warning: Undefined variable $undefined_variable in test-5.php:1")));
+    }
+
+    /// Console input: an expression's value is shown; statements run in the page's scope.
+    #[test]
+    fn php_console_eval_runs_in_the_page() {
+        let page = php_page("<p id=out>start</p>", &["$counter = 41;\nfunction bump() { global $counter; return ++$counter; }"]);
+        let eval = |source: &str| page.pack.eval(source, debug::CONSOLE_PACK);
+        // Randomness comes from the host (WASI random_get), as for every pack.
+        assert!(matches!(eval("random_int(1, 6)").unwrap().as_str(), "1" | "2" | "3" | "4" | "5" | "6"));
+        assert_eq!(eval("strlen(random_bytes(16))").unwrap(), "16");
+        assert_eq!(eval("bump()").unwrap(), "42");
+        assert_eq!(eval("[1, 'a', null];").unwrap(), "array (\n  0 => 1,\n  1 => 'a',\n  2 => NULL,\n)");
+        assert_eq!(eval("$x = 5; $document->querySelector('#out')->textContent = 'from the console';").unwrap(), "");
+        assert_eq!(output(&page), "from the console");
+        assert_eq!(eval("$x * 2").unwrap(), "10");
+        assert_eq!(eval("$document->querySelector('#out')").unwrap(), "<p id=\"out\">");
+        let err = eval("missing()").unwrap_err().to_string();
+        assert!(err.contains("Call to undefined function missing()"), "{err}");
+    }
+
+    /// A PHP listener that never returns is stopped by the time limit, like the other packs.
+    #[test]
+    fn runaway_php_is_stopped() {
+        let mut page = php_page("<button id=b>go</button>", &[
+            "$document->querySelector('#b')->addEventListener('click', function () { while (true) {} });",
+        ]);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        assert!(host::trace().iter().any(|e| e.pack == "php" && e.result.contains("script ran too long and was stopped (PHP)")));
+        assert!(page.pack.idle());
+    }
+
+    /// PHP sees the web platform through the host and nothing else: no files, processes,
+    /// sockets, DNS, environment or extensions, and nothing that blocks.
+    #[test]
+    fn php_has_no_side_doors() {
+        let page = php_page("<p id=out></p>", &[r#"
+            $reachable = [];
+            if (@file_get_contents('/etc/passwd') !== false) $reachable[] = 'files';
+            if (@file_put_contents('/tmp/php-pack-test', 'x') !== false) $reachable[] = 'write';
+            if (@fsockopen('example.com', 80) !== false) $reachable[] = 'sockets';
+            if (gethostbyname('example.com') !== 'example.com') $reachable[] = 'dns';
+            if (@file_get_contents('http://example.com/') !== false) $reachable[] = 'http';
+            if (getenv() !== []) $reachable[] = 'env';
+            foreach (['exec', 'shell_exec', 'system', 'proc_open', 'popen', 'sleep', 'usleep'] as $f) {
+                try { $f('true', 'r'); $reachable[] = $f; } catch (Error) {}
+            }
+            try { if (@dl('x.so')) $reachable[] = 'dl'; } catch (Error) {}
+            $document->querySelector('#out')->textContent = $reachable ? implode(',', $reachable) : 'none';
+        "#]);
+        assert_eq!(output(&page), "none");
+    }
+
     /// A page that allocates without end fails inside its pack (the memory cap), and the
     /// browser carries on.
     #[test]

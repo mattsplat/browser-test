@@ -412,6 +412,26 @@ fn add_wasi(linker: &mut Linker<State>) -> Result<()> {
     linker.func_wrap(WASI, "fd_seek", |_: u32, _: i64, _: u32, _: u32| -> i32 { EBADF })?;
     linker.func_wrap(WASI, "path_filestat_get", |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
     linker.func_wrap(WASI, "path_open", |_: u32, _: u32, _: u32, _: u32, _: u32, _: u64, _: u64, _: u32, _: u32| -> i32 { EBADF })?;
+    // PHP's libc links the rest of the file calls, and preview 1's calls on pre-opened sockets
+    // (there are none).
+    for name in ["fd_datasync", "fd_sync"] {
+        linker.func_wrap(WASI, name, |_: u32| -> i32 { EBADF })?;
+    }
+    linker.func_wrap(WASI, "fd_fdstat_set_flags", |_: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "fd_filestat_set_size", |_: u32, _: u64| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "fd_tell", |_: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "fd_pread", |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { EBADF })?;
+    for name in ["path_create_directory", "path_remove_directory", "path_unlink_file"] {
+        linker.func_wrap(WASI, name, |_: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    }
+    linker.func_wrap(WASI, "path_filestat_set_times", |_: u32, _: u32, _: u32, _: u32, _: u64, _: u64, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "path_link", |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "path_readlink", |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "path_rename", |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "path_symlink", |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "sock_accept", |_: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "sock_recv", |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
+    linker.func_wrap(WASI, "sock_send", |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { EBADF })?;
     linker.func_wrap(WASI, "poll_oneoff", |_: u32, _: u32, _: u32, _: u32| -> i32 { ENOSYS })?;
     linker.func_wrap(WASI, "sched_yield", || -> i32 { 0 })?;
     linker.func_wrap(WASI, "proc_exit", |code: u32| -> wasmtime::Result<()> { Err(wasmtime::Error::msg(format!("the pack exited with code {code}"))) })?;

@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PHP counter</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+    #status { color: #2E7D32; }
+    .counter { display: flex; align-items: center; gap: 16px; margin: 24px 0; }
+    #count { font-size: 48px; font-weight: bold; min-width: 64px; }
+    button { font-size: 16px; padding: 8px 16px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    #log { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>PHP counter</h1>
+  <p>The same counter as the Dart, JS and Python examples, in PHP. PHP is a language pack like
+  Dart: it runs by default and can be blocked for a site in the Site panel. The page ships
+  source (<code>main.php</code>); the browser runs it with php-src, compiled to WebAssembly.</p>
+  <p id="status">PHP is blocked for this site.</p>
+  <div class="counter">
+    <span id="count">0</span>
+    <button id="increment">Add one</button>
+  </div>
+  <ul id="log"></ul>
+  <script type="text/php" src="main.php"></script>
+</body>
+</html>

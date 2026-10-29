@@ -46,6 +46,7 @@ mod js_permission;
 mod page_document;
 mod profile;
 mod prompt;
+mod php_pack;
 mod python_pack;
 mod replay;
 mod request_panel;

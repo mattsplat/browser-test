@@ -21,3 +21,6 @@ vendor/gosub/
 # Local tool and OS files
 .DS_Store
 .gstack/
+
+# The PHP pack's toolchain and php-src, downloaded by packs/php/build.sh
+packs/php/.build/

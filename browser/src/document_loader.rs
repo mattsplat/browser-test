@@ -20,7 +20,7 @@ use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
 use crate::host::{self, TraceEntry, TraceKind};
-use crate::{dart_pack, js_pack, python_pack};
+use crate::{dart_pack, js_pack, php_pack, python_pack};
 use crate::js_permission;
 use crate::prompt;
 use crate::replay;
@@ -234,7 +234,8 @@ impl Drop for DocumentLoader {
 
 /// Build the document for a loaded page, returning the document, its title, and its
 /// favicon URL (if any). A page runs one pack, the first of: Dart (`<script
-/// type="application/dart" src="app.wasm">`), Python (`<script type="text/python">`), JS
+/// type="application/dart" src="app.wasm">`), Python (`<script type="text/python">`), PHP
+/// (`<script type="text/php">`), JS
 /// (plain `<script>`, only where JS is allowed). Any other script is ignored.
 async fn build_page_document(
     html: &str,
@@ -274,7 +275,7 @@ async fn build_page_document(
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");
         if !scripts.is_empty() {
-            trace_skipped(&document, &page_url, "Python", &["js"]);
+            trace_skipped(&document, &page_url, "Python", &["php", "js"]);
             if settings::get().python_blocked.contains(&origin) {
                 trace_pack_load("python", &page_url, &page_url, format!("skipped {} script(s): Python is blocked for {origin}", scripts.len()));
                 return (shown(document), title, favicon_url);
@@ -292,7 +293,28 @@ async fn build_page_document(
                 }
             };
         }
-        // No Dart or Python: the page's JS, if any, runs only where JS is allowed.
+        // PHP, the same way.
+        let scripts = page_scripts(&document, "php");
+        if !scripts.is_empty() {
+            trace_skipped(&document, &page_url, "PHP", &["js"]);
+            if settings::get().php_blocked.contains(&origin) {
+                trace_pack_load("php", &page_url, &page_url, format!("skipped {} script(s): PHP is blocked for {origin}", scripts.len()));
+                return (shown(document), title, favicon_url);
+            }
+            let sources = fetch_sources("php", &scripts, &page_url, net_provider, signal).await;
+            arm(&page_url);
+            return match php_pack::start(document, env, &sources) {
+                Ok(php) => {
+                    record(&php, replay::Program::Scripts { pack: "php", scripts: sources, imports: Vec::new() });
+                    (shown_pack(php), title, favicon_url)
+                }
+                Err(e) => {
+                    trace_pack_load("php", &page_url, &page_url, format!("ERROR {e:#}"));
+                    ((error_document(&format!("PHP pack failed: {e:#}")), None), title, favicon_url)
+                }
+            };
+        }
+        // No Dart, Python or PHP: the page's JS, if any, runs only where JS is allowed.
         let scripts = page_scripts(&document, "js");
         if scripts.is_empty() {
             return (shown(document), title, favicon_url);
@@ -334,7 +356,7 @@ async fn build_page_document(
             }
         };
     };
-    trace_skipped(&document, &page_url, "Dart", &["python", "js"]);
+    trace_skipped(&document, &page_url, "Dart", &["python", "php", "js"]);
     if settings::get().dart_blocked.contains(&origin) {
         trace_load(&page_url, &src, format!("skipped: Dart is blocked for {origin}"));
         return (shown(document), title, favicon_url);
@@ -374,7 +396,11 @@ fn trace_skipped(document: &BaseDocument, page: &Url, runs: &str, others: &[&'st
     for &pack in others {
         let count = page_scripts(document, pack).len();
         if count > 0 {
-            let language = if pack == "js" { "JS" } else { "Python" };
+            let language = match pack {
+                "js" => "JS",
+                "php" => "PHP",
+                _ => "Python",
+            };
             trace_pack_load(pack, page, page, format!("skipped {count} {language} script(s): this page runs {runs}"));
         }
     }
@@ -394,8 +420,8 @@ enum PageScript {
     External { url: Url, module: bool },
 }
 
-/// The page's scripts for `pack` ("js" or "python"), in document order. For JS that's classic
-/// and module scripts; for Python, `type="text/python"`.
+/// The page's scripts for `pack` ("js", "python" or "php"), in document order. For JS that's
+/// classic and module scripts; for Python, `type="text/python"`; for PHP, `type="text/php"`.
 fn page_scripts(document: &BaseDocument, pack: &str) -> Vec<PageScript> {
     let Ok(nodes) = document.query_selector_all("script") else { return Vec::new() };
     let mut scripts = Vec::new();
@@ -407,6 +433,7 @@ fn page_scripts(document: &BaseDocument, pack: &str) -> Vec<PageScript> {
             ("js", None | Some("") | Some("text/javascript") | Some("application/javascript")) => false,
             ("js", Some("module")) => true,
             ("python", Some("text/python")) => false,
+            ("php", Some("text/php")) => false,
             _ => continue,
         };
         scripts.push(match node.attr(local_name!("src")) {
@@ -556,12 +583,13 @@ mod tests {
         assert!(matches!(dev_mode_decision(&s, "https://no.test"), DevDecision::Skip(_)));
     }
 
-    /// Each pack gets only its own scripts: `text/python` for Python; classic and module
-    /// scripts for JS; other types for nobody.
+    /// Each pack gets only its own scripts: `text/python` for Python; `text/php` for PHP;
+    /// classic and module scripts for JS; other types for nobody.
     #[test]
     fn scripts_are_picked_by_type() {
         let html = r#"<script>js1</script><script type="Text/Python">py1</script><script type=" MODULE ">js2</script>
-            <script type="text/python" src="app.py"></script><script type="text/x-template">neither</script>"#;
+            <script type="text/python" src="app.py"></script><script type="text/x-template">neither</script>
+            <script type="TEXT/PHP">php1</script>"#;
         let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some("https://site.test/".into()), ..Default::default() }).into_inner();
         let names = |pack| page_scripts(&doc, pack).into_iter().map(|s| match s {
             PageScript::Inline { source, module } => format!("{source}{}", if module { " (module)" } else { "" }),
@@ -569,11 +597,14 @@ mod tests {
         }).collect::<Vec<_>>();
         assert_eq!(names("python"), ["py1", "https://site.test/app.py"]);
         assert_eq!(names("js"), ["js1", "js2 (module)"]);
+        assert_eq!(names("php"), ["php1"]);
 
         // The page runs Python, so its JS is skipped, and the trace says so.
         let page = Url::parse("https://skipped-js.test/").unwrap();
-        trace_skipped(&doc, &page, "Python", &["js"]);
-        assert!(host::trace().iter().any(|e| e.pack == "js" && e.page == page.as_str() && e.result == "skipped 2 JS script(s): this page runs Python"));
+        trace_skipped(&doc, &page, "Python", &["php", "js"]);
+        let trace = host::trace();
+        assert!(trace.iter().any(|e| e.pack == "js" && e.page == page.as_str() && e.result == "skipped 2 JS script(s): this page runs Python"));
+        assert!(trace.iter().any(|e| e.pack == "php" && e.page == page.as_str() && e.result == "skipped 1 PHP script(s): this page runs Python"));
     }
 
     #[test]

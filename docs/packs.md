@@ -1,8 +1,8 @@
 # Language packs
 
-A language pack runs a page's code in one language. There are three: **Dart** (dart2wasm
-output), **JS** (Boa compiled to `wasm32-wasip1`) and **Python** (RustPython compiled to
-`wasm32-wasip1`). They all run in wasmtime on the UI thread and reach the page only through
+A language pack runs a page's code in one language. There are four: **Dart** (dart2wasm
+output), **JS** (Boa compiled to `wasm32-wasip1`), **Python** (RustPython compiled to
+`wasm32-wasip1`) and **PHP** (php-src's embed SAPI compiled to `wasm32-wasip1` with wasi-sdk). They all run in wasmtime on the UI thread and reach the page only through
 the host (`browser/src/host.rs`). This document says what a pack implements and what the
 host guarantees in return. The code is the reference; the module named in each section is
 where to look.
@@ -11,7 +11,7 @@ Two kinds of pack exist today:
 
 - **Compiled** (Dart): the page ships Wasm. The pack is a Rust adapter between that Wasm's
   imports and the host (`dart_pack.rs`).
-- **Interpreter** (JS, Python): the page ships source. The pack is an interpreter compiled to
+- **Interpreter** (JS, Python, PHP): the page ships source. The pack is an interpreter compiled to
   Wasm with a fixed ABI, and one shared Rust runtime (`interpreter.rs`) loads any such
   interpreter. Adding an interpreted language is a new crate under `packs/` and a
   `Language` static; nothing in the runtime changes.
@@ -53,13 +53,13 @@ Ok(startup.finish(Box::new(runtime)))
 
 - **Choosing a pack** (`document_loader.rs`, `build_page_document`). A page runs one pack:
   the first of Dart (`<script type="application/dart" src="app.wasm">`), Python
-  (`<script type="text/python">`, inline or `src`), JS (a plain `<script>` or
+  (`<script type="text/python">`, inline or `src`), PHP (`<script type="text/php">`), JS (a plain `<script>` or
   `type="module"`). Other script types are ignored.
 - **Permission** is checked before anything loads:
   - A page's scripts for packs that don't run are traced as skipped, e.g. `skipped 2 JS
     script(s): this page runs Python`. Script types compare ignoring ASCII case.
-  - Dart and Python run by default and can be blocked per site (`dart_blocked`,
-    `python_blocked` in settings, toggled in the Site panel).
+  - Dart, Python and PHP run by default and can be blocked per site (`dart_blocked`,
+    `python_blocked`, `php_blocked` in settings, toggled in the Site panel).
   - JS follows `js_permission::decide`: a global default (Ask), and per-site "always allow",
     "keep off" and "allow this visit".
   - A skipped pack is traced as a `load` entry saying why.
@@ -131,7 +131,8 @@ Ok(startup.finish(Box::new(runtime)))
 
   An import outside this list fails instantiation. JS imports 8 of these functions; Python
   imports 21 (RustPython's standard Rust library links the file calls even though nothing
-  can succeed).
+  can succeed); PHP imports 33 (wasi-libc's whole file API and preview 1's calls on
+  pre-opened sockets, of which there are none; every one fails with EBADF).
 
 ## DOM bindings: the host operations
 
@@ -402,3 +403,31 @@ packed JSON reply.
   - Passing lists or dicts holding functions or host objects to the host (as for JS):
     only data crosses.
   - Snake_case aliases for Web IDL names.
+
+## PHP pack
+
+`packs/php/build.sh` downloads wasi-sdk and php-src into `packs/php/.build/`, applies
+`patches/wasi.patch`, and builds PHP's embed SAPI with `src/pack.c` (the ABI, `php_` prefix)
+into `packs/php/target/php_pack.wasm` (about 4.7 MB). The PHP side of the bridge is
+`src/prelude.php`.
+
+- **Porting:** WASI has no users, processes, sockets, DNS, syslog or dynamic loading.
+  `shim/posix_stubs.h` (force-included into every file) declares them and
+  `shim/posix_stubs.c` makes each fail. PHP's bailout (`zend_try`) uses `setjmp`/`longjmp`,
+  compiled to standard Wasm exceptions (`-wasm-enable-sjlj -wasm-use-legacy-eh=false`), which
+  the shared engine already enables for Dart.
+- **The bridge:** `HostObject` maps `__get`, `__set` and `__call` to host get, set and call.
+  PHP's syntax separates reading a member from calling it, so unlike JS and Python there is
+  no `METHODS` list. Lists support `[$i]`, `['name']` and `foreach`; their size is `->length`.
+- **Globals:** `$document`, `$window`, `$console`, `$location`, `$history`, `$navigator`,
+  `$localStorage` and `$sessionStorage` are superglobals (registered in `pack.c`), so
+  functions and closures reach them without `global` or `use`. Page variables still need
+  `global` inside functions, as in any PHP.
+- **Output and errors:** `echo` and warnings go to the console, one entry per call into the
+  pack. Fatal errors (parse errors, uncaught exceptions, PHP's 256 MB `memory_limit`) are
+  returned with file and line.
+- **Randomness and time** come from the host: wasi-libc's `arc4random_buf` (patched in as
+  PHP's CSPRNG) is seeded through `random_get`; clocks through `clock_time_get`.
+- **Not available:** Fibers (no stack switching; creating one throws), `sleep` and the
+  process functions (disabled), files, sockets, `dl()`. There is no promise wrapper yet:
+  `fetch(...)->then($ok, $err)` calls the host promise directly.

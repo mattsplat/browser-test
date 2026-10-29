@@ -320,7 +320,7 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "tab": tab, "limit": limit } } },
         { "name": "requests", "description": "Network requests a tab's site made: allowed or blocked, why, and the third-party site. Query values are hidden.",
           "inputSchema": { "type": "object", "properties": { "tab": tab, "limit": limit } } },
-        { "name": "eval", "description": "Needs AI control and a dev-mode site. Evaluate code in a tab's page, in the page's own language (JavaScript or Python pages; Dart can't evaluate) and return the result. It reaches the page only through the browser's host, like the page's own code.",
+        { "name": "eval", "description": "Needs AI control and a dev-mode site. Evaluate code in a tab's page, in the page's own language (JavaScript, Python or PHP pages; Dart can't evaluate) and return the result. It reaches the page only through the browser's host, like the page's own code.",
           "inputSchema": { "type": "object", "properties": { "tab": tab, "expression": { "type": "string" } }, "required": ["expression"] } },
         { "name": "click", "description": "Needs AI control and a dev-mode site. Click the element a CSS selector matches: the page's click listeners run, as for element.click() (links aren't followed).",
           "inputSchema": { "type": "object", "properties": { "tab": tab, "selector": { "type": "string" } }, "required": ["selector"] } },
