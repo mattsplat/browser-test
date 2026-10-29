@@ -72,8 +72,11 @@ Ok(startup.finish(Box::new(runtime)))
     wasmtime's `precompile_compatibility_hash`. It is written with
     `profile::write_atomic`, because another profile's process may have it memory-mapped.
     Once a new file is saved, that pack's older `.cwasm` files are deleted.
-  - **Dart:** each page's program is compiled when it loads (pages differ; there's no
-    cache).
+  - **Dart:** a page's program is cached the same way, keyed by its wasm, wasmtime's
+    compatibility hash **and the page's origin**, in the profile's `compiled-dart/` folder
+    (at most 32 entries, oldest pruned). It's partitioned by site and profile because a hit
+    loads measurably faster, which a site could time. Only compiled code is shared; each
+    page still gets its own instance.
 - **Instantiating:** each page gets a fresh `Store` and `Instance`, so no pack state is ever
   shared between pages or tabs. Every store has a memory cap of 512 MB
   (`page_document::MEMORY_LIMIT`, applied with `Store::limiter`). A page that allocates
@@ -281,8 +284,9 @@ Ok(startup.finish(Box::new(runtime)))
   `a_dropped_page_releases_its_pack_and_dom` checks this for all three packs.
 - **A pack must not hold anything outside its store:** no threads, files or global state in
   the host.
-- **What outlives pages:** only the compiled `Module`, which is immutable code shared by
-  every page.
+- **What outlives pages:** only compiled code (`Module`s, and their `.cwasm` files), which is
+  immutable. The interpreters' is shared by every page; a Dart program's only by pages of
+  the same site in the same profile.
 
 ## Isolation
 

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use wasmtime::*;
 
 use crate::host::{Host, HostValue};
-use crate::page_document::{PackRuntime, RAN_TOO_LONG, STOPPED, Startup, TIME_LIMIT_TICKS, engine, interrupted, memory_limits};
+use crate::page_document::{PackRuntime, RAN_TOO_LONG, STOPPED, Startup, TIME_LIMIT_TICKS, code_key, engine, interrupted, load_or_compile, memory_limits};
 
 /// One interpreter pack: where its build puts it and what it calls itself.
 pub struct Language {
@@ -74,35 +74,14 @@ fn module(lang: &'static Language) -> Result<&'static Module> {
 
 /// Compiling an interpreter takes seconds, so keep the compiled code on disk, keyed by a hash
 /// of its bytes and of wasmtime's version and configuration (a rebuilt interpreter or a
-/// changed config gets a new entry). Every profile's process shares the file and maps it
-/// into memory, so it's only ever replaced whole (`write_atomic`), never rewritten in place.
+/// changed config gets a new entry). Every profile's process shares the file: it holds no
+/// user data, and every browser has the same interpreters, so a cache hit reveals nothing.
 fn cached_compile(lang: &Language, wasm: &[u8]) -> Result<Module> {
-    use std::hash::{Hash, Hasher};
-    let engine = engine();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    wasm.hash(&mut hasher);
-    engine.precompile_compatibility_hash().hash(&mut hasher);
     let path = directories::ProjectDirs::from("dev", "mattsplat", "browser-test")
-        .map(|d| d.cache_dir().join(format!("{}-engine-{:016x}.cwasm", lang.prefix, hasher.finish())));
-    if let Some(path) = &path {
-        if path.exists() {
-            // Safety: this file was written by `Module::serialize` below, for this engine
-            // configuration, into our own cache folder.
-            match unsafe { Module::deserialize_file(engine, path) } {
-                Ok(module) => return Ok(module),
-                Err(e) => tracing::warn!("ignoring stale compiled {} pack: {e:#}", lang.label),
-            }
-        }
-    }
-    let module = Module::new(engine, wasm)?;
-    if let Some(path) = &path {
-        let saved = path.parent().map(std::fs::create_dir_all).transpose().and_then(|_| {
-            module.serialize().map_err(std::io::Error::other).and_then(|bytes| crate::profile::write_atomic(path, &bytes))
-        });
-        match saved {
-            Ok(()) => remove_stale_caches(lang, path),
-            Err(e) => tracing::warn!("could not cache the compiled {} pack: {e}", lang.label),
-        }
+        .map(|d| d.cache_dir().join(format!("{}-engine-{:016x}.cwasm", lang.prefix, code_key(wasm, ""))));
+    let (module, compiled) = load_or_compile(wasm, path.as_deref(), &format!("{} pack", lang.label))?;
+    if let Some(path) = path.filter(|p| compiled && p.exists()) {
+        remove_stale_caches(lang, &path);
     }
     Ok(module)
 }

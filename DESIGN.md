@@ -914,6 +914,28 @@ are generalisations:
   Pack time includes the pack's own work in Rust (string conversion in the bridge), which
   is part of crossing the boundary but can't be separated without timing inside each pack.
 
+**Shared compiled-runtime cache** (`page_document::load_or_compile`, `code_key`).
+- **What existed:** the JS and Python interpreters' compiled code was already cached on disk
+  (`<cache dir>/<prefix>-engine-<hash>.cwasm`, keyed by the `.wasm` and wasmtime's
+  `precompile_compatibility_hash`, written with `write_atomic`, older builds deleted). That
+  logic moved into `page_document.rs` (where the engine is) so Dart can use it; behaviour
+  for the interpreters is unchanged.
+- **New: Dart page programs** are cached too (`dart_pack::compiled`), as
+  `<profile>/compiled-dart/<key>.cwasm`, key = wasm bytes + compatibility hash + the page's
+  origin. Reloads (including hot reload), other tabs and later runs of the same site skip
+  Cranelift. At most 32 are kept per profile, newest first.
+- **Decided: Dart's cache is partitioned by site and profile; the interpreters' isn't.** Every
+  browser has the same interpreters, so a hit on them reveals nothing. A Dart program is
+  the site's own: a cached one starts measurably faster, and a page can time that (it can
+  start an image request from `main` and the server can measure the gap), which would let a
+  site learn whether this machine ran another site's program, or ran it in another
+  profile. Keying by origin and keeping it in the profile folder closes that, at the cost of
+  compiling the same bytes again for another site or profile.
+- **Never shared:** stores, instances, memories, `Objects`, callbacks: each page gets its own
+  (`each_page_gets_a_fresh_instance`). Only immutable compiled code is reused.
+- The dev-mode Dart compile cache (`dart-dev/`) is unchanged; its http part still sits in the
+  shared cache folder (see "Phase C notes").
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).

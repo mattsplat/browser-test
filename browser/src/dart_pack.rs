@@ -54,13 +54,12 @@ struct State {
 }
 
 impl DartRuntime {
-    /// Compile and instantiate a Dart program. Does not run `main`.
-    pub fn load(wasm: &[u8], host: Box<dyn Host>) -> Result<Self> {
+    /// Instantiate a Dart program (`module` is `wasm`, compiled). Does not run `main`.
+    pub fn load(wasm: &[u8], module: &Module, host: Box<dyn Host>) -> Result<Self> {
         let table = read_import_table(&embedded_import_table(wasm)?)?;
         // A broken map only costs readable stack traces, so don't fail the page over it.
         let source_map = custom_section(wasm, "dart2wasm-sourcemap")?
             .and_then(|json| SourceMap::parse(&String::from_utf8_lossy(json)).inspect_err(|e| tracing::warn!("{e:#}")).ok());
-        let module = Module::new(engine(), wasm)?;
         let state = State { host, callbacks: Vec::new(), microtasks: Default::default(), source_map, describe_error: None, limits: memory_limits() };
         let mut store = Store::new(engine(), state);
         store.limiter(|state| &mut state.limits);
@@ -267,14 +266,51 @@ impl DartRuntime {
 /// Load a Dart program against the page `doc` and run its `main`. An error out of `main`
 /// fails the start: the loader traces it and shows it in place of the page.
 pub fn start(doc: blitz_dom::BaseDocument, wasm: &[u8]) -> Result<PackDocument> {
+    let origin = crate::settings::origin_of(doc.url());
+    let module = compiled(wasm, &origin, crate::profile::dir())?;
     let (host, startup) = PackDocument::starting(doc, "dart");
-    let mut runtime = DartRuntime::load(wasm, Box::new(host))?;
+    let mut runtime = DartRuntime::load(wasm, &module, Box::new(host))?;
     if let Err(e) = runtime.run_main() {
         // A snapshot keeps the page's state from just before.
         startup.snapshot("main", String::new(), &e);
         return Err(e);
     }
     Ok(startup.finish(Box::new(runtime)))
+}
+
+/// Compiled Dart programs kept per profile, at most this many (the oldest go first).
+const KEEP_COMPILED: usize = 32;
+
+/// A page's Dart program, compiled. Compiled code is cached on disk like the interpreters'
+/// (`<profile>/compiled-dart/<key>.cwasm`, keyed by the wasm, wasmtime's compatibility hash
+/// and the page's origin), so reloads, other tabs and later runs of the same site skip
+/// compiling. Unlike the interpreters', it's partitioned by site and kept in the profile: a
+/// cache hit loads measurably faster, and a site could time it to learn whether this
+/// machine ran some other site's program, or ran it in another profile. Only compiled code
+/// is shared; every page still gets its own instance and store. With no profile folder
+/// (tests), nothing is saved.
+fn compiled(wasm: &[u8], origin: &str, profile: Option<&std::path::Path>) -> Result<Module> {
+    let dir = profile.map(|p| p.join("compiled-dart"));
+    let path = dir.as_ref().map(|d| d.join(format!("{:016x}.cwasm", crate::page_document::code_key(wasm, origin))));
+    let (module, fresh) = crate::page_document::load_or_compile(wasm, path.as_deref(), "Dart program")?;
+    if let (true, Some(dir)) = (fresh, &dir) {
+        prune_compiled(dir, KEEP_COMPILED);
+    }
+    Ok(module)
+}
+
+/// Keep the `keep` most recently written compiled programs in `dir`.
+fn prune_compiled(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "cwasm"))
+        .filter_map(|e| Some((e.metadata().and_then(|m| m.modified()).ok()?, e.path())))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 impl PackRuntime for DartRuntime {
@@ -841,6 +877,33 @@ fn to_radix(mut n: i64, radix: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A site's compiled program is saved once and loaded after; another site gets its own
+    /// entry, never the first one's; old entries are pruned.
+    #[test]
+    fn compiled_programs_are_cached_per_site_and_pruned() {
+        let wasm = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/throws.wasm")).unwrap();
+        let profile = std::env::temp_dir().join(format!("dart-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&profile);
+        let dir = profile.join("compiled-dart");
+        let files = || {
+            let mut f: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| (e.file_name(), e.metadata().unwrap().modified().unwrap())).collect();
+            f.sort();
+            f
+        };
+        compiled(&wasm, "https://a.test", Some(&profile)).unwrap();
+        let first = files();
+        assert_eq!(first.len(), 1);
+        let again = compiled(&wasm, "https://a.test", Some(&profile)).unwrap();
+        assert_eq!(files(), first, "loaded, not compiled and written again");
+        assert!(again.imports().len() > 0, "a usable module");
+        // Another site's key differs, so it can never hit this entry.
+        assert_ne!(crate::page_document::code_key(&wasm, "https://a.test"), crate::page_document::code_key(&wasm, "https://b.test"));
+        std::fs::write(dir.join("another.cwasm"), "x").unwrap();
+        prune_compiled(&dir, 1);
+        assert_eq!(files().len(), 1);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
 
     #[test]
     fn wasm_without_embedded_table_is_rejected_with_a_hint() {

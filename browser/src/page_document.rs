@@ -88,6 +88,41 @@ pub(crate) fn memory_limits() -> wasmtime::StoreLimits {
     wasmtime::StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build()
 }
 
+/// A key for compiled code: a hash of the Wasm's bytes, wasmtime's version and configuration
+/// (`precompile_compatibility_hash`), and `partition` (empty for code anyone may share).
+pub(crate) fn code_key(wasm: &[u8], partition: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    wasm.hash(&mut hasher);
+    engine().precompile_compatibility_hash().hash(&mut hasher);
+    partition.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compiled code for `wasm`: loaded from `path` if it's there and loads, otherwise compiled
+/// and saved there. Returns whether it was compiled now. Other processes (profiles) may have
+/// the file memory-mapped, so it's only ever replaced whole (`write_atomic`).
+pub(crate) fn load_or_compile(wasm: &[u8], path: Option<&std::path::Path>, what: &str) -> Result<(wasmtime::Module, bool)> {
+    if let Some(path) = path.filter(|p| p.exists()) {
+        // Safety: the file was written by `Module::serialize` below, into our own cache, and
+        // its name carries the engine's compatibility hash.
+        match unsafe { wasmtime::Module::deserialize_file(engine(), path) } {
+            Ok(module) => return Ok((module, false)),
+            Err(e) => tracing::warn!("ignoring stale compiled {what}: {e:#}"),
+        }
+    }
+    let module = wasmtime::Module::new(engine(), wasm)?;
+    if let Some(path) = path {
+        let saved = path.parent().map(std::fs::create_dir_all).transpose().and_then(|_| {
+            module.serialize().map_err(std::io::Error::other).and_then(|bytes| crate::profile::write_atomic(path, &bytes))
+        });
+        if let Err(e) = saved {
+            tracing::warn!("could not cache the compiled {what}: {e}");
+        }
+    }
+    Ok((module, true))
+}
+
 /// Whether `err` is the time limit stopping a pack.
 pub(crate) fn interrupted(err: &wasmtime::Error) -> bool {
     err.downcast_ref::<Trap>() == Some(&Trap::Interrupt)
