@@ -210,6 +210,8 @@ pub enum Obj {
     IdbDatabase(String),
     IdbTransaction,
     IdbObjectStore { db: String, store: String, tx: Option<u32> },
+    /// A `<canvas>`'s 2D context, one per canvas; its drawing is in `Objects::canvases`.
+    Canvas2d(NodeId),
 }
 
 /// A page's IndexedDB requests and transactions, by handle.
@@ -289,6 +291,7 @@ impl Obj {
             Obj::IdbDatabase(_) => "IDBDatabase",
             Obj::IdbTransaction => "IDBTransaction",
             Obj::IdbObjectStore { .. } => "IDBObjectStore",
+            Obj::Canvas2d(_) => "CanvasRenderingContext2D",
         }
     }
 }
@@ -451,6 +454,8 @@ pub struct Objects {
     /// What the page's connections received, for the UI thread to deliver.
     pub inbox: crate::websocket::Inbox,
     pub idb: Idb,
+    /// Each canvas's 2D drawing, by canvas element (`canvas.rs`).
+    pub canvases: HashMap<NodeId, crate::canvas::Canvas>,
     /// Events for objects that aren't nodes the page caused (an IndexedDB request's
     /// `success`), by handle, to dispatch once its code returns.
     pub queued_object_events: Vec<(u32, String)>,
@@ -488,6 +493,7 @@ impl Default for Objects {
             sockets_made: 0,
             inbox: crate::websocket::Inbox { waker, ..Default::default() },
             idb: Idb::default(),
+            canvases: HashMap::new(),
             queued_object_events: Vec::new(),
         }
     }
@@ -704,6 +710,7 @@ impl Objects {
         let handle = self.add(match kind {
             "classList" => Obj::ClassList(node),
             "style" => Obj::Style(node),
+            "2d" => Obj::Canvas2d(node),
             _ => Obj::Dataset(node),
         });
         self.views.insert((node, kind), handle);
@@ -718,7 +725,8 @@ impl Objects {
             if let Some(h) = self.element_handles.remove(node) {
                 self.objects.remove(&h);
             }
-            for kind in ["classList", "style", "dataset"] {
+            self.canvases.remove(node);
+            for kind in ["classList", "style", "dataset", "2d"] {
                 if let Some(h) = self.views.remove(&(*node, kind)) {
                     self.objects.remove(&h);
                 }
@@ -1307,6 +1315,20 @@ impl PageHost {
         }
     }
 
+    fn is_canvas(&self, id: NodeId) -> bool {
+        self.doc.borrow().get_node(id).and_then(|n| n.element_data()).is_some_and(|el| &*el.name.local == "canvas")
+    }
+
+    /// A canvas's size: its drawing's, or its `width` and `height` attributes (300 × 150 by
+    /// default).
+    fn canvas_size(&self, id: NodeId) -> Option<(u32, u32)> {
+        if let Some(c) = self.objects.borrow().canvases.get(&id) {
+            return Some((c.width, c.height));
+        }
+        let size = |name: &str, default: u32| self.attr(id, name).trim().parse::<u32>().unwrap_or(default);
+        Some((size("width", 300), size("height", 150)))
+    }
+
     /// A node as the page sees it, or null.
     fn node_or_null(&mut self, node: Option<NodeId>) -> HostValue {
         match node {
@@ -1631,6 +1653,22 @@ impl PageHost {
                     _ => HostValue::str(&style_value(&declarations, &kebab(prop))),
                 }
             }
+            (Obj::Element(id), "width" | "height") if self.is_canvas(*id) => HostValue::Num(self.canvas_size(*id).map(|(w, h)| if prop == "width" { w } else { h }).unwrap_or(0) as f64),
+            (Obj::Canvas2d(id), _) => {
+                let objects = self.objects.borrow();
+                let canvas = objects.canvases.get(id).context("this canvas is no longer available")?;
+                match prop {
+                    "fillStyle" => HostValue::str(canvas.fill_style()),
+                    "strokeStyle" => HostValue::str(canvas.stroke_style()),
+                    "lineWidth" => HostValue::Num(canvas.line_width()),
+                    "font" => HostValue::str(canvas.font()),
+                    "canvas" => {
+                        drop(objects);
+                        self.objects.borrow_mut().element(*id)
+                    }
+                    _ => bail!("CanvasRenderingContext2D.{prop} is not supported yet"),
+                }
+            }
             (Obj::Window, "indexedDB") => self.objects.borrow_mut().singleton("indexedDB", Obj::IdbFactory),
             (Obj::IdbRequest | Obj::IdbTransaction, _) => {
                 let HostValue::Object(handle) = target else { bail!("not an object") };
@@ -1751,6 +1789,18 @@ impl PageHost {
     fn do_set(&mut self, target: &HostValue, prop: &str, value: &HostValue) -> Result<()> {
         let obj = self.objects.borrow().get(target)?;
         match (&obj, prop) {
+            // Setting a canvas's size clears it, as in browsers.
+            (Obj::Element(id), "width" | "height") if self.is_canvas(*id) => {
+                let (w, h) = self.canvas_size(*id).unwrap_or((300, 150));
+                let n = value.as_num().unwrap_or(f64::NAN).trunc();
+                let (w, h) = if prop == "width" { (n, h as f64) } else { (w as f64, n) };
+                let (w, h) = crate::canvas::Canvas::check_size(w, h).map_err(|e| anyhow::anyhow!(e))?;
+                self.set_attr(*id, prop, Some(&format_number(n)));
+                if let Some(canvas) = self.objects.borrow_mut().canvases.get_mut(id) {
+                    canvas.resize(w, h);
+                }
+                return Ok(());
+            }
             (Obj::Element(_), _) => {}
             (Obj::Json(_), _) => {
                 let field = self.objects.borrow().to_json(value)?;
@@ -1784,6 +1834,17 @@ impl PageHost {
                 return Ok(());
             }
             (Obj::WebSocket, "binaryType") => return Ok(()),
+            (Obj::Canvas2d(id), _) => {
+                let mut objects = self.objects.borrow_mut();
+                let canvas = objects.canvases.get_mut(id).context("this canvas is no longer available")?;
+                match prop {
+                    "fillStyle" | "strokeStyle" => canvas.set_style(prop == "fillStyle", &value.display()),
+                    "lineWidth" => canvas.set_line_width(value.as_num().unwrap_or(f64::NAN)),
+                    "font" => canvas.set_font(&value.display()),
+                    _ => bail!("CanvasRenderingContext2D.{prop} = ... is not supported yet"),
+                }
+                return Ok(());
+            }
             (Obj::Dataset(id), _) => {
                 self.set_attr(*id, &data_attribute(prop), Some(&value.display()));
                 return Ok(());
@@ -1915,6 +1976,61 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Window, "WebSocket") => self.web_socket(args)?,
+            (Obj::Element(id), "getContext") => match (self.is_canvas(*id), text(0)?.as_str()) {
+                (true, "2d") => {
+                    let (w, h) = self.canvas_size(*id).unwrap_or((300, 150));
+                    let mut objects = self.objects.borrow_mut();
+                    objects.canvases.entry(*id).or_insert_with(|| crate::canvas::Canvas::new(w, h));
+                    objects.view(*id, "2d")
+                }
+                // Other contexts (WebGL, bitmaprenderer) aren't supported: null, as browsers
+                // answer for a context they can't make.
+                _ => HostValue::Null,
+            },
+            // The pixels depend on the system's fonts (text): on the tape, as layout is.
+            (Obj::Element(id), "toDataURL") if self.is_canvas(*id) => {
+                let live = match self.objects.borrow().canvases.get(id) {
+                    Some(canvas) => canvas.to_data_url(),
+                    None => {
+                        let (w, h) = self.canvas_size(*id).unwrap_or((300, 150));
+                        crate::canvas::Canvas::new(w, h).to_data_url()
+                    }
+                };
+                HostValue::str(&self.objects.borrow_mut().tape.read_text(Read::Pixels, live))
+            }
+            (Obj::Canvas2d(id), _) => {
+                let num = |i: usize| args.get(i).and_then(HostValue::as_num).unwrap_or(f64::NAN);
+                let mut objects = self.objects.borrow_mut();
+                let canvas = objects.canvases.get_mut(id).context("this canvas is no longer available")?;
+                // Non-finite arguments are ignored, as in browsers.
+                let finite = |n: usize| (0..n).all(|i| num(i).is_finite());
+                let done = match method {
+                    "fillRect" | "strokeRect" | "clearRect" | "rect" if !finite(4) => Ok(()),
+                    "fillRect" => canvas.fill_rect(num(0), num(1), num(2), num(3)),
+                    "strokeRect" => canvas.stroke_rect(num(0), num(1), num(2), num(3)),
+                    "clearRect" => canvas.clear_rect(num(0), num(1), num(2), num(3)),
+                    "rect" => canvas.rect(num(0), num(1), num(2), num(3)),
+                    "moveTo" | "lineTo" if !finite(2) => Ok(()),
+                    "moveTo" => canvas.move_to(num(0), num(1)),
+                    "lineTo" => canvas.line_to(num(0), num(1)),
+                    "arc" if !finite(5) => Ok(()),
+                    "arc" => canvas.arc(num(0), num(1), num(2), num(3), num(4), args.get(5).is_some_and(HostValue::truthy)),
+                    "beginPath" => Ok(canvas.begin_path()),
+                    "closePath" => Ok(canvas.close_path()),
+                    "fill" => canvas.fill(),
+                    "stroke" => canvas.stroke(),
+                    "save" => Ok(canvas.save()),
+                    "restore" => Ok(canvas.restore()),
+                    "fillText" => {
+                        let words = text(0)?;
+                        let (x, y) = (num(1), num(2));
+                        if x.is_finite() && y.is_finite() { canvas.fill_text(&words, x, y) } else { Ok(()) }
+                    }
+                    _ => bail!("CanvasRenderingContext2D.{method}() is not supported yet"),
+                };
+                done.map_err(|e| anyhow::anyhow!(e))?;
+                HostValue::Undefined
+            }
             (Obj::IdbFactory, "open") => {
                 let name = text(0)?;
                 let version = args.get(1).and_then(HostValue::as_num);

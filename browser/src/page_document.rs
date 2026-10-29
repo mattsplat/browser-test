@@ -361,6 +361,39 @@ impl RunningPack {
         self.objects.borrow_mut().history_state = Some(state);
     }
 
+    /// Show what the page drew on its canvases since last time: each one's pixels become
+    /// its element's image, which Blitz paints at the canvas's place (`canvas.rs`).
+    pub(crate) fn show_canvases(&self) {
+        use blitz_dom::node::{ImageData, RasterImageData, SpecialElementData};
+        let drawn: Vec<(NodeId, u32, u32, Vec<u8>)> = self
+            .objects
+            .borrow_mut()
+            .canvases
+            .iter_mut()
+            .filter(|(_, c)| c.dirty)
+            .map(|(id, c)| {
+                c.dirty = false;
+                (*id, c.width, c.height, c.render())
+            })
+            .collect();
+        if drawn.is_empty() {
+            return;
+        }
+        let mut doc = self.doc.borrow_mut();
+        for (id, width, height, pixels) in drawn {
+            if let Some(node) = doc.get_node_mut(id) {
+                if let Some(el) = node.element_data_mut() {
+                    el.special_data = match width * height {
+                        0 => SpecialElementData::None,
+                        _ => SpecialElementData::Image(Box::new(ImageData::Raster(RasterImageData::new(width, height, Arc::new(pixels))))),
+                    };
+                }
+                node.mark_ancestors_dirty();
+            }
+        }
+        doc.shell_provider.request_redraw();
+    }
+
     /// Fire `resize` on `window` if the window changed size since last checked (Blitz has no
     /// resize callback for a document, so the event loop's poll checks).
     fn check_resize(&self) -> bool {
@@ -952,6 +985,7 @@ impl Document for PackDocument {
         let delivered = self.pack.deliver_fetches() | self.pack.deliver_sockets();
         let queued = self.pack.run_queued_events();
         let ran = self.pack.run_due_timers();
+        self.pack.show_canvases();
         self.pack.arm_timers();
         resized || delivered || queued || ran
     }
@@ -1883,6 +1917,86 @@ mod tests {
 
         let blank = js_page("<p id=out></p>", &["let r = ''; try { indexedDB.open('x'); } catch (e) { r = e.message.split(':')[0]; } document.getElementById('out').textContent = r;"]);
         assert_eq!(output(&blank), "SecurityError");
+    }
+
+    // ---- Cross-pack: Canvas 2D (`tests/fixtures/canvas.*`).
+
+    const CANVAS_OUTPUT: &[&str] = &["size:60,40,null", "style:#000000,#008000,4,14px sans-serif", "url:true"];
+
+    /// The canvas element's pixels, as Blitz will paint them.
+    fn canvas_pixels(page: &PackDocument) -> (u32, Vec<u8>) {
+        page.pack.show_canvases();
+        let doc = page.pack.doc.borrow();
+        let id = doc.query_selector("#c").unwrap().unwrap();
+        let image = doc.get_node(id).unwrap().element_data().unwrap().raster_image_data().expect("the canvas shows its pixels");
+        (image.width, image.data.data().to_vec())
+    }
+
+    /// One page drawing on a canvas (rectangles, a stroke, an arc, a closed path, a clear,
+    /// text), the same in every pack, pixel for pixel; the pixels become the canvas element's
+    /// image. A replay draws the same.
+    #[tokio::test]
+    async fn canvas_draws_the_same_in_dart_js_and_python() {
+        let wasm = compile("tests/fixtures/canvas.dart").await;
+        let html = include_str!("../tests/fixtures/canvas.html");
+        let mut drawn = Vec::new();
+        for pack in ["dart", "js", "python"] {
+            let url = format!("https://canvas-{pack}.test/");
+            replay::arm(&url);
+            let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+            let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+            let (page, program) = match pack {
+                "dart" => (crate::dart_pack::start(doc, Default::default(), &wasm).unwrap(), replay::Program::Dart(wasm.clone())),
+                "python" => {
+                    let scripts = script("canvas.py", include_str!("../tests/fixtures/canvas.py"));
+                    (crate::python_pack::start(doc, Default::default(), &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+                }
+                _ => {
+                    let scripts = script("canvas.js", include_str!("../tests/fixtures/canvas.js"));
+                    let page = crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                    (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
+                }
+            };
+            page.attach_recording(html, None, program);
+            assert_eq!(output(&page).split('|').collect::<Vec<_>>(), CANVAS_OUTPUT, "{pack}: {:?}", errors_on(&url));
+            let (width, pixels) = canvas_pixels(&page);
+            let at = |x: u32, y: u32| -> [u8; 4] { pixels[((y * width + x) * 4) as usize..][..4].try_into().unwrap() };
+            assert_eq!(width, 60);
+            assert_eq!(at(10, 5), [255, 0, 0, 255], "{pack}: fillRect");
+            assert_eq!(at(1, 1), [0, 0, 0, 0], "{pack}: clearRect");
+            assert_eq!(at(25, 7), [0, 128, 0, 255], "{pack}: strokeRect, 4 wide");
+            assert_eq!(at(30, 7), [0, 0, 0, 0], "{pack}: inside the stroke");
+            assert_eq!(at(10, 25), [0, 0, 255, 255], "{pack}: the arc");
+            assert_eq!(at(36, 24), [255, 0, 255, 255], "{pack}: the closed path");
+            assert_eq!(at(28, 31), [0, 0, 0, 0], "{pack}: outside it");
+            let text = (42..60).flat_map(|x| (0..16).map(move |y| (x, y))).any(|(x, y)| at(x, y)[3] > 0);
+            assert!(text, "{pack}: fillText drew something");
+            drawn.push(pixels.clone());
+
+            let recording = page.pack.stop_recording().unwrap();
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            assert_eq!(outcome.diverged, None, "{pack}");
+            assert_eq!(canvas_pixels(&replayed).1, pixels, "{pack}: the replay draws the same");
+        }
+        assert!(drawn.windows(2).all(|w| w[0] == w[1]), "the same pixels in every pack");
+    }
+
+    /// Blitz paints the canvas's pixels where the canvas is laid out, as the window would.
+    #[test]
+    fn blitz_paints_the_canvas() {
+        let viewport = blitz_traits::shell::Viewport::new(100, 80, 1.0, blitz_traits::shell::ColorScheme::Light);
+        let doc = HtmlDocument::from_html("<body style='margin: 0'><canvas id=c width=50 height=30></canvas>", DocumentConfig { viewport: Some(viewport), ..Default::default() }).into_inner();
+        let script = "const c = document.getElementById('c').getContext('2d'); c.fillStyle = 'red'; c.fillRect(10, 10, 20, 10);";
+        let scripts = [Script { name: "paint.js".into(), source: script.into(), module: false }];
+        let page = futures_lite_block_on(crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        page.pack.show_canvases();
+        let mut doc = page.pack.doc.borrow_mut();
+        doc.resolve(0.0);
+        let pixels = anyrender::render_to_buffer::<anyrender_vello_cpu::VelloCpuImageRenderer, _>(|scene| blitz_paint::paint_scene(scene, &mut doc, 1.0, 100, 80, 0, 0), 100, 80);
+        let at = |x: usize, y: usize| pixels[(y * 100 + x) * 4..][..4].to_vec();
+        assert_eq!(at(15, 15), [255, 0, 0, 255], "inside the drawn rectangle");
+        assert_eq!(at(5, 5)[..3], [0, 0, 0], "the rest of the canvas is transparent");
     }
 
     /// Storage over the limit throws, as `QuotaExceededError`; a page with no origin has no

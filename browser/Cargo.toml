@@ -13,8 +13,8 @@ path = "src/main.rs"
 [features]
 default = ["hybrid", "cookies", "cache", "screenshot", "apple-font-embolden", "scrollbars", "mimalloc"]
 
-screenshot = ["dep:anyrender_vello_cpu", "dep:blitz-paint", "dep:png", "dep:peniko", "dep:rfd"]
-capture = ["dep:anyrender_serialize", "dep:blitz-paint", "dep:png", "dep:peniko", "dep:rfd"]
+screenshot = ["dep:blitz-paint", "dep:rfd"]
+capture = ["dep:anyrender_serialize", "dep:blitz-paint", "dep:rfd"]
 vello = ["dioxus-native/vello"]
 hybrid = ["dioxus-native/vello-hybrid"]
 cpu = ["dioxus-native/vello-cpu-pixels"]
@@ -50,9 +50,11 @@ usvg = "0.48.1"
 nucleo = "0.5"
 anyrender = "0.14.0"
 anyrender_serialize = { version = "0.8.0", optional = true }
-anyrender_vello_cpu = { version = "0.18.0", optional = true }
-png = { version = "0.18", optional = true }
-peniko = { version = "0.6.0", optional = true }
+# Canvas 2D rasterises with these too, so they're always built (they were the screenshot
+# feature's, which is on by default).
+anyrender_vello_cpu = "0.18.0"
+png = "0.18"
+peniko = "0.6.0"
 tokio = { version = "1.42", features = ["time", "rt", "sync", "macros"] }
 mimalloc = { version = "0.1.48", optional = true }
 rfd = { version = "0.17.1", default-features = false, features = ["xdg-portal"], optional = true }
@@ -84,3 +86,5 @@ cookie = "0.18"
 # tungstenite through Dioxus's devtools, native-tls through reqwest)
 tungstenite = "0.29"
 native-tls = "0.2"
+# Canvas text (already in the dependency tree, through Blitz)
+parley = "0.12"

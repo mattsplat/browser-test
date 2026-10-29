@@ -716,6 +716,7 @@ dependencies = [
  "mimalloc",
  "native-tls",
  "nucleo",
+ "parley",
  "peniko",
  "png",
  "psl",

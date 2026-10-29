@@ -55,12 +55,14 @@ pub enum Read {
     Layout,
     /// An IndexedDB operation's outcome (JSON text): another tab may change the databases.
     Idb,
+    /// A canvas's pixels as read back (`toDataURL`): text drawn depends on the system's fonts.
+    Pixels,
 }
 
 impl Read {
     /// Whether the tape value is an index into the recording's texts.
     fn is_text(self) -> bool {
-        matches!(self, Read::Cookie | Read::Storage | Read::State | Read::Field | Read::Layout | Read::Idb)
+        matches!(self, Read::Cookie | Read::Storage | Read::State | Read::Field | Read::Layout | Read::Idb | Read::Pixels)
     }
 }
 

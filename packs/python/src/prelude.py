@@ -25,6 +25,8 @@ METHODS = {
     # `transaction` properties aren't supported, as one name can't be both.)
     'open', 'deleteDatabase', 'createObjectStore', 'deleteObjectStore', 'transaction', 'objectStore',
     'put', 'delete', 'getAll', 'count', 'clear',
+    'getContext', 'toDataURL', 'fillRect', 'strokeRect', 'clearRect', 'beginPath', 'moveTo', 'lineTo',
+    'arc', 'rect', 'closePath', 'fill', 'stroke', 'fillText', 'save', 'restore',
 }
 # Storage's methods. Kept apart because `key` is also a property (of keyboard events).
 STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}

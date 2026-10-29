@@ -13,8 +13,8 @@ CSS, Split View, hot reload with state restoration, the Handles and Profiler vie
 compiled-code cache and time-travel replay (see "Phase E notes"). Web platform parity part 1
 is done: `document.cookie`, `fetch`, `localStorage`/`sessionStorage`, `location`/`history`
 and window basics in all three packs (see "Web platform parity notes"). Part 2 adds DOM
-breadth and form events, `WebSocket` and a subset of IndexedDB (see "Web platform
-parity part 2 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+breadth and form events, `WebSocket`, a subset of IndexedDB and a basic Canvas 2D (see
+"Web platform parity part 2 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -380,7 +380,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | **Done** (part 2) | Queries, tree walking and editing, `classList`, `dataset`, `style`, `innerHTML`/`outerHTML`, `getBoundingClientRect`, `focus`/`blur`, form `value`/`checked`/`disabled`; see "Web platform parity part 2 notes" |
 | `window` and `location`: URL, navigation, `history`, viewport size | **Done** (part 1) | `location`, `history`, `innerWidth`/`innerHeight`, `devicePixelRatio`, scroll, `navigator.userAgent`/`language`, `resize`; see "Web platform parity notes" |
 | `console.*` with objects, `print` to a console view | Partly | Both packs log as text, with levels, to the Inspector's Console and the Trace panel; objects are shown by handle, not expanded |
-| Canvas, WebGL, audio, media | Missing | Large; depends on what Blitz can render |
+| Canvas, WebGL, audio, media | Partly | **Canvas 2D, a basic subset** (rectangles, paths, arcs, `fillText`, `toDataURL`), painted in the window as the canvas's image; see "Web platform parity part 2 notes". WebGL, audio and media missing |
 
 ## Phase 0 notes
 
@@ -1422,6 +1422,44 @@ fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
 - **Not supported:** indexes (`createIndex`, `index()`), cursors (`openCursor`), key
   ranges (`IDBKeyRange`), `getAllKeys`, `getKey`, `put` with a key range, and
   `indexedDB.databases()`.
+
+**Canvas 2D, a basic subset** (`browser/src/canvas.rs`; cross-pack test
+`canvas_draws_the_same_in_dart_js_and_python`, fixtures `tests/fixtures/canvas.*`, and
+`blitz_paints_the_canvas`).
+- `canvas.getContext('2d')` (one context per canvas; other kinds are `null`), `width` and
+  `height` (setting one clears the canvas), `toDataURL()` (PNG); the context's `fillStyle`
+  and `strokeStyle` (CSS colours, read back as `#rrggbb` or `rgba(...)`), `lineWidth`,
+  `font` (only its `<n>px` size is used), `fillRect`, `strokeRect`, `clearRect`,
+  `beginPath`, `moveTo`, `lineTo`, `rect`, `arc` (either direction), `closePath`, `fill`,
+  `stroke`, `fillText` and `save`/`restore` of those settings, and `canvas`.
+- **How it's drawn:** the context keeps the page's drawing commands; after the page's code
+  returns (`RunningPack::show_canvases`, from `poll`), each canvas drawn on is rasterised on
+  the CPU with vello_cpu (through anyrender, as Blitz's screenshots are: both already in the
+  tree) and the pixels become the canvas element's raster image. **No fork change:** Blitz
+  paints any element's raster image data, and lays a canvas out at its `width` × `height`
+  whether or not it has one (`blitz_paints_the_canvas` renders the document with
+  blitz-paint and checks the pixels land in the window). Its custom paint sources (`<canvas
+  src=id>`) were the other route; they need a paint source registered with the window
+  renderer, which the page document can't reach. **Tradeoff:** every frame a canvas changes
+  is re-rendered from its commands on the CPU and handed to the window renderer as a new
+  image, which is fine for small canvases and simple animations but not fast; clearing the
+  whole canvas drops the commands before it, so a clear-and-redraw animation stays short.
+- `fillText` shapes with parley (Blitz's text engine) in the system's sans-serif and draws
+  the glyphs with vello_cpu; `textAlign`, `textBaseline` (it's "alphabetic") and
+  `measureText` aren't supported.
+- **The same in every pack:** the test compares the pixel buffers of the three packs (equal)
+  and checks pixels for each shape. A replay draws the same (it re-runs the same calls);
+  `toDataURL`'s result is on the tape (`Read::Pixels`), since text depends on the system's
+  fonts.
+- **Bounded:** a canvas is at most 16,384 pixels a side and 16 million pixels; it keeps at
+  most a million commands (and a path a million elements); past that a call throws.
+- **Not supported:** transforms (`translate`, `rotate`, `scale`, `setTransform`),
+  gradients and patterns, `globalAlpha` and compositing modes, line caps, joins and dashes,
+  `strokeText`, curves (`quadraticCurveTo`, `bezierCurveTo`, `arcTo`, `ellipse`), clipping,
+  `drawImage`, `getImageData`/`putImageData`, `toBlob`, `OffscreenCanvas` and WebGL. The
+  pixels `toDataURL` encodes aren't premultiplied; translucent colours aren't checked
+  against browsers' exact values.
+- **AI:** drawing calls aren't hidden: what a page draws is its output, like its DOM.
 _object`),
   which IndexedDB uses too.
 

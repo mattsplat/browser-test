@@ -57,6 +57,7 @@ mod source_map;
 mod trace_panel;
 mod browser_history;
 mod command_palette;
+mod canvas;
 #[cfg(any(feature = "screenshot", feature = "capture"))]
 mod capture;
 mod document_loader;
