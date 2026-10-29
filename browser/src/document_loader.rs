@@ -47,6 +47,8 @@ pub struct LoadedDocument {
     // True for synthesized error/404 pages. Callers use this to gate side
     // effects that should only fire on real loads (e.g. recording history).
     pub is_error: bool,
+    /// Where the page came from, after any redirects; None for the browser's error pages.
+    pub url: Option<Url>,
 }
 
 pub struct DocumentLoader {
@@ -191,6 +193,7 @@ impl DocumentLoader {
                     title: parsed_title,
                     favicon_candidate,
                     is_error,
+                    url: Url::parse(&base_url).ok(),
                 }
             }
             Err(err) => {
@@ -220,6 +223,7 @@ impl DocumentLoader {
                     title: parsed_title,
                     favicon_candidate: None,
                     is_error: true,
+                    url: None,
                 }
             }
         }

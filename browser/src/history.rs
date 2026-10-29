@@ -138,6 +138,9 @@ pub trait HistoryNav {
     fn navigate(&self, req: Request);
     fn current_doc(&self) -> u64;
     fn current_state(&self) -> Option<String>;
+    /// The current entry's page came from `url` (a redirect): the entry takes it, keeping
+    /// its document and state, so nothing reloads.
+    fn redirected_to(&self, url: Url);
 }
 
 impl HistoryNav for SyncStore<History> {
@@ -171,6 +174,14 @@ impl HistoryNav for SyncStore<History> {
 
     fn current_state(&self) -> Option<String> {
         HistoryStoreImplExt::current_state(self)
+    }
+
+    fn redirected_to(&self, url: Url) {
+        let mut req = self.current_url().peek().clone();
+        if req.url != url {
+            req.url = url;
+            HistoryStoreImplExt::replace(self, req, true, HistoryStoreImplExt::current_state(self));
+        }
     }
 }
 

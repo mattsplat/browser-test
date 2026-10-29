@@ -151,6 +151,11 @@ fn commit_loaded_document<Lens>(
 ) where
     Lens: Writable<Target = Tab> + Copy + 'static,
 {
+    // After a redirect the tab shows where the page came from, as browsers do, so its URL,
+    // history and site settings (AI control's grant) match the page that runs.
+    if let Some(url) = loaded.url.clone() {
+        tab.nav_history().redirected_to(url);
+    }
     let page_url = tab.nav_history().current_url().read().url.clone();
     let candidate = loaded.favicon_candidate.clone();
 
