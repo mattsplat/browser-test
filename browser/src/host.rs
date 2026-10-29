@@ -178,6 +178,7 @@ pub enum Obj {
     Storage(bool),
     Location,
     History,
+    Navigator,
 }
 
 impl Obj {
@@ -197,9 +198,14 @@ impl Obj {
             Obj::Storage(_) => "Storage",
             Obj::Location => "Location",
             Obj::History => "History",
+            Obj::Navigator => "Navigator",
         }
     }
 }
+
+/// `navigator.language`. Fixed rather than the system's, so pages can't use it to tell
+/// machines apart beyond what the User-Agent already says.
+const LANGUAGE: &str = "en-US";
 
 /// What a page reaches beyond its own document. The loader gives each page its tab's; tests
 /// and replays use the default, which has no network.
@@ -887,6 +893,24 @@ impl PageHost {
             (Obj::Window, "document") => self.objects.borrow_mut().singleton("document", Obj::Document),
             (Obj::Window, "console") => self.objects.borrow_mut().singleton("console", Obj::Console),
             (Obj::Window | Obj::Document, "location") => self.objects.borrow_mut().singleton("location", Obj::Location),
+            (Obj::Window, "innerWidth" | "innerHeight" | "devicePixelRatio" | "scrollX" | "scrollY" | "pageXOffset" | "pageYOffset") => {
+                // The window can change size and scroll at any time: on the tape.
+                let doc = self.doc.borrow();
+                let (width, height) = doc.viewport().logical_size();
+                let scroll = doc.viewport_scroll();
+                let live = match prop {
+                    "innerWidth" => width.round() as f64,
+                    "innerHeight" => height.round() as f64,
+                    "devicePixelRatio" => doc.viewport().scale_f64(),
+                    "scrollX" | "pageXOffset" => scroll.x,
+                    _ => scroll.y,
+                };
+                drop(doc);
+                HostValue::Num(f64::from_bits(self.objects.borrow_mut().tape.read(Read::Viewport, live.to_bits())))
+            }
+            (Obj::Window, "navigator") => self.objects.borrow_mut().singleton("navigator", Obj::Navigator),
+            (Obj::Navigator, "userAgent") => HostValue::str(blitz_net::USER_AGENT),
+            (Obj::Navigator, "language") => HostValue::str(LANGUAGE),
             (Obj::Window, "history") => self.objects.borrow_mut().singleton("history", Obj::History),
             (Obj::Location, _) => {
                 let url = self.doc.borrow().url().clone();
@@ -1124,6 +1148,25 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Window, "fetch") => self.fetch(args)?,
+            (Obj::Window, "scrollTo" | "scroll" | "scrollBy") => {
+                // scrollTo(x, y) or scrollTo({left, top}); scrollBy is relative.
+                let current = self.doc.borrow().viewport_scroll();
+                let options = match args.first() {
+                    Some(v @ HostValue::Object(_)) => self.objects.borrow().to_json(v)?,
+                    _ => None,
+                };
+                let (x, y) = match &options {
+                    Some(o) => (o.get("left").and_then(|v| v.as_f64()), o.get("top").and_then(|v| v.as_f64())),
+                    None => (args.first().and_then(|v| v.as_num()), args.get(1).and_then(|v| v.as_num())),
+                };
+                let (x, y) = match method {
+                    "scrollBy" => (current.x + x.unwrap_or(0.0), current.y + y.unwrap_or(0.0)),
+                    _ => (x.unwrap_or(current.x), y.unwrap_or(current.y)),
+                };
+                let clean = |v: f64| if v.is_finite() { v.max(0.0) } else { 0.0 };
+                self.doc.borrow_mut().set_viewport_scroll(blitz_dom::Point { x: clean(x), y: clean(y) });
+                HostValue::Undefined
+            }
             (Obj::Location, "assign" | "replace") => {
                 self.go_to(&text(0)?, method == "replace")?;
                 HostValue::Undefined

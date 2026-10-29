@@ -45,6 +45,8 @@ pub enum Read {
     Storage,
     /// What the page read from its tab: `history.state` and `history.length` (text).
     State,
+    /// The window's size, pixel ratio or scroll position (`innerWidth`, `scrollY`...).
+    Viewport,
 }
 
 impl Read {

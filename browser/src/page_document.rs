@@ -181,6 +181,8 @@ pub struct RunningPack {
     timer_thread: RefCell<Option<Sender<Instant>>>,
     /// How many times each callback has been called, for the Inspector's Handles view.
     fires: RefCell<HashMap<usize, u64>>,
+    /// The window size last seen, to notice a resize.
+    window_size: Cell<(u32, u32)>,
 }
 
 /// What a page's pack holds, as the Inspector's Handles view shows it.
@@ -355,6 +357,18 @@ impl RunningPack {
             self.doc.borrow_mut().set_base_url(url);
         }
         self.objects.borrow_mut().history_state = Some(state);
+    }
+
+    /// Fire `resize` on `window` if the window changed size since last checked (Blitz has no
+    /// resize callback for a document, so the event loop's poll checks).
+    fn check_resize(&self) -> bool {
+        let size = self.doc.borrow().viewport().window_size;
+        if size == self.window_size.replace(size) {
+            return false;
+        }
+        let root = [self.doc.borrow().root_node().id];
+        self.dispatch(&root, "resize", EventDetails::default());
+        true
     }
 
     /// Dispatch the events the page's own code queued for `window` (`hashchange` after it set
@@ -573,6 +587,7 @@ impl Startup {
         let micros = (running.as_micros() as u64).saturating_sub(self.objects.borrow().host_micros.get());
         host::record(TraceEntry { pack: self.name, kind: TraceKind::Pack, page: self.page.clone(), call: "start".into(), args: String::new(), result: String::new(), micros });
         let waker = self.objects.borrow().waker.clone();
+        let window_size = self.doc.borrow().viewport().window_size;
         let pack = RunningPack {
             name: self.name,
             page: self.page,
@@ -584,6 +599,7 @@ impl Startup {
             waker,
             timer_thread: Default::default(),
             fires: Default::default(),
+            window_size: Cell::new(window_size),
         };
         PackDocument { pack: Rc::new(pack) }
     }
@@ -781,11 +797,12 @@ impl Document for PackDocument {
                 *waker = Some(cx.waker().clone());
             }
         }
+        let resized = self.pack.check_resize();
         let delivered = self.pack.deliver_fetches();
         let queued = self.pack.run_queued_events();
         let ran = self.pack.run_due_timers();
         self.pack.arm_timers();
-        delivered || queued || ran
+        resized || delivered || queued || ran
     }
 }
 
@@ -1192,6 +1209,9 @@ mod tests {
         "location:http:,/app/page.html,,,true",
         "push:/app/two,?x=1,2,2",
         "replace:/app/two?x=1#h,three,2",
+        "window:400,300,2,0,60,true,en-US",
+        // The test resizes the window after the scripts run; then the queued events go.
+        "resize:500",
         "popstate:#next,null",
         "hashchange:true",
         "fetch:200,true,application/json,null",
@@ -1256,7 +1276,8 @@ mod tests {
             crate::cookies::jar().set_cookies(&mut [server].iter(), &url);
 
             replay::arm(url.as_str());
-            let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.to_string()), ..Default::default() }).into_inner();
+            let viewport = blitz_traits::shell::Viewport::new(800, 600, 2.0, blitz_traits::shell::ColorScheme::Light);
+            let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.to_string()), viewport: Some(viewport), ..Default::default() }).into_inner();
             let nav = Rc::new(TestNav { entries: RefCell::new(vec![(url.to_string(), None)]), asked: Default::default() });
             let env = PageEnv { gate: Some(gate.clone()), nav: Some(nav.clone()), ..Default::default() };
             let mut page = match pack {
@@ -1265,6 +1286,9 @@ mod tests {
                 _ => crate::js_pack::start(doc, env, &script("web_api.js", include_str!("../tests/fixtures/web_api.js")), |_| async { anyhow::bail!("no imports") }).await.unwrap(),
             };
             page.attach_recording(&html, None, web_api_program(pack, &wasm));
+            // The window grows (before the network answers): the page gets `resize`.
+            page.pack.doc.borrow_mut().set_viewport(blitz_traits::shell::Viewport::new(1000, 600, 2.0, blitz_traits::shell::ColorScheme::Light));
+            page.pack.check_resize();
             settle_network(&mut page).await;
             assert_eq!(output(&page).split('|').collect::<Vec<_>>(), WEB_API_OUTPUT, "{pack}: {:?}", errors_on(url.as_str()));
             assert_eq!(*nav.asked.borrow(), ["go -1".to_string(), format!("{base}elsewhere")].map(|s| if s.starts_with("go") { s } else { format!("navigate {s}") }), "{pack}");

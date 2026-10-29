@@ -19,6 +19,7 @@
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
     'fetch', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
+    'scrollTo', 'scroll', 'scrollBy',
   ]);
   // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
   const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
@@ -126,6 +127,13 @@
   // The network, through the page's gate.
   globalThis.fetch = (input, init) => window.fetch(String(input), init);
   globalThis.location = window.location;
+  globalThis.navigator = window.navigator;
+  // The window's size and scroll, read from the host each time.
+  for (const name of ['innerWidth', 'innerHeight', 'devicePixelRatio', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset']) {
+    Object.defineProperty(globalThis, name, { get: () => window[name], configurable: true });
+  }
+  globalThis.scrollTo = (...args) => window.scrollTo(...args);
+  globalThis.scrollBy = (...args) => window.scrollBy(...args);
   globalThis.history = window.history;
   globalThis.localStorage = window.localStorage;
   globalThis.sessionStorage = window.sessionStorage;

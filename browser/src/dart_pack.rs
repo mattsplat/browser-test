@@ -459,7 +459,8 @@ enum Helper {
     /// `(p, s, f) => p.then(s, (e) => f(e, e === undefined))`: `JSPromise.toDart`. Dart's
     /// rejection handler takes a second argument, whether the reason was undefined.
     PromiseThen,
-    /// `(x0,x1) => ({a: x0,b: x1})`, or `() => ({})`: an object literal with these fields.
+    /// `(x0,x1) => ({a: x0,b: x1})`, `x0 => ({top: x0})` or `() => ({})`: an object literal
+    /// with these fields.
     ObjectLiteral(Vec<String>),
     /// `(o, p, v) => o[p] = v`
     SetIndex,
@@ -489,7 +490,7 @@ fn classify(body: &str) -> Helper {
         }
     }
     static LITERAL: OnceLock<Regex> = OnceLock::new();
-    let literal = LITERAL.get_or_init(|| Regex::new(r"^\((?:x\d+(?:,x\d+)*)?\) => \(\{(.*)\}\)$").unwrap());
+    let literal = LITERAL.get_or_init(|| Regex::new(r"^(?:\((?:x\d+(?:,x\d+)*)?\)|x\d+) => \(\{(.*)\}\)$").unwrap());
     if let Some(c) = literal.captures(b) {
         let names = c[1].split(',').filter_map(|f| f.split_once(':')).map(|(name, _)| name.trim().to_string()).collect();
         return Helper::ObjectLiteral(names);

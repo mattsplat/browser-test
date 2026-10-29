@@ -10,7 +10,9 @@ per-site policy screen. Phase A is done, Phase B is done apart from breakpoints 
 from bookmarks (see "Phase C notes"). Phase D is done: the pack contract is written down in
 `docs/packs.md` and Python is a third pack (see "Phase D notes"). Phase E is done: per-site
 CSS, Split View, hot reload with state restoration, the Handles and Profiler views, a Dart
-compiled-code cache and time-travel replay (see "Phase E notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+compiled-code cache and time-travel replay (see "Phase E notes"). Web platform parity part 1
+is done: `document.cookie`, `fetch`, `localStorage`/`sessionStorage`, `location`/`history`
+and window basics in all three packs (see "Web platform parity notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -369,12 +371,12 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 | Capability | Status | Notes |
 |---|---|---|
 | `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
-| Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | Missing | Needs the event loop to wake the pack; time comes from the host (principle 4) |
+| Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | **Done** | Phase A: host-owned timers, woken by the event loop |
 | Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). `XMLHttpRequest` and `WebSocket` deferred |
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | Partly | **`localStorage` and `sessionStorage` done** (`storage.rs`; see "Web platform parity notes"). IndexedDB deferred |
-| Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
+| Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners, details, `preventDefault`, propagation, `popstate`/`hashchange`/`resize` work; form events and `value` don't |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
-| `window` and `location`: URL, navigation, `history`, viewport size | Partly | **`location` and `history` done** (see "Web platform parity notes"); window basics below |
+| `window` and `location`: URL, navigation, `history`, viewport size | **Done** (part 1) | `location`, `history`, `innerWidth`/`innerHeight`, `devicePixelRatio`, scroll, `navigator.userAgent`/`language`, `resize`; see "Web platform parity notes" |
 | `console.*` with objects, `print` to a console view | Partly | Both packs log as text, with levels, to the Inspector's Console and the Trace panel; objects are shown by handle, not expanded |
 | Canvas, WebGL, audio, media | Missing | Large; depends on what Blitz can render |
 
@@ -1164,6 +1166,29 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   and `URL`/`URLSearchParams` aren't there; a global assignment `location = "..."` in JS or
   Python rebinds the name instead of navigating (use `location.href`); Blitz doesn't scroll
   to a fragment's target.
+
+**Window basics.**
+- `innerWidth`/`innerHeight` (the viewport in CSS pixels, from Blitz's `Viewport`),
+  `devicePixelRatio` (its scale: hidpi times zoom), `scrollX`/`scrollY` (and
+  `pageXOffset`/`pageYOffset`), `scrollTo`/`scroll`/`scrollBy` with `(x, y)` or `{left, top}`
+  (clamped at 0; Blitz clamps to the content when it lays out). All reads are on the tape.
+- `navigator.userAgent` is blitz-net's `USER_AGENT`, the one every request sends;
+  `navigator.language` is a fixed `en-US`, so it adds nothing to fingerprinting.
+- **`resize`:** Blitz has no resize callback for a sub-document, so the page's `poll` compares
+  the viewport size with the last one it saw and dispatches `resize` on `window` when it
+  changed. Polls follow redraws, so a resize arrives with the next frame.
+- JS gets `innerWidth` etc., `navigator`, `scrollTo` and `scrollBy` as globals too; Python
+  reads them from `window` (it has no global getters), plus `navigator`.
+
+**Cross-cutting decisions:**
+- **`PageEnv`** is the one explicit hand-off of what a page reaches beyond its DOM (gate, the
+  tab's session storage and history), passed to each pack's `start` rather than through
+  globals, so tests and replays visibly get none.
+- **Events the host causes** for `window` are dispatched from `poll` (queued, a resize, a
+  traversal), through the same `dispatch` as input, so they're recorded and paused alike.
+- **Prelude method lists** remain hand-kept (`METHODS` in both preludes), now with
+  `STORAGE_METHODS` for the one name clash (`key`). A per-interface table generated from the
+  host would remove that upkeep; three packs share it today, so it waits.
 
 ## Known local setup notes
 

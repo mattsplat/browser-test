@@ -37,6 +37,13 @@ location.hash = 'next';
 history.back();
 location.assign('/elsewhere');
 
+// Window basics: size, pixel ratio, scrolling, navigator. (The test's window is 800×600
+// physical pixels at 2×.)
+window.scrollTo(0, 50);
+window.scrollBy({ top: 10 });
+add(`window:${window.innerWidth},${window.innerHeight},${window.devicePixelRatio},${window.scrollX},${window.scrollY},${navigator.userAgent.startsWith('Mozilla/5.0')},${navigator.language}`);
+window.addEventListener('resize', () => add(`resize:${window.innerWidth}`));
+
 // fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect, a
 // blocked third party, and cross-origin reads that CORS allows (without cookies) or refuses.
 const cross = out.getAttribute('data-cross');

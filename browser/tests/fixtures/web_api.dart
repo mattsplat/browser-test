@@ -44,6 +44,13 @@ Future<void> main() async {
   hist.back();
   loc.assign('/elsewhere');
 
+  // Window basics: size, pixel ratio, scrolling, navigator. (The test's window is 800×600
+  // physical pixels at 2×.)
+  window.scrollTo(0.toJS, 50);
+  window.scrollBy(ScrollToOptions(top: 10));
+  add('window:${window.innerWidth},${window.innerHeight},${window.devicePixelRatio.toInt()},${window.scrollX.toInt()},${window.scrollY.toInt()},${window.navigator.userAgent.startsWith('Mozilla/5.0')},${window.navigator.language}');
+  window.addEventListener('resize', ((Event e) => add('resize:${window.innerWidth}')).toJS);
+
   // fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect,
   // a blocked third party, and cross-origin reads that CORS allows (without cookies) or
   // refuses.

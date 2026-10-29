@@ -185,8 +185,12 @@ not read time or randomness any other way.
   Python `HostObject` with `__getattr__`/`__setattr__`.
   - The prelude's `METHODS` list says which member names are methods (called), as opposed
     to properties (read). Keep it in step with `host.rs`.
+  - Storage objects have their own list (`STORAGE_METHODS`), since `key` is a Storage
+    method but a keyboard event property.
   - The prelude also defines the globals: `window`, `document`, `console`, the timer
-    functions, `Math.random` for JS and `Math` for Python.
+    functions, `fetch`, `localStorage`, `sessionStorage`, `location`, `history`,
+    `navigator`, `Math.random` for JS and `Math` for Python (JS also gets the window's size
+    and scroll getters, `scrollTo` and `scrollBy`).
 
 ## Callbacks and their lifetimes
 
@@ -372,8 +376,9 @@ packed JSON reply.
   - `sys.setrecursionlimit` is capped at 3,000. Deeper recursion would overflow the Wasm
     stack (about 5,000 simple frames fit), which crashes the pack. The default stays 1,000.
   - The globals are `window`, `document`, `console`, `Math`, `setTimeout`, `setInterval`,
-    `clearTimeout`, `clearInterval`, `requestAnimationFrame` and `cancelAnimationFrame`.
-    `print` goes to the console.
+    `clearTimeout`, `clearInterval`, `requestAnimationFrame`, `cancelAnimationFrame`,
+    `fetch` (callbacks: `fetch(url).then(on_value, on_error)`), `localStorage`,
+    `sessionStorage`, `location`, `history` and `navigator`. `print` goes to the console.
   - Members use Web IDL's camelCase names (`document.querySelector`, `el.textContent`).
   - Numbers from the host that are whole come back as `int`, so `e.clientX` prints `10`,
     not `10.0`.
