@@ -15,6 +15,7 @@ METHODS = {
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
     'fetch', 'then', 'text', 'json', 'get', 'has',
+    'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
 }
 # Storage's methods. Kept apart because `key` is also a property (of keyboard events).
 STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}
@@ -134,6 +135,8 @@ window = request({'op': 'global', 'name': 'window'})
 document = request({'op': 'global', 'name': 'document'})
 console = request({'op': 'global', 'name': 'console'})
 Math = request({'op': 'global', 'name': 'Math'})
+location = window.location
+history = window.history
 localStorage = window.localStorage
 sessionStorage = window.sessionStorage
 
@@ -194,7 +197,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}

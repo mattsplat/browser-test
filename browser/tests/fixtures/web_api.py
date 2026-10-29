@@ -35,6 +35,19 @@ localStorage.removeItem('k')
 sessionStorage.setItem('s', 'tab')
 add(f"storage:{localStorage.length},{localStorage.key(0)},{sessionStorage.getItem('s')},{sessionStorage.length}")
 
+# Location and history: pushState and replaceState change the URL without a load; a new
+# fragment queues popstate and hashchange; back and other navigations go to the tab.
+add(f'location:{location.protocol},{location.pathname},{location.search},{location.hash},{js(location.href == location.origin + location.pathname)}')
+window.addEventListener('popstate', lambda e: add(f'popstate:{location.hash},{js(e.state)}'))
+window.addEventListener('hashchange', lambda e: add(f"hashchange:{js(e.newURL.endswith('#next'))}"))
+history.pushState({'page': 2}, '', 'two?x=1')
+add(f'push:{location.pathname},{location.search},{history.state.page},{history.length}')
+history.replaceState('three', '', '#h')
+add(f'replace:{location.pathname}{location.search}{location.hash},{history.state},{history.length}')
+location.hash = 'next'
+history.back()
+location.assign('/elsewhere')
+
 # fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect, a
 # blocked third party, and cross-origin reads that CORS allows (without cookies) or refuses.
 # Python gets callbacks: `then(on_value, on_error)`.

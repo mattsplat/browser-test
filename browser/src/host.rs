@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use crate::gate::{FetchResponse, Gate, PageFetch};
 use crate::replay::Read;
 use blitz_dom::{BaseDocument, LocalName, NodeId, QualName, ns};
+use blitz_traits::net::Url;
 use wasmtime::{AnyRef, OwnedRooted};
 
 /// A JS-like value as seen by the host. Lives inside a wasm externref.
@@ -140,6 +141,11 @@ pub struct EventDetails {
     pub ctrl_key: bool,
     pub shift_key: bool,
     pub meta_key: bool,
+    /// `popstate`'s `state`, as JSON text.
+    pub state: Option<String>,
+    /// `hashchange`'s `oldURL` and `newURL`.
+    pub old_url: Option<String>,
+    pub new_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +176,8 @@ pub enum Obj {
     Json(serde_json::Value),
     /// `localStorage` (true) or `sessionStorage` (false).
     Storage(bool),
+    Location,
+    History,
 }
 
 impl Obj {
@@ -187,6 +195,8 @@ impl Obj {
             Obj::Json(v) if v.is_array() => "Array",
             Obj::Json(_) => "Object",
             Obj::Storage(_) => "Storage",
+            Obj::Location => "Location",
+            Obj::History => "History",
         }
     }
 }
@@ -199,6 +209,24 @@ pub struct PageEnv {
     pub gate: Option<std::sync::Arc<Gate>>,
     /// The tab's `sessionStorage` (a fresh one: nothing is shared).
     pub session: crate::storage::Session,
+    /// The tab's history, for `location` and `history`; None outside a tab (navigations do
+    /// nothing).
+    pub nav: Option<Rc<dyn TabNav>>,
+}
+
+/// What a page's `location` and `history` change in its tab (`history::TabHistory`).
+pub trait TabNav {
+    /// Load `url` as a new document: a new entry, or in place of the current one.
+    fn navigate(&self, url: Url, replace: bool);
+    fn reload(&self);
+    /// A new entry, or the current one replaced, in the same document (pushState,
+    /// replaceState, a fragment), with its `history.state` as JSON text.
+    fn set_entry(&self, url: Url, state: Option<String>, replace: bool);
+    /// `history.go(delta)`: the tab moves, and tells the page if it stays in this document.
+    fn go(&self, delta: i64);
+    /// The current entry's state, and how many entries there are.
+    fn state(&self) -> Option<String>;
+    fn length(&self) -> usize;
 }
 
 /// A promise's state: its outcome once settled, and the callbacks waiting for it.
@@ -282,6 +310,12 @@ pub struct Objects {
     fetching: usize,
     /// Wakes the page's event loop: a timer is due, or a fetch finished.
     pub waker: std::sync::Arc<Mutex<Option<std::task::Waker>>>,
+    /// `history.state` for the page's current entry, as JSON text; None until first read
+    /// from the tab.
+    pub history_state: Option<Option<String>>,
+    /// Events for `window` the page caused (`hashchange` after setting `location.hash`), to
+    /// dispatch as a task once its code returns.
+    pub queued_events: Vec<(String, EventDetails)>,
 }
 
 impl Default for Objects {
@@ -303,6 +337,8 @@ impl Default for Objects {
             fetched: Default::default(),
             fetching: 0,
             waker: Default::default(),
+            history_state: None,
+            queued_events: Vec::new(),
         }
     }
 }
@@ -620,6 +656,51 @@ impl PageHost {
         Self { pack, page, doc, objects, env, rng: seed | 1 }
     }
 
+    /// `history.state`: the tab's, read once (on the tape, since it comes from the tab), then
+    /// what the page set or traversed to.
+    fn history_state(&mut self) -> Option<String> {
+        if let Some(state) = self.objects.borrow().history_state.clone() {
+            return state;
+        }
+        let live = self.env.nav.as_ref().and_then(|n| n.state());
+        let text = self.objects.borrow_mut().tape.read_text(Read::State, serde_json::to_string(&live).unwrap_or_default());
+        let state: Option<String> = serde_json::from_str(&text).unwrap_or(None);
+        self.objects.borrow_mut().history_state = Some(state.clone());
+        state
+    }
+
+    /// `location.href = target`, `location.assign` and `replace`: a fragment of this page
+    /// stays in the document (a new entry, then `popstate` and `hashchange`); anything else is
+    /// a navigation the tab loads through the gate, like a link. A replay doesn't navigate.
+    fn go_to(&mut self, target: &str, replace: bool) -> Result<()> {
+        let current = self.doc.borrow().url().clone();
+        let url = current.join(target).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {target:?} ({e})"))?;
+        if !matches!(url.scheme(), "http" | "https" | "file" | "about") {
+            bail!("{}: URLs can't be navigated to from a page", url.scheme());
+        }
+        let replaying = self.objects.borrow().tape.replaying();
+        if crate::history::same_document(&current, &url) {
+            self.doc.borrow_mut().set_base_url(url.as_str());
+            let mut objects = self.objects.borrow_mut();
+            objects.history_state = Some(None);
+            if !replaying {
+                let details = EventDetails { old_url: Some(current.to_string()), new_url: Some(url.to_string()), ..Default::default() };
+                objects.queued_events.push(("popstate".into(), EventDetails::default()));
+                objects.queued_events.push(("hashchange".into(), details));
+                if let Some(w) = objects.waker.lock().unwrap().as_ref() {
+                    w.wake_by_ref();
+                }
+            }
+            drop(objects);
+            if let (Some(nav), false) = (&self.env.nav, replaying) {
+                nav.set_entry(url, None, replace);
+            }
+        } else if let (Some(nav), false) = (&self.env.nav, replaying) {
+            nav.navigate(url, replace);
+        }
+        Ok(())
+    }
+
     /// The origin the page's storage is kept under. Pages with an opaque origin (about:blank,
     /// data:) have none; `file://` pages share one.
     fn storage_origin(&self) -> Result<String> {
@@ -790,6 +871,12 @@ impl PageHost {
             "ctrlKey" => HostValue::Bool(d.ctrl_key),
             "shiftKey" => HostValue::Bool(d.shift_key),
             "metaKey" => HostValue::Bool(d.meta_key),
+            "state" if e.kind == "popstate" => {
+                let state = d.state.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(serde_json::Value::Null);
+                self.objects.borrow_mut().from_json(state)
+            }
+            "oldURL" => HostValue::str(d.old_url.as_deref().unwrap_or_default()),
+            "newURL" => HostValue::str(d.new_url.as_deref().unwrap_or_default()),
             _ => return None,
         })
     }
@@ -799,6 +886,34 @@ impl PageHost {
         Ok(match (&obj, prop) {
             (Obj::Window, "document") => self.objects.borrow_mut().singleton("document", Obj::Document),
             (Obj::Window, "console") => self.objects.borrow_mut().singleton("console", Obj::Console),
+            (Obj::Window | Obj::Document, "location") => self.objects.borrow_mut().singleton("location", Obj::Location),
+            (Obj::Window, "history") => self.objects.borrow_mut().singleton("history", Obj::History),
+            (Obj::Location, _) => {
+                let url = self.doc.borrow().url().clone();
+                let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+                let host = url.host_str().unwrap_or_default();
+                HostValue::str(&match prop {
+                    "href" => url.to_string(),
+                    "protocol" => format!("{}:", url.scheme()),
+                    "host" => format!("{host}{port}"),
+                    "hostname" => host.to_string(),
+                    "port" => port.trim_start_matches(':').to_string(),
+                    "pathname" => url.path().to_string(),
+                    "search" => url.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
+                    "hash" => url.fragment().filter(|f| !f.is_empty()).map(|f| format!("#{f}")).unwrap_or_default(),
+                    "origin" => url.origin().ascii_serialization(),
+                    _ => bail!("Location.{prop} is not supported yet"),
+                })
+            }
+            (Obj::History, "state") => {
+                let state = self.history_state();
+                self.objects.borrow_mut().from_json(state.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::Value::Null))
+            }
+            (Obj::History, "length") => {
+                let live = self.env.nav.as_ref().map_or(1, |n| n.length());
+                let text = self.objects.borrow_mut().tape.read_text(Read::State, live.to_string());
+                HostValue::Num(text.parse().unwrap_or(1.0))
+            }
             (Obj::Window, "localStorage") => self.objects.borrow_mut().singleton("localStorage", Obj::Storage(true)),
             (Obj::Window, "sessionStorage") => self.objects.borrow_mut().singleton("sessionStorage", Obj::Storage(false)),
             (Obj::Storage(local), "length") => self.storage_read(*local, |a| a.len().into())?,
@@ -860,6 +975,15 @@ impl PageHost {
                 if let (Some(Obj::Json(serde_json::Value::Object(fields))), Some(field)) = (self.objects.borrow_mut().objects.get_mut(handle), field) {
                     fields.insert(prop.to_string(), field);
                 }
+                return Ok(());
+            }
+            (Obj::Location, "href" | "hash") | (Obj::Window | Obj::Document, "location") => {
+                let text = value.display();
+                let target = match prop {
+                    "hash" => format!("#{}", text.trim_start_matches('#')),
+                    _ => text,
+                };
+                self.go_to(&target, false)?;
                 return Ok(());
             }
             (Obj::Document, "cookie") => {
@@ -1000,6 +1124,48 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Window, "fetch") => self.fetch(args)?,
+            (Obj::Location, "assign" | "replace") => {
+                self.go_to(&text(0)?, method == "replace")?;
+                HostValue::Undefined
+            }
+            (Obj::Location, "reload") => {
+                if let (Some(nav), false) = (&self.env.nav, self.objects.borrow().tape.replaying()) {
+                    nav.reload();
+                }
+                HostValue::Undefined
+            }
+            (Obj::Location, "toString") => HostValue::str(self.doc.borrow().url().as_str()),
+            (Obj::History, "pushState" | "replaceState") => {
+                let state = match args.first() {
+                    Some(v) => self.objects.borrow().to_json(v)?.map(|v| v.to_string()),
+                    None => None,
+                };
+                let current = self.doc.borrow().url().clone();
+                let url = match args.get(2) {
+                    Some(HostValue::Undefined | HostValue::Null) | None => current.clone(),
+                    Some(v) => current.join(&v.display()).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {:?} ({e})", v.display()))?,
+                };
+                if url.origin() != current.origin() {
+                    bail!("SecurityError: {method} can't change the page's origin (to {url})");
+                }
+                self.doc.borrow_mut().set_base_url(url.as_str());
+                self.objects.borrow_mut().history_state = Some(state.clone());
+                if let (Some(nav), false) = (&self.env.nav, self.objects.borrow().tape.replaying()) {
+                    nav.set_entry(url, state, method == "replaceState");
+                }
+                HostValue::Undefined
+            }
+            (Obj::History, "back" | "forward" | "go") => {
+                let delta = match method {
+                    "back" => -1,
+                    "forward" => 1,
+                    _ => args.first().and_then(|v| v.as_num()).unwrap_or(0.0) as i64,
+                };
+                if let (Some(nav), false) = (&self.env.nav, self.objects.borrow().tape.replaying()) {
+                    nav.go(delta);
+                }
+                HostValue::Undefined
+            }
             (Obj::Storage(local), "getItem") => {
                 let key = text(0)?;
                 self.storage_read(*local, |a| a.get(&key).into())?

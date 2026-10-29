@@ -64,6 +64,8 @@ pub struct DocumentLoader {
     pub restore: RefCell<Option<(Url, crate::hot_reload::PageState)>>,
     /// The tab's `sessionStorage`, by origin: its pages share it, and it goes with the tab.
     pub session: crate::storage::Session,
+    /// The history document (`History::current_doc`) of the page last committed.
+    pub committed_doc: Cell<u64>,
 }
 
 pub fn make_doc_config(
@@ -107,7 +109,15 @@ impl DocumentLoader {
             record_next: Cell::new(false),
             restore: RefCell::new(None),
             session: Default::default(),
+            committed_doc: Cell::new(0),
         }
+    }
+
+    /// What this tab's pages reach beyond their documents (the gate is added when loading):
+    /// its session storage and its history.
+    fn page_env(&self) -> crate::host::PageEnv {
+        let nav = crate::history::TabHistory { history: self.history, reload: self.reload_generation };
+        crate::host::PageEnv { gate: None, session: self.session.clone(), nav: Some(Rc::new(nav)) }
     }
 
     pub fn reload(&self) {
@@ -167,7 +177,7 @@ impl DocumentLoader {
 
                 let record = self.record_next.replace(false);
                 let ((document, page), parsed_title, favicon_url) =
-                    build_page_document(html, config, &net_provider, &signal, record, self.session.clone()).await;
+                    build_page_document(html, config, &net_provider, &signal, record, self.page_env()).await;
                 // Armed only for this load: drop it if no pack started to take it.
                 if let (true, Ok(url)) = (record, Url::parse(&base_url)) {
                     replay::take_armed(url.as_str());
@@ -232,7 +242,7 @@ async fn build_page_document(
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
     recording: bool,
-    session: crate::storage::Session,
+    env: crate::host::PageEnv,
 ) -> ((SubDocumentAttr, Option<PageRef>), String, Option<String>) {
     let mut document = HtmlDocument::from_html(html, config).into_inner();
     // The site's own stylesheet, if the user gave it one: after the page's, before any script.
@@ -259,7 +269,7 @@ async fn build_page_document(
 
     let page_url = document.url().clone();
     // What the page's code reaches beyond its document: the network, through its gate.
-    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)), session };
+    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)), ..env };
     let Some(src) = dart_script_url(&document) else {
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");

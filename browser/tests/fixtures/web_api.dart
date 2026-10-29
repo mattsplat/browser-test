@@ -30,6 +30,20 @@ Future<void> main() async {
   session.setItem('s', 'tab');
   add('storage:${local.length},${local.key(0)},${session.getItem('s')},${session.length}');
 
+  // Location and history: pushState and replaceState change the URL without a load; a new
+  // fragment queues popstate and hashchange; back and other navigations go to the tab.
+  final loc = window.location, hist = window.history;
+  add('location:${loc.protocol},${loc.pathname},${loc.search},${loc.hash},${loc.href == loc.origin + loc.pathname}');
+  window.addEventListener('popstate', ((PopStateEvent e) => add('popstate:${loc.hash},${e.state}')).toJS);
+  window.addEventListener('hashchange', ((HashChangeEvent e) => add('hashchange:${e.newURL.endsWith('#next')}')).toJS);
+  hist.pushState({'page': 2}.jsify(), '', 'two?x=1');
+  add('push:${loc.pathname},${loc.search},${(hist.state as JSObject).getProperty('page'.toJS)},${hist.length}');
+  hist.replaceState('three'.toJS, '', '#h');
+  add('replace:${loc.pathname}${loc.search}${loc.hash},${hist.state},${hist.length}');
+  loc.hash = 'next';
+  hist.back();
+  loc.assign('/elsewhere');
+
   // fetch, through the gate: same-origin (with cookies), a POST, an error status, a redirect,
   // a blocked third party, and cross-origin reads that CORS allows (without cookies) or
   // refuses.

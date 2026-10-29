@@ -329,6 +329,48 @@ impl RunningPack {
         true
     }
 
+    /// The tab moved to another entry of this page's document (back, forward, a fragment
+    /// link): take its URL and state, then `popstate`, and `hashchange` if the fragment
+    /// changed. Nothing happens if the page is already there (it made the entry itself).
+    pub fn traverse(&self, url: &str, state: Option<String>) {
+        let old = self.doc.borrow().url().to_string();
+        let current_state = self.objects.borrow().history_state.clone();
+        if old == url && current_state.as_ref().is_none_or(|s| *s == state) {
+            return;
+        }
+        self.objects.borrow_mut().tape.step(|| replay::Step::Traverse { url: url.to_string(), state: state.clone() });
+        self.move_to(url, state.clone());
+        let root = [self.doc.borrow().root_node().id];
+        self.dispatch(&root, "popstate", EventDetails { state, ..Default::default() });
+        let fragment = |u: &str| u.split_once('#').map(|(_, f)| f.to_string());
+        if fragment(&old) != fragment(url) {
+            self.dispatch(&root, "hashchange", EventDetails { old_url: Some(old), new_url: Some(url.to_string()), ..Default::default() });
+        }
+        self.doc.borrow().shell_provider.request_redraw();
+        self.arm_timers();
+    }
+
+    fn move_to(&self, url: &str, state: Option<String>) {
+        if blitz_traits::net::Url::parse(url).is_ok() {
+            self.doc.borrow_mut().set_base_url(url);
+        }
+        self.objects.borrow_mut().history_state = Some(state);
+    }
+
+    /// Dispatch the events the page's own code queued for `window` (`hashchange` after it set
+    /// `location.hash`). Returns whether there were any.
+    fn run_queued_events(&self) -> bool {
+        if self.idle() {
+            return false;
+        }
+        let queued = std::mem::take(&mut self.objects.borrow_mut().queued_events);
+        let root = [self.doc.borrow().root_node().id];
+        for (kind, details) in &queued {
+            self.dispatch(&root, kind, details.clone());
+        }
+        !queued.is_empty()
+    }
+
     /// Settle the promises of fetches that finished (each one a recorded step), so their
     /// callbacks run with the due timers. Returns whether any did.
     fn deliver_fetches(&self) -> bool {
@@ -422,6 +464,7 @@ impl RunningPack {
                 let _ = self.eval(source, by);
             }
             replay::Step::Resume => self.paused.set(false),
+            replay::Step::Traverse { url, state } => self.move_to(url, state.clone()),
             replay::Step::Fetch { promise, result } => self.objects.borrow_mut().deliver_fetch(*promise, result.clone()),
         }
         Ok(())
@@ -739,9 +782,10 @@ impl Document for PackDocument {
             }
         }
         let delivered = self.pack.deliver_fetches();
+        let queued = self.pack.run_queued_events();
         let ran = self.pack.run_due_timers();
         self.pack.arm_timers();
-        delivered || ran
+        delivered || queued || ran
     }
 }
 
@@ -1108,12 +1152,48 @@ mod tests {
         }
     }
 
+    /// The tab's history as a page sees it, recording what the page asked of it.
+    struct TestNav {
+        entries: RefCell<Vec<(String, Option<String>)>>,
+        asked: RefCell<Vec<String>>,
+    }
+
+    impl host::TabNav for TestNav {
+        fn navigate(&self, url: blitz_traits::net::Url, replace: bool) {
+            self.asked.borrow_mut().push(format!("navigate {url}{}", if replace { " (replace)" } else { "" }));
+        }
+        fn reload(&self) {
+            self.asked.borrow_mut().push("reload".into());
+        }
+        fn set_entry(&self, url: blitz_traits::net::Url, state: Option<String>, replace: bool) {
+            let mut entries = self.entries.borrow_mut();
+            if replace {
+                entries.pop();
+            }
+            entries.push((url.to_string(), state));
+        }
+        fn go(&self, delta: i64) {
+            self.asked.borrow_mut().push(format!("go {delta}"));
+        }
+        fn state(&self) -> Option<String> {
+            self.entries.borrow().last().and_then(|(_, s)| s.clone())
+        }
+        fn length(&self) -> usize {
+            self.entries.borrow().len()
+        }
+    }
+
     /// What the web API page prints, in every pack.
     const WEB_API_OUTPUT: &[&str] = &[
         "cookie:a=1; b=2",
         "cookie:b=2",
         "storage:v,2,null,2,k",
         "storage:1,n,tab,1",
+        "location:http:,/app/page.html,,,true",
+        "push:/app/two,?x=1,2,2",
+        "replace:/app/two?x=1#h,three,2",
+        "popstate:#next,null",
+        "hashchange:true",
         "fetch:200,true,application/json,null",
         "json:web,3",
         "cookie:b=2; fromserver=1",
@@ -1140,10 +1220,12 @@ mod tests {
         let until = Instant::now() + std::time::Duration::from_secs(5);
         while Instant::now() < until {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // As `poll` does.
             page.pack.deliver_fetches();
+            page.pack.run_queued_events();
             page.pack.run_due_timers();
             let objects = page.pack.objects.borrow();
-            if !objects.fetching() && objects.next_deadline().is_none() {
+            if !objects.fetching() && objects.next_deadline().is_none() && objects.queued_events.is_empty() {
                 break;
             }
         }
@@ -1175,7 +1257,8 @@ mod tests {
 
             replay::arm(url.as_str());
             let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.to_string()), ..Default::default() }).into_inner();
-            let env = PageEnv { gate: Some(gate.clone()), ..Default::default() };
+            let nav = Rc::new(TestNav { entries: RefCell::new(vec![(url.to_string(), None)]), asked: Default::default() });
+            let env = PageEnv { gate: Some(gate.clone()), nav: Some(nav.clone()), ..Default::default() };
             let mut page = match pack {
                 "dart" => crate::dart_pack::start(doc, env, &wasm).unwrap(),
                 "python" => crate::python_pack::start(doc, env, &script("web_api.py", include_str!("../tests/fixtures/web_api.py"))).unwrap(),
@@ -1184,6 +1267,8 @@ mod tests {
             page.attach_recording(&html, None, web_api_program(pack, &wasm));
             settle_network(&mut page).await;
             assert_eq!(output(&page).split('|').collect::<Vec<_>>(), WEB_API_OUTPUT, "{pack}: {:?}", errors_on(url.as_str()));
+            assert_eq!(*nav.asked.borrow(), ["go -1".to_string(), format!("{base}elsewhere")].map(|s| if s.starts_with("go") { s } else { format!("navigate {s}") }), "{pack}");
+            assert!(nav.entries.borrow().last().unwrap().0.ends_with("/app/two?x=1#next"), "{pack}: {:?}", nav.entries.borrow());
             let recording = page.pack.stop_recording().unwrap();
             assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Cookie), "{pack}: cookie reads are on the tape");
             assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Storage), "{pack}: storage reads are on the tape");
@@ -1231,6 +1316,32 @@ mod tests {
 
         let blank = js_page("<p id=out></p>", &["let r = ''; try { localStorage.getItem('x'); } catch (e) { r = e.message.split(':')[0]; } document.querySelector('#out').textContent = r;"]);
         assert_eq!(output(&blank), "SecurityError");
+    }
+
+    /// The tab going back to another entry of the page's document gives the page that URL and
+    /// state, then `popstate` (and `hashchange` for a new fragment); a replay does the same.
+    #[tokio::test]
+    async fn moving_within_a_document_fires_popstate_and_replays() {
+        let url = "https://traverse.test/a";
+        replay::arm(url);
+        let html = "<p id=out></p>";
+        let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let scripts = vec![Script { name: "t.js".into(), source: "
+            const out = document.querySelector('#out');
+            window.addEventListener('popstate', (e) => { out.textContent += `pop:${location.pathname}${location.hash},${e.state && e.state.n};`; });
+            window.addEventListener('hashchange', () => { out.textContent += 'hash;'; });".into(), module: false }];
+        let page = crate::js_pack::start(doc, PageEnv::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+        page.attach_recording(html, None, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() });
+        page.pack.traverse("https://traverse.test/b", Some(r#"{"n":1}"#.into()));
+        page.pack.traverse("https://traverse.test/b#x", None);
+        page.pack.traverse("https://traverse.test/b#x", None);
+        assert_eq!(output(&page), "pop:/b,1;pop:/b#x,null;hash;", "the last one changed nothing");
+        let recording = page.pack.stop_recording().unwrap();
+        let config = DocumentConfig { base_url: Some(url.into()), ..Default::default() };
+        let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+        assert_eq!(outcome.diverged, None);
+        assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom);
+        assert_eq!(replayed.pack().doc.borrow().url().as_str(), "https://traverse.test/b#x");
     }
 
     // ---- Time-travel replay: record a session, replay it in a fresh pack, same DOM.

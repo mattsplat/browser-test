@@ -372,11 +372,12 @@ pub fn trace(origin: &str, privacy: Privacy, limit: usize) -> Vec<TraceEntry> {
 pub const HIDDEN: &str = "(hidden)";
 
 /// Host calls whose arguments or results carry what AI access must never see: cookie values,
-/// stored values, and request and response bodies and headers.
+/// stored values, request and response bodies and headers, and the page's full URLs and
+/// history state (AI sees URLs only redacted).
 pub fn holds_secrets(call: &str) -> bool {
     let member = call.trim_end_matches(" =");
     member == "Document.cookie"
-        || ["Storage.", "Response.", "Headers.", "Promise."].iter().any(|p| member.starts_with(p))
+        || ["Storage.", "Response.", "Headers.", "Promise.", "Location.", "History."].iter().any(|p| member.starts_with(p))
         || member == "Window.fetch"
 }
 

@@ -18,6 +18,7 @@
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
     'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
     'fetch', 'text', 'json', 'get', 'has',
+    'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
   ]);
   // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
   const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
@@ -124,6 +125,8 @@
   globalThis.cancelAnimationFrame = (handle) => window.cancelAnimationFrame(handle);
   // The network, through the page's gate.
   globalThis.fetch = (input, init) => window.fetch(String(input), init);
+  globalThis.location = window.location;
+  globalThis.history = window.history;
   globalThis.localStorage = window.localStorage;
   globalThis.sessionStorage = window.sessionStorage;
 

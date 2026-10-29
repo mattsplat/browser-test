@@ -1,22 +1,46 @@
+//! A tab's back/forward list. Each entry has a request, the document it belongs to and the
+//! page's `history.state` for it. Entries made by `history.pushState`/`replaceState` or by a
+//! fragment navigation (`#section`) share their document with the entry before them, so
+//! moving between them doesn't reload: the page gets `popstate` (and `hashchange`) instead
+//! (`TabWebView` in tab.rs). A page reaches the list through `TabHistory`, its `host::TabNav`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
-use blitz_traits::net::Request;
+use blitz_traits::net::{Method, Request, Url};
 use dioxus_native::prelude::*;
 
 pub type SyncStore<T> = Store<T, CopyValue<T, SyncStorage>>;
 
+/// Document ids: every entry that needs a load gets a new one.
+fn next_doc() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Store)]
 pub struct History {
     urls: Vec<Request>,
+    /// Each entry's document id, parallel to `urls`.
+    docs: Vec<u64>,
+    /// Each entry's `history.state`, as JSON text.
+    states: Vec<Option<String>>,
     current: usize,
 }
 
 impl History {
     pub fn new(initial_request: Request) -> Self {
-        Self {
-            urls: vec![initial_request],
-            current: 0,
-        }
+        Self { urls: vec![initial_request], docs: vec![next_doc()], states: vec![None], current: 0 }
     }
+}
+
+/// Whether going from `current` to `next` stays in the same document: the same URL apart
+/// from a fragment, which `next` has (a plain reload of the same URL loads again).
+pub fn same_document(current: &Url, next: &Url) -> bool {
+    let (mut a, mut b) = (current.clone(), next.clone());
+    a.set_fragment(None);
+    b.set_fragment(None);
+    a == b && next.fragment().is_some()
 }
 
 #[store]
@@ -45,14 +69,60 @@ impl<Lens> Store<History, Lens> {
         }
     }
 
-    pub(crate) fn navigate(&self, req: Request)
+    /// Move `delta` entries (`history.go`), if there are that many.
+    pub(crate) fn go(&mut self, delta: i64)
+    where
+        Lens: Writable,
+    {
+        let target = self.current_idx() as i64 + delta;
+        if delta != 0 && (0..self.urls().len() as i64).contains(&target) {
+            *self.current().write() = target as usize;
+        }
+    }
+
+    /// Add an entry after the current one, dropping the forward entries. It shares the current
+    /// document when only the fragment changes (a GET), or when `same_doc` says so (pushState).
+    pub(crate) fn push(&self, req: Request, same_doc: bool, state: Option<String>)
     where
         Lens: Writable,
     {
         let idx = self.current_idx();
+        let current = self.urls().get(idx).map(|r| r.read().url.clone());
+        let keep = same_doc || (req.method == Method::GET && current.is_some_and(|c| same_document(&c, &req.url)));
+        let doc = if keep { *self.docs().get(idx).unwrap().read() } else { next_doc() };
         self.urls().write().truncate(idx + 1);
+        self.docs().write().truncate(idx + 1);
+        self.states().write().truncate(idx + 1);
         self.urls().push(req);
+        self.docs().push(doc);
+        self.states().push(state);
         *self.current().write() += 1;
+    }
+
+    /// Replace the current entry: in the same document with `state` (replaceState), or with a
+    /// new document (`location.replace`).
+    pub(crate) fn replace(&self, req: Request, same_doc: bool, state: Option<String>)
+    where
+        Lens: Writable,
+    {
+        let idx = self.current_idx();
+        *self.urls().get(idx).unwrap().write() = req;
+        if !same_doc {
+            *self.docs().get(idx).unwrap().write() = next_doc();
+        }
+        *self.states().get(idx).unwrap().write() = state;
+    }
+
+    pub(crate) fn current_doc(&self) -> u64 {
+        *self.docs().get(self.current_idx()).unwrap().read()
+    }
+
+    pub(crate) fn current_state(&self) -> Option<String> {
+        self.states().get(self.current_idx()).unwrap().read().clone()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.urls().len()
     }
 }
 
@@ -66,6 +136,8 @@ pub trait HistoryNav {
     fn go_back(&mut self);
     fn go_forward(&mut self);
     fn navigate(&self, req: Request);
+    fn current_doc(&self) -> u64;
+    fn current_state(&self) -> Option<String>;
 }
 
 impl HistoryNav for SyncStore<History> {
@@ -90,7 +162,15 @@ impl HistoryNav for SyncStore<History> {
     }
 
     fn navigate(&self, req: Request) {
-        HistoryStoreImplExt::navigate(self, req)
+        HistoryStoreImplExt::push(self, req, false, None)
+    }
+
+    fn current_doc(&self) -> u64 {
+        HistoryStoreImplExt::current_doc(self)
+    }
+
+    fn current_state(&self) -> Option<String> {
+        HistoryStoreImplExt::current_state(self)
     }
 }
 
@@ -101,5 +181,93 @@ pub struct BrowserNavProvider {
 impl NavigationProvider for BrowserNavProvider {
     fn navigate_to(&self, options: NavigationOptions) {
         HistoryNav::navigate(&self.history, options.into_request());
+    }
+}
+
+/// A page's view of its tab's history and loader: what `location` and `history` change.
+/// Navigations go into the history like a link click, so the tab loads them through the
+/// gate as usual.
+pub struct TabHistory {
+    pub history: SyncStore<History>,
+    /// The tab's loader's reload counter (`DocumentLoader::reload_generation`).
+    pub reload: Signal<u64>,
+}
+
+impl crate::host::TabNav for TabHistory {
+    fn navigate(&self, url: Url, replace: bool) {
+        match replace {
+            true => HistoryStoreImplExt::replace(&self.history, Request::get(url), false, None),
+            false => HistoryStoreImplExt::push(&self.history, Request::get(url), false, None),
+        }
+    }
+
+    fn reload(&self) {
+        let mut reload = self.reload;
+        *reload.write() += 1;
+    }
+
+    fn set_entry(&self, url: Url, state: Option<String>, replace: bool) {
+        match replace {
+            true => HistoryStoreImplExt::replace(&self.history, Request::get(url), true, state),
+            false => HistoryStoreImplExt::push(&self.history, Request::get(url), true, state),
+        }
+    }
+
+    fn go(&self, delta: i64) {
+        let mut history = self.history;
+        HistoryStoreImplExt::go(&mut history, delta);
+    }
+
+    fn state(&self) -> Option<String> {
+        HistoryStoreImplExt::current_state(&self.history)
+    }
+
+    fn length(&self) -> usize {
+        HistoryStoreImplExt::len(&self.history)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_new_fragment_stays_in_the_document() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        assert!(same_document(&url("https://a.test/p"), &url("https://a.test/p#x")));
+        assert!(same_document(&url("https://a.test/p#x"), &url("https://a.test/p#y")));
+        assert!(!same_document(&url("https://a.test/p#x"), &url("https://a.test/p")), "no fragment: a reload");
+        assert!(!same_document(&url("https://a.test/p"), &url("https://a.test/q#x")));
+        assert!(!same_document(&url("https://a.test/p?a=1"), &url("https://a.test/p?a=2#x")));
+    }
+
+    /// pushState entries share their document; a navigation gets a new one; going back to a
+    /// pushed entry keeps the document, and replace swaps the entry in place.
+    #[test]
+    fn entries_share_a_document_until_a_navigation() {
+        // Dioxus swallows panics during render, so the scenario reports how it went.
+        thread_local!(static PASSED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) });
+        fn app() -> Element {
+            PASSED.set(Some(std::panic::catch_unwind(scenario).is_ok()));
+            VNode::empty()
+        }
+        fn scenario() {
+            let history: SyncStore<History> = Store::new_maybe_sync(History::new(Request::get(Url::parse("https://a.test/").unwrap())));
+            let first = HistoryNav::current_doc(&history);
+            HistoryStoreImplExt::push(&history, Request::get(Url::parse("https://a.test/two").unwrap()), true, Some("2".into()));
+            HistoryStoreImplExt::push(&history, Request::get(Url::parse("https://a.test/two#x").unwrap()), false, None);
+            assert_eq!((HistoryNav::current_doc(&history), HistoryStoreImplExt::len(&history)), (first, 3));
+            HistoryStoreImplExt::push(&history, Request::get(Url::parse("https://b.test/").unwrap()), false, None);
+            assert_ne!(HistoryNav::current_doc(&history), first);
+            let mut h = history;
+            HistoryStoreImplExt::go(&mut h, -2);
+            assert_eq!((HistoryNav::current_doc(&history), HistoryNav::current_state(&history).as_deref()), (first, Some("2")));
+            HistoryStoreImplExt::replace(&history, Request::get(Url::parse("https://a.test/three").unwrap()), true, Some("3".into()));
+            assert_eq!((HistoryStoreImplExt::len(&history), HistoryNav::current_doc(&history)), (4, first));
+            HistoryStoreImplExt::go(&mut h, 10);
+            assert_eq!(history.current_url().read().url.as_str(), "https://a.test/three", "an impossible go does nothing");
+        }
+        VirtualDom::new(app).rebuild_in_place();
+        assert_eq!(PASSED.get(), Some(true), "the scenario's assertions failed (see the panic above)");
     }
 }

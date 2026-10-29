@@ -43,12 +43,14 @@ pub enum Read {
     Cookie,
     /// A read of `localStorage` or `sessionStorage`, as JSON (text, like `Cookie`).
     Storage,
+    /// What the page read from its tab: `history.state` and `history.length` (text).
+    State,
 }
 
 impl Read {
     /// Whether the tape value is an index into the recording's texts.
     fn is_text(self) -> bool {
-        matches!(self, Read::Cookie | Read::Storage)
+        matches!(self, Read::Cookie | Read::Storage | Read::State)
     }
 }
 
@@ -64,6 +66,9 @@ pub enum Step {
     Eval { source: String, by: &'static str },
     /// The user resumed the page after it paused on an exception.
     Resume,
+    /// The tab moved to another entry of this page's document (back, forward, a fragment):
+    /// its URL and `history.state`. The `popstate` that follows is a step of its own.
+    Traverse { url: String, state: Option<String> },
     /// A `fetch` finished: its promise (a handle) and what it resolved with.
     Fetch { promise: u32, result: Result<crate::gate::FetchResponse, String> },
 }
@@ -76,6 +81,7 @@ impl Step {
             Step::Timers(t) => format!("{} timer(s)", t.len()),
             Step::Eval { by, .. } => format!("{by} input"),
             Step::Resume => "resumed after an exception".into(),
+            Step::Traverse { url, .. } => format!("moved to {url}"),
             Step::Fetch { result: Ok(r), .. } => format!("fetch answered ({})", r.status),
             Step::Fetch { result: Err(_), .. } => "fetch failed".into(),
         }
@@ -105,6 +111,7 @@ impl Step {
             Step::Timers(fired) => fired.len() * 16,
             Step::Eval { source, .. } => source.len(),
             Step::Resume => 0,
+            Step::Traverse { url, state } => url.len() + state.as_ref().map_or(0, String::len),
             Step::Fetch { result, .. } => match result {
                 Ok(r) => r.url.len() + r.body.len() + r.headers.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>(),
                 Err(e) => e.len(),

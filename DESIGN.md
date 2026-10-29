@@ -374,7 +374,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | Partly | **`localStorage` and `sessionStorage` done** (`storage.rs`; see "Web platform parity notes"). IndexedDB deferred |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | Partly | Listeners and `event.type`/`target` work; details and form events don't |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | Partly | `querySelector`, create/append/remove, `textContent`, attributes, `id`, `className` work |
-| `window` and `location`: URL, navigation, `history`, viewport size | Missing | |
+| `window` and `location`: URL, navigation, `history`, viewport size | Partly | **`location` and `history` done** (see "Web platform parity notes"); window basics below |
 | `console.*` with objects, `print` to a console view | Partly | Both packs log as text, with levels, to the Inspector's Console and the Trace panel; objects are shown by handle, not expanded |
 | Canvas, WebGL, audio, media | Missing | Large; depends on what Blitz can render |
 
@@ -1132,6 +1132,38 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   (`localStorage.foo`; use `getItem`); IndexedDB and the Cache API deferred; a Dart page
   can't catch host errors (a pre-existing gap: they aren't thrown as Dart exceptions), so
   `QuotaExceededError` ends its current task there.
+
+**Location and history** (`Obj::Location`, `Obj::History`, `history.rs`, `TabWebView`).
+- **The tab's back/forward list now knows documents.** Each entry has a document id and a
+  `history.state` (JSON text). `pushState`, `replaceState` and fragment navigations
+  (`#section`, by link, `location.hash` or `assign`) make or change entries that share the
+  current document; anything else gets a new one. The tab loads when the current entry's
+  document changes (a memo), not when its URL does, so moving between entries of one
+  document doesn't reload. Instead the page gets them through `RunningPack::traverse`:
+  the entry's URL (the document's base URL is updated) and state, then `popstate`, and
+  `hashchange` if the fragment changed. A page with no pack just takes the URL.
+  (`same_document` and the entry rules are tested.)
+- **`location`:** `href`, `protocol`, `host`, `hostname`, `port`, `pathname`, `search`,
+  `hash`, `origin`; setting `href` or `hash`, `assign`, `replace`, `reload`. A navigation
+  goes into the tab's history like a link click (`TabNav::navigate`), so the tab loads it
+  through the normal path and the gate. Only http(s), file and about URLs can be navigated to
+  (no `javascript:`). `window.location = url` and `document.location` work too.
+- **`history`:** `pushState`/`replaceState` (same origin only: `SecurityError` otherwise;
+  state must be data, as `fetch` init is), `state`, `length`, `back`, `forward`, `go`.
+- **How the page reaches its tab:** `PageEnv::nav`, a `host::TabNav` (`history::TabHistory`
+  over the tab's history store and reload counter). Tests use a recording stand-in; replays
+  and pages outside a tab have none (navigation does nothing).
+- **Events the page causes** (`popstate` and `hashchange` after it sets a fragment) are queued
+  (`Objects::queued_events`) and dispatched on `window` after its code returns, from `poll`.
+- **Replay:** `history.state` (first read) and `history.length` are on the tape; a traversal
+  is a step (`Step::Traverse`) and its `popstate` another; a replay never navigates.
+- **AI:** `Location.*` and `History.*` calls are hidden in redacted views (full URLs can carry
+  tokens; AI access sees URLs only redacted).
+- **Limitations:** the tab's list still isn't saved with the session (as before), so state
+  and pushed entries are lost on restart; `history.scrollRestoration`, `location.ancestorOrigins`
+  and `URL`/`URLSearchParams` aren't there; a global assignment `location = "..."` in JS or
+  Python rebinds the name instead of navigating (use `location.href`); Blitz doesn't scroll
+  to a fragment's target.
 
 ## Known local setup notes
 

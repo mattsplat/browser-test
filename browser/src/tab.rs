@@ -209,16 +209,43 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     let about = use_memo(move || AboutPage::from_url(&tab.nav_history().current_url().read().url));
 
     let loader = tab.loader_rc();
+    // Loads follow the current entry's document, not its URL: moving between entries of one
+    // document (pushState, a fragment) doesn't reload; the page is told instead (below).
+    let current_doc = use_memo(move || tab.nav_history().current_doc());
     let loaded_document = use_resource(move || {
-        let req = (*tab.nav_history().current_url().read()).clone();
+        let doc = current_doc();
+        let req = (*tab.nav_history().current_url().peek()).clone();
         let _reload_generation = loader.reload_generation();
         let loader = loader.clone();
-        let is_about = about().is_some();
+        let is_about = about.peek().is_some();
         async move {
             if is_about {
                 None
             } else {
-                Some(loader.load_document(req).await)
+                Some((doc, loader.load_document(req).await))
+            }
+        }
+    });
+
+    // Back, forward or a fragment link within the loaded document: the page takes the entry's
+    // URL and state and gets `popstate` (and `hashchange`), as browsers do.
+    use_effect(move || {
+        let history = tab.nav_history();
+        let (doc, url, state) = (history.current_doc(), history.current_url().read().url.clone(), history.current_state());
+        if tab.loader_rc().committed_doc.get() != doc {
+            return;
+        }
+        let Some(page) = tab.page().peek().clone() else { return };
+        match page.pack() {
+            Some(pack) => pack.traverse(url.as_str(), state),
+            None => {
+                if let Some(doc) = page.doc() {
+                    if let Ok(mut doc) = doc.try_borrow_mut() {
+                        if doc.url() != &url {
+                            doc.set_base_url(url.as_str());
+                        }
+                    }
+                }
             }
         }
     });
@@ -238,7 +265,8 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
 
     use_effect(move || {
         if loaded_document.read().is_some() {
-            if let Some(loaded) = loaded_document.write_unchecked().take().flatten() {
+            if let Some((doc, loaded)) = loaded_document.write_unchecked().take().flatten() {
+                tab.loader_rc().committed_doc.set(doc);
                 commit_loaded_document(tab, history.clone(), loaded);
             }
         }
