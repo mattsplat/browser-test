@@ -923,14 +923,15 @@ mod tests {
     #[test]
     fn console_input_and_its_effects_stay_out_of_ai_views() {
         let page = js_page("<p id=out></p>", &[]);
-        page.pack.eval("console.log('typed-log-7781'); document.querySelector('#out').textContent = 'typed-text-7781'", debug::CONSOLE_PACK).unwrap();
+        page.pack.eval("console.log('typed-log-qzx'); document.querySelector('#out').textContent = 'typed-text-qzx'", debug::CONSOLE_PACK).unwrap();
         let origin = crate::settings::origin_of(&blitz_traits::net::Url::parse(&page.pack.page).unwrap());
-        let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
-        assert!(!console.iter().any(|e| format!("{e:?}").contains("7781")), "console leaked");
-        let trace = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
-        assert!(!trace.iter().any(|e| format!("{e:?}").contains("7781")), "trace leaked");
         // The user's own console still shows the log.
-        assert!(debug::console(&origin, debug::Privacy::Full, usize::MAX).iter().any(|e| e.text == "typed-log-7781"));
+        assert!(debug::console(&origin, debug::Privacy::Full, usize::MAX).iter().any(|e| e.text == "typed-log-qzx"));
+        // Match on text, not `{:?}`: a number marker could match an entry's timing.
+        let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
+        assert!(!console.iter().any(|e| e.text.contains("qzx") || e.input.as_deref().is_some_and(|i| i.contains("qzx"))), "console leaked");
+        let trace = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+        assert!(!trace.iter().any(|e| [&e.call, &e.args, &e.result].iter().any(|t| t.contains("qzx"))), "trace leaked");
     }
 
     /// A paused page doesn't arm the timer thread (a due timer would wake the loop forever);
