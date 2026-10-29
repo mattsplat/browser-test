@@ -170,7 +170,10 @@ not read time or randomness any other way.
   - `{"o": handle}` is a web object;
   - `{"cb": id}` is a callback;
   - `{"obj": {name: value}}` is a plain object of data, which the host turns into a host
-    object (`Host::object`).
+    object (`Host::object`);
+  - `{"o": handle, "r": 1}` from the host marks an object made for the pack (a response,
+    its headers, parsed data, a promise): when the pack drops its last wrapper it sends
+    `{"op": "release", "target": handle}` (`Host::release`). Dart doesn't release.
 
   Arrays can't cross from an interpreter yet.
 - **Promises:** host methods that return a promise (`fetch`, `Response.text`, `json`) return
