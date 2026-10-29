@@ -4,7 +4,8 @@
 //! - Off at every launch; turned on from the menu, and visibly on (a bar with "Turn off").
 //! - Listens on 127.0.0.1 only, and every request needs the token, which is new each time
 //!   access is turned on. The address and token are written to `ai-access.json` (readable
-//!   only by the user) next to settings.json, for MCP clients to use.
+//!   only by the user) next to settings.json in the profile's folder, for MCP clients to use.
+//!   The port is fixed, so only one profile's process can have it on at a time.
 //! - Requests from web pages are refused: they carry an `Origin` header, MCP clients don't.
 //! - Read-only: tabs, a page's outline, console and errors, the trace, and requests. Form
 //!   field values, cookies, headers and URL query values and fragments are never returned.
@@ -104,7 +105,7 @@ pub fn last_error() -> Option<String> {
 }
 
 fn connection_file() -> Option<PathBuf> {
-    directories::ProjectDirs::from("dev", "mattsplat", "browser-test").map(|d| d.config_dir().join("ai-access.json"))
+    crate::profile::dir().map(|d| d.join("ai-access.json"))
 }
 
 pub fn url() -> String {

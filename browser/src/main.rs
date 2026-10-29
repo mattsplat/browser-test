@@ -39,6 +39,7 @@ mod inspector;
 mod js_pack;
 mod js_permission;
 mod page_document;
+mod profile;
 mod prompt;
 mod request_panel;
 mod settings;
@@ -109,7 +110,17 @@ fn main() {
     #[cfg(feature = "tracing")]
     tracing_subscriber::fmt::init();
 
-    let cli_url = std::env::args().skip(1).find_map(|a| parse_cli_url(&a));
+    // Choose the profile before anything reads settings, history or the HTTP cache.
+    let (profile_name, args) = profile::parse_args(std::env::args().skip(1));
+    if let Err(e) = profile::init(&profile_name) {
+        eprintln!("browser: {e}");
+        std::process::exit(1);
+    }
+    #[cfg(feature = "cache")]
+    if let Some(dir) = profile::dir() {
+        blitz_net::set_cache_dir(dir.join("http-cache"));
+    }
+    let cli_url = args.iter().find_map(|a| parse_cli_url(a));
 
     let window_attributes = WindowAttributes::default();
     #[cfg(target_os = "windows")]
@@ -144,7 +155,7 @@ fn app() -> Element {
     let url_input_handle: Signal<Option<NodeHandle>> = use_signal(|| None);
     let url_input_value = use_signal(|| home_url.to_string());
 
-    let history_store: HistoryStore = use_hook(HistoryStore::open);
+    let history_store: HistoryStore = use_hook(|| HistoryStore::open(profile::dir()));
 
     // Synchronous on purpose: the toolbar's URL suggestions read from this
     // store on first render, so the entries need to be present before the
@@ -203,7 +214,11 @@ fn app() -> Element {
         fps_overlay::FpsOverlay {}
     });
 
-    let window_title = tab_display_title(active_tab(tabs, active_tab_id()));
+    let mut window_title = tab_display_title(active_tab(tabs, active_tab_id()));
+    // Say which profile a window is, so two profiles' windows can be told apart.
+    if profile::name() != profile::DEFAULT {
+        window_title = format!("{window_title} — {}", profile::name());
+    }
 
     rsx!(
         div {

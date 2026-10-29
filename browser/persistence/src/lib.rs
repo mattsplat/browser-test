@@ -6,11 +6,9 @@
 //!
 //! Every write path here is best-effort and may silently no-op:
 //!
-//! - On desktop, if `ProjectDirs::from` returns `None` or the data dir is
+//! - If the caller passes no folder (tests, mobile) or the folder is
 //!   unwritable, the sqlite connection is in-memory only — the on-disk view
 //!   is empty across restarts but the in-process store still works.
-//! - On mobile (Android, iOS) the store always opens an in-memory connection;
-//!   history is in-process only and does not persist across launches.
 //! - Per-statement sqlite errors are logged at `warn` and swallowed; callers
 //!   never see a `Result`.
 //!
@@ -24,6 +22,7 @@
 //! runtime-agnostic — callers are responsible for keeping disk work off any
 //! latency-sensitive thread (e.g. by wrapping calls in `spawn_blocking`).
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -101,8 +100,10 @@ pub struct HistoryStore {
 }
 
 impl HistoryStore {
-    pub fn open() -> Self {
-        let mut conn = open_connection();
+    /// Open `history.sqlite3` in `dir` (the browser profile's folder), or an
+    /// in-memory store when `dir` is None.
+    pub fn open(dir: Option<&Path>) -> Self {
+        let mut conn = open_connection(dir);
         if let Err(e) = migrations().to_latest(&mut conn) {
             tracing::warn!("history_store: schema migration failed: {e}");
         }
@@ -274,26 +275,15 @@ fn set_favicon_by_url_inner(conn: &Connection, page_url: &Url, favicon_url: &Url
     }
 }
 
-// Mobile (Android, iOS) skips the file path entirely and always lands in
-// in-memory mode. `directories` isn't pulled in for those targets.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn open_file_connection() -> Result<Connection, String> {
-    use directories::ProjectDirs;
-
-    let dirs = ProjectDirs::from("dev", "mattsplat", "browser-test")
-        .ok_or_else(|| "ProjectDirs::from returned None".to_string())?;
-    let db_path = dirs.data_dir().join("history.sqlite3");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create_dir_all({}): {e}", parent.display()))?;
-    }
+fn open_file_connection(dir: &Path) -> Result<Connection, String> {
+    let db_path = dir.join("history.sqlite3");
+    std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all({}): {e}", dir.display()))?;
     Connection::open(&db_path).map_err(|e| format!("open({}): {e}", db_path.display()))
 }
 
-fn open_connection() -> Connection {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        match open_file_connection() {
+fn open_connection(dir: Option<&Path>) -> Connection {
+    if let Some(dir) = dir {
+        match open_file_connection(dir) {
             Ok(c) => return c,
             Err(e) => tracing::warn!(
                 "history_store: file-backed open failed: {e}; falling back to in-memory"
@@ -315,7 +305,7 @@ mod tests {
     use url::Url;
 
     use super::{
-        HistoryEntry, MAX_HISTORY_ENTRIES, clear_inner, load_recent_inner, migrations,
+        HistoryEntry, HistoryStore, MAX_HISTORY_ENTRIES, clear_inner, load_recent_inner, migrations,
         record_visit_inner, set_favicon_by_url_inner,
     };
 
@@ -503,5 +493,19 @@ mod tests {
             .unwrap()
             .as_secs();
         assert_eq!(top_secs, overflow);
+    }
+
+    #[test]
+    fn stores_in_different_folders_are_separate() {
+        // Each browser profile opens its own folder; one's history never shows in another's.
+        let root = std::env::temp_dir().join(format!("history-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (work, home) = (root.join("Work"), root.join("Home"));
+        HistoryStore::open(Some(&work)).record_visit(&entry_at("https://work.test/", 1_000));
+        assert!(HistoryStore::open(Some(&home)).load_recent(10).is_empty());
+        let reopened = HistoryStore::open(Some(&work)).load_recent(10);
+        assert_eq!(reopened.len(), 1, "history persists in its own folder");
+        assert_eq!(reopened[0].url, url("https://work.test/"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

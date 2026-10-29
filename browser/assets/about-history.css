@@ -83,3 +83,35 @@
     font-size: 12px;
     color: #aaa;
 }
+
+/* about:settings uses this page's look, plus labelled rows. */
+.about-settings h2 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 20px 0 8px 0;
+    color: #222;
+}
+.about-settings .setting-row {
+    align-items: center;
+    justify-content: space-between;
+}
+.about-settings .setting-label {
+    font-size: 14px;
+    color: #222;
+}
+.about-settings .setting-value {
+    font-size: 13px;
+    color: #777;
+}
+.about-settings .setting-note {
+    font-size: 13px;
+    color: #666;
+    margin: 0 0 10px 0;
+}
+.about-settings .setting-input {
+    flex: 1 1 auto;
+    font-size: 14px;
+    padding: 5px 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+}

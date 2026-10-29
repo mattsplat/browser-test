@@ -70,7 +70,7 @@ impl AboutPage {
 pub fn AboutPageView(page: AboutPage, on_navigate: Callback<Request>) -> Element {
     match page {
         AboutPage::NewTab => rsx!(NewTabPage { on_navigate }),
-        AboutPage::Settings => rsx!(StubPage { name: "Settings" }),
+        AboutPage::Settings => rsx!(SettingsPage {}),
         AboutPage::History => rsx!(HistoryPage { on_navigate }),
         AboutPage::Bookmarks => rsx!(StubPage { name: "Bookmarks" }),
     }
@@ -181,6 +181,78 @@ fn HistoryEntryRow(
                 }
                 div { class: "entry-url", "{entry.url}" }
                 div { class: "entry-time", "{elapsed}" }
+            }
+        }
+    }
+}
+
+/// about:settings: browser-wide choices for this profile, and the profiles themselves.
+#[component]
+fn SettingsPage() -> Element {
+    // Bumped after a change the page shows but nothing else signals (profile folders).
+    let mut changes = use_signal(|| 0u64);
+    let mut new_profile = use_signal(String::new);
+    let mut message = use_signal(|| None::<String>);
+    let _ = changes();
+
+    let current = crate::profile::name();
+    let profiles = crate::profile::list();
+    let open_profile = use_callback(move |name: String| {
+        let result = crate::profile::create(&name).and_then(|_| crate::profile::open_in_new_process(&name));
+        message.set(Some(match result {
+            Ok(()) => format!("Opening \"{name}\" in a new window."),
+            Err(e) => e,
+        }));
+        changes += 1;
+    });
+    rsx! {
+        document::Link { rel: "stylesheet", href: HISTORY_CSS }
+        div { class: "about-history about-settings",
+            div { class: "toolbar", h1 { "Settings" } }
+            h2 { "Profiles" }
+            p { class: "setting-note",
+                "Each profile has its own cookies, history, open tabs and site permissions, and opens in its own window. This window is "
+                b { "{current}" }
+                "."
+            }
+            ul {
+                for name in profiles {
+                    li { key: "{name}", class: "setting-row",
+                        span { class: "setting-label", "{name}" }
+                        if name == current {
+                            span { class: "setting-value", "This window" }
+                        } else if crate::profile::is_open(&name) {
+                            span { class: "setting-value", "Open in another window" }
+                        } else {
+                            button { class: "clear-btn", onclick: move |_| open_profile(name.clone()), "Open" }
+                        }
+                    }
+                }
+                li { class: "setting-row",
+                    input {
+                        class: "setting-input",
+                        r#type: "text",
+                        placeholder: "New profile name",
+                        value: "{new_profile}",
+                        oninput: move |evt| new_profile.set(evt.value()),
+                    }
+                    button {
+                        class: "clear-btn",
+                        onclick: move |_| {
+                            let name = new_profile.read().trim().to_string();
+                            if crate::profile::list().contains(&name) {
+                                message.set(Some(format!("\"{name}\" already exists.")));
+                                return;
+                            }
+                            new_profile.set(String::new());
+                            open_profile(name);
+                        },
+                        "Create and open"
+                    }
+                }
+            }
+            if let Some(m) = message() {
+                p { class: "setting-note", "{m}" }
             }
         }
     }

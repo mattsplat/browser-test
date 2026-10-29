@@ -1,5 +1,6 @@
 //! Browser settings that persist between runs: dev mode and per-site decisions.
-//! Stored as JSON in the app's config folder.
+//! Stored as JSON in the profile's folder (`profile.rs`), so each profile has its own
+//! permissions. With no profile (tests) they stay in memory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -84,7 +85,7 @@ impl Default for Settings {
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
 
 fn path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("dev", "mattsplat", "browser-test").map(|d| d.config_dir().join("settings.json"))
+    crate::profile::dir().map(|d| d.join("settings.json"))
 }
 
 /// A copy of the current settings.
