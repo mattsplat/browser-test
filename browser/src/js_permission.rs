@@ -38,6 +38,69 @@ pub fn decide(settings: &Settings, allowed_this_visit: bool, origin: &str) -> Js
     }
 }
 
+/// A site's own JavaScript choice, as the Site panel shows and cycles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteChoice {
+    /// No choice saved: the global default applies (or "allow this visit").
+    Default,
+    AlwaysAllow,
+    KeptOff,
+}
+
+impl SiteChoice {
+    pub fn of(settings: &Settings, origin: &str) -> Self {
+        if settings.js_blocked.contains(origin) {
+            SiteChoice::KeptOff
+        } else if settings.js_sites.contains(origin) {
+            SiteChoice::AlwaysAllow
+        } else {
+            SiteChoice::Default
+        }
+    }
+
+    /// The cycle: default → always allowed → kept off → default.
+    pub fn next(self) -> Self {
+        match self {
+            SiteChoice::Default => SiteChoice::AlwaysAllow,
+            SiteChoice::AlwaysAllow => SiteChoice::KeptOff,
+            SiteChoice::KeptOff => SiteChoice::Default,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SiteChoice::Default => "default",
+            SiteChoice::AlwaysAllow => "always allowed",
+            SiteChoice::KeptOff => "kept off",
+        }
+    }
+
+    fn apply(self, settings: &mut Settings, origin: &str) {
+        settings.js_sites.remove(origin);
+        settings.js_blocked.remove(origin);
+        match self {
+            SiteChoice::Default => {}
+            SiteChoice::AlwaysAllow => {
+                settings.js_sites.insert(origin.to_string());
+            }
+            SiteChoice::KeptOff => {
+                settings.js_blocked.insert(origin.to_string());
+            }
+        }
+    }
+}
+
+/// Move `origin` to its next choice and save it. Any "allow this visit" and pending offer
+/// are dropped, since the user has now chosen. The Site panel and the command palette both
+/// use this, so they always agree. Returns the new choice; it applies on reload.
+pub fn cycle_site(origin: &str) -> SiteChoice {
+    revoke_this_visit(origin);
+    clear_offer(origin);
+    let next = SiteChoice::of(&settings::get(), origin).next();
+    settings::update(|s| next.apply(s, origin));
+    next
+}
+
 /// Session state: never saved.
 #[derive(Default)]
 struct Session {
@@ -191,5 +254,20 @@ mod tests {
         dismiss(origin);
         offer(origin, 3);
         assert!(SESSION.lock().unwrap().as_ref().unwrap().offers.get(origin).is_none());
+    }
+
+    #[test]
+    fn site_choices_cycle_and_replace_each_other() {
+        let mut s = Settings::default();
+        let o = "https://a.test";
+        let mut seen = vec![];
+        for _ in 0..3 {
+            let next = SiteChoice::of(&s, o).next();
+            next.apply(&mut s, o);
+            seen.push((next, decide(&s, false, o) == JsDecision::Run));
+            // Never both allowed and kept off.
+            assert!(!(s.js_sites.contains(o) && s.js_blocked.contains(o)));
+        }
+        assert_eq!(seen, [(SiteChoice::AlwaysAllow, true), (SiteChoice::KeptOff, false), (SiteChoice::Default, false)]);
     }
 }

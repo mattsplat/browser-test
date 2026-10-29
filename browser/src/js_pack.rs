@@ -46,12 +46,15 @@ fn engine_module() -> Result<&'static Module> {
 }
 
 /// Compiling the engine takes seconds, so keep the compiled code on disk, keyed by a hash of
-/// the engine's bytes (a rebuilt engine gets a new entry).
+/// the engine's bytes and of wasmtime's version and configuration (a rebuilt engine or a
+/// changed config gets a new entry). Every profile's process shares the file and maps it
+/// into memory, so it's only ever replaced whole (`write_atomic`), never rewritten in place.
 fn cached_compile(wasm: &[u8]) -> Result<Module> {
     use std::hash::{Hash, Hasher};
     let engine = crate::dart_pack::engine();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     wasm.hash(&mut hasher);
+    engine.precompile_compatibility_hash().hash(&mut hasher);
     let path = directories::ProjectDirs::from("dev", "mattsplat", "browser-test")
         .map(|d| d.cache_dir().join(format!("js-engine-{:016x}.cwasm", hasher.finish())));
     if let Some(path) = &path {
@@ -67,7 +70,7 @@ fn cached_compile(wasm: &[u8]) -> Result<Module> {
     let module = Module::new(engine, wasm)?;
     if let Some(path) = &path {
         let saved = path.parent().map(std::fs::create_dir_all).transpose().and_then(|_| {
-            module.serialize().map_err(std::io::Error::other).and_then(|bytes| std::fs::write(path, bytes))
+            module.serialize().map_err(std::io::Error::other).and_then(|bytes| crate::profile::write_atomic(path, &bytes))
         });
         if let Err(e) = saved {
             tracing::warn!("could not cache the compiled JS engine: {e}");

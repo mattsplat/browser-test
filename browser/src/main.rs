@@ -214,6 +214,12 @@ fn app() -> Element {
                 if !shortcut_modifier || !event.state.is_pressed() {
                     return;
                 }
+                // Held keys repeat. Only new tab may; closing, reopening and toggling the
+                // palette happen once per press.
+                let new_tab = event.physical_key == PhysicalKey::Code(KeyCode::KeyT) && !modifiers.shift_key();
+                if event.repeat && !new_tab {
+                    return;
+                }
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::KeyT) if modifiers.shift_key() => manager.reopen_closed(None),
                     PhysicalKey::Code(KeyCode::KeyT) => open_new_tab(home_url.clone()),

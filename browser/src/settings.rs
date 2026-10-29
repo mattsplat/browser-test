@@ -94,16 +94,20 @@ fn path() -> Option<PathBuf> {
     crate::profile::dir().map(|d| d.join("settings.json"))
 }
 
+/// Read settings.json. A file that won't parse is kept as `settings.json.bad` and defaults
+/// are used, so the next change can't silently overwrite every saved permission.
+fn load() -> Settings {
+    let Some(p) = path() else { return Settings::default() };
+    let Ok(text) = std::fs::read_to_string(&p) else { return Settings::default() };
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        crate::profile::keep_bad(&p, &e.to_string());
+        Settings::default()
+    })
+}
+
 /// A copy of the current settings.
 pub fn get() -> Settings {
-    let mut slot = SETTINGS.lock().unwrap();
-    slot.get_or_insert_with(|| {
-        path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    })
-    .clone()
+    SETTINGS.lock().unwrap().get_or_insert_with(load).clone()
 }
 
 /// Change settings and save them.
@@ -112,7 +116,7 @@ pub fn update(change: impl FnOnce(&mut Settings)) {
     change(&mut settings);
     if let Some(p) = path() {
         let saved = p.parent().map(std::fs::create_dir_all).transpose().and_then(|_| {
-            std::fs::write(&p, serde_json::to_string_pretty(&settings).unwrap_or_default())
+            crate::profile::write_atomic(&p, serde_json::to_string_pretty(&settings).unwrap_or_default().as_bytes())
         });
         if let Err(e) = saved {
             tracing::error!("could not save settings to {}: {e}", p.display());

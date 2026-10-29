@@ -16,11 +16,11 @@ use crate::Panel;
 use crate::about_pages::AboutPage;
 use crate::browser_history::{BrowsingHistoryStoreExt, HistoryService};
 use crate::history::HistoryNav;
-use crate::js_permission::{self, JsDecision};
+use crate::js_permission::{self, SiteChoice};
 use crate::nav::is_enter_key;
 use crate::settings;
 use crate::tab::{Favicon, TabId, TabStoreExt, TabStoreImplExt, active_tab, tab_display_title};
-use crate::tab_manager::TabManager;
+use crate::tab_manager::{SavedTab, TabManager};
 
 /// Rows shown at most.
 const MAX_ROWS: usize = 40;
@@ -60,7 +60,8 @@ pub enum Action {
     CloseOtherTabs,
     Reload,
     TogglePin,
-    ReopenClosed(usize),
+    ReopenLastClosed,
+    ReopenClosed(SavedTab),
     OpenPanel(Panel),
     ToggleDevMode,
     ToggleAiAccess,
@@ -127,8 +128,9 @@ pub fn rank(query: &str, items: &[Item]) -> Vec<usize> {
         .collect()
 }
 
-/// Every row the palette can show right now, before filtering.
-fn all_items(manager: TabManager, history: &HistoryService) -> Vec<Item> {
+/// Every row the palette can show right now, before filtering. `profiles` is each profile
+/// and whether it's open, read once when the palette opens.
+fn all_items(manager: TabManager, history: &HistoryService, profiles: &[(String, bool)]) -> Vec<Item> {
     let mut items = Vec::new();
     let active = (manager.active_tab_id)();
     let current_space = manager.current_space.read().clone();
@@ -169,9 +171,10 @@ fn all_items(manager: TabManager, history: &HistoryService) -> Vec<Item> {
     let ai = crate::ai_access::is_on();
     items.push(Item::command(Action::ToggleAiAccess, if ai { "Turn AI access off" } else { "Turn AI access on" }, "AI access (MCP)"));
     if matches!(page.scheme(), "http" | "https" | "file") {
+        // The Site panel's JavaScript cycle, one step.
         let origin = settings::origin_of(&page);
-        let runs = js_permission::decide(&s, js_permission::allowed_this_visit(&origin), &origin) == JsDecision::Run;
-        let title = if runs { "Turn JavaScript off for this site" } else { "Allow JavaScript for this site" };
+        let choice = SiteChoice::of(&s, &origin);
+        let title = format!("JavaScript for this site: {} → {}", choice.label(), choice.next().label());
         items.push(Item::command(Action::ToggleJsForSite, title, format!("{origin}, reloads")));
     }
     items.push(Item::command(Action::ShowAbout(AboutPage::History), "Open history", ""));
@@ -180,7 +183,7 @@ fn all_items(manager: TabManager, history: &HistoryService) -> Vec<Item> {
     let vertical = (manager.vertical)();
     items.push(Item::command(Action::SetVertical(!vertical), if vertical { "Use horizontal tabs" } else { "Use vertical tabs" }, "tab layout"));
     if !manager.closed.read().is_empty() {
-        items.push(Item::command(Action::ReopenClosed(manager.closed.read().len() - 1), "Reopen closed tab", format!("{MOD}+Shift+T")));
+        items.push(Item::command(Action::ReopenLastClosed, "Reopen closed tab", format!("{MOD}+Shift+T")));
     }
 
     // Spaces.
@@ -196,16 +199,16 @@ fn all_items(manager: TabManager, history: &HistoryService) -> Vec<Item> {
     }
 
     // Profiles open in their own window.
-    for name in crate::profile::list() {
-        if name != crate::profile::name() && !crate::profile::is_open(&name) {
+    for (name, open) in profiles {
+        if !open {
             items.push(Item::command(Action::OpenProfile(name.clone()), format!("Open profile: {name}"), "new window"));
         }
     }
 
     // Recently closed, newest first.
-    for (i, closed) in manager.closed.read().iter().enumerate().rev() {
+    for closed in manager.closed.read().iter().rev() {
         items.push(Item {
-            action: Action::ReopenClosed(i),
+            action: Action::ReopenClosed(closed.clone()),
             title: closed.title.clone(),
             detail: closed.url.to_string(),
             favicon: None,
@@ -233,16 +236,16 @@ fn all_items(manager: TabManager, history: &HistoryService) -> Vec<Item> {
 }
 
 /// Rows that make something named after the query (a space, a profile).
-fn create_items(query: &str, manager: TabManager) -> Vec<Item> {
+fn create_items(query: &str, manager: TabManager, profiles: &[(String, bool)]) -> Vec<Item> {
     let name = query.trim();
     let mut items = Vec::new();
     if name.is_empty() {
         return items;
     }
-    if !manager.spaces.read().iter().any(|s| s == name) {
+    if !manager.spaces.read().iter().any(|s| s.to_lowercase() == name.to_lowercase()) {
         items.push(Item::command(Action::NewSpace(name.into()), format!("New space “{name}”"), ""));
     }
-    if crate::profile::valid_name(name) && !crate::profile::list().iter().any(|p| p == name) {
+    if crate::profile::valid_name(name) && !crate::profile::exists(profiles, name) {
         items.push(Item::command(Action::NewProfile(name.into()), format!("New profile “{name}”"), "opens in a new window"));
     }
     items
@@ -258,7 +261,8 @@ fn perform(action: Action, mut manager: TabManager, mut open_panel: Signal<Panel
         Action::CloseOtherTabs => manager.close_others(),
         Action::Reload => tab.reload(),
         Action::TogglePin => manager.toggle_pin(active),
-        Action::ReopenClosed(i) => manager.reopen_closed(Some(i)),
+        Action::ReopenLastClosed => manager.reopen_closed(None),
+        Action::ReopenClosed(tab) => manager.reopen_closed(Some(&tab)),
         Action::OpenPanel(panel) => open_panel.set(panel),
         Action::ToggleDevMode => settings::update(|s| s.dev_mode = !s.dev_mode),
         Action::ToggleAiAccess => {
@@ -269,20 +273,7 @@ fn perform(action: Action, mut manager: TabManager, mut open_panel: Signal<Panel
             }
         }
         Action::ToggleJsForSite => {
-            // The same changes as the Site panel's JavaScript row, then a reload to apply.
-            let origin = settings::origin_of(&tab.nav_history().current_url().read().url);
-            let runs = js_permission::decide(&settings::get(), js_permission::allowed_this_visit(&origin), &origin) == JsDecision::Run;
-            js_permission::revoke_this_visit(&origin);
-            js_permission::clear_offer(&origin);
-            settings::update(|s| {
-                if runs {
-                    s.js_sites.remove(&origin);
-                    s.js_blocked.insert(origin.clone());
-                } else {
-                    s.js_blocked.remove(&origin);
-                    s.js_sites.insert(origin.clone());
-                }
-            });
+            js_permission::cycle_site(&settings::origin_of(&tab.nav_history().current_url().read().url));
             tab.reload();
         }
         Action::ShowAbout(page) => manager.show_about(page),
@@ -295,7 +286,7 @@ fn perform(action: Action, mut manager: TabManager, mut open_panel: Signal<Panel
         Action::RemoveSpace(name) => manager.remove_space(&name),
         Action::SetVertical(on) => manager.set_vertical(on),
         Action::OpenProfile(name) | Action::NewProfile(name) => {
-            if let Err(e) = crate::profile::create(&name).and_then(|_| crate::profile::open_in_new_process(&name)) {
+            if let Err(e) = crate::profile::open(&name) {
                 tracing::error!("{e}");
             }
         }
@@ -309,10 +300,13 @@ pub fn CommandPalette(mut open: Signal<bool>, open_panel: Signal<Panel>, open_ne
     let mut query = use_signal(String::new);
     let mut selected = use_signal(|| 0usize);
 
-    let items = all_items(manager, &history);
+    // Checking which profiles are open takes their locks, so do it once per opening.
+    let profiles = use_hook(crate::profile::list_with_state);
+
+    let items = all_items(manager, &history, &profiles);
     let q = query.read().clone();
     let mut rows: Vec<Item> = rank(&q, &items).into_iter().map(|i| items[i].clone()).collect();
-    rows.extend(create_items(&q, manager));
+    rows.extend(create_items(&q, manager, &profiles));
     let count = rows.len();
     let current = selected().min(count.saturating_sub(1));
 

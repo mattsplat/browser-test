@@ -205,11 +205,14 @@ fn SettingsPage() -> Element {
     };
 
     let current = crate::profile::name();
-    let profiles = crate::profile::list();
+    // Checking which profiles are open takes their locks, so do it on change, not per render.
+    let profiles = use_memo(move || {
+        changes();
+        crate::profile::list_with_state()
+    });
     let open_profile = use_callback(move |name: String| {
-        let result = crate::profile::create(&name).and_then(|_| crate::profile::open_in_new_process(&name));
-        message.set(Some(match result {
-            Ok(()) => format!("Opening \"{name}\" in a new window."),
+        message.set(Some(match crate::profile::open(&name) {
+            Ok(name) => format!("Opening \"{name}\" in a new window."),
             Err(e) => e,
         }));
         changes += 1;
@@ -245,12 +248,12 @@ fn SettingsPage() -> Element {
                 "."
             }
             ul {
-                for name in profiles {
+                for (name, open) in profiles() {
                     li { key: "{name}", class: "setting-row",
                         span { class: "setting-label", "{name}" }
                         if name == current {
                             span { class: "setting-value", "This window" }
-                        } else if crate::profile::is_open(&name) {
+                        } else if open {
                             span { class: "setting-value", "Open in another window" }
                         } else {
                             button { class: "clear-btn", onclick: move |_| open_profile(name.clone()), "Open" }
@@ -269,7 +272,7 @@ fn SettingsPage() -> Element {
                         class: "clear-btn",
                         onclick: move |_| {
                             let name = new_profile.read().trim().to_string();
-                            if crate::profile::list().contains(&name) {
+                            if crate::profile::exists(&profiles.read(), &name) {
                                 message.set(Some(format!("\"{name}\" already exists.")));
                                 return;
                             }
@@ -287,12 +290,16 @@ fn SettingsPage() -> Element {
     }
 }
 
-/// The choices for closing idle tabs, in the order the button cycles through them.
+/// The choices for closing idle tabs, in the order the button cycles through them. After
+/// "never" it goes back to the default, 12 hours.
 const IDLE_LIMITS: [Option<u32>; 7] = [Some(1), Some(4), Some(12), Some(24), Some(72), Some(168), None];
 
 fn next_idle_limit(current: Option<u32>) -> Option<u32> {
-    let idx = IDLE_LIMITS.iter().position(|&l| l == current).map_or(0, |i| i + 1);
-    IDLE_LIMITS[idx % IDLE_LIMITS.len()]
+    match IDLE_LIMITS.iter().position(|&l| l == current) {
+        Some(i) if IDLE_LIMITS[i].is_none() => Some(12),
+        Some(i) => IDLE_LIMITS[i + 1],
+        None => IDLE_LIMITS[0],
+    }
 }
 
 #[component]
@@ -325,14 +332,13 @@ mod tests {
 
     #[test]
     fn idle_limit_cycles_through_every_choice_and_off() {
-        let mut seen = vec![];
-        let mut limit = Some(12);
-        for _ in 0..IDLE_LIMITS.len() {
-            limit = next_idle_limit(limit);
-            seen.push(limit);
+        // From 1 hour the button passes every choice, off last.
+        let mut seen = vec![Some(1)];
+        while seen.len() < IDLE_LIMITS.len() {
+            seen.push(next_idle_limit(*seen.last().unwrap()));
         }
-        assert_eq!(limit, Some(12), "back where it started");
-        assert!(seen.contains(&None), "off is one of the choices");
+        assert_eq!(seen, IDLE_LIMITS);
+        assert_eq!(next_idle_limit(None), Some(12), "off goes back to the default");
         // A value edited by hand into settings.json restarts the cycle.
         assert_eq!(next_idle_limit(Some(5)), Some(1));
     }

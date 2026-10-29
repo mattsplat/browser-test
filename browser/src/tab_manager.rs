@@ -31,8 +31,9 @@ use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt, open_tab, tab_display
 
 /// The space every profile starts with.
 pub const FIRST_SPACE: &str = "Main";
-/// How many closed tabs can be reopened.
-const MAX_CLOSED: usize = 20;
+/// How many closed tabs can be reopened (they're saved with the session, so tabs closed while
+/// you were away can be found again).
+const MAX_CLOSED: usize = 50;
 /// How often idle tabs are looked for.
 pub const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -72,16 +73,9 @@ pub fn idle_tabs(tabs: &[TabMeta], active: TabId, now: SystemTime, limit: Option
         .collect()
 }
 
-/// A closed tab, kept so it can be reopened.
-#[derive(Clone, PartialEq)]
-pub struct ClosedTab {
-    pub url: Url,
-    pub title: String,
-    pub space: String,
-}
-
-/// One tab in `session.json`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One tab in `session.json`, open or recently closed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SavedTab {
     pub url: String,
     pub title: String,
@@ -100,24 +94,60 @@ pub struct Session {
     pub active: Option<usize>,
     pub spaces: Vec<String>,
     pub current_space: String,
+    /// Recently closed tabs, most recent last.
+    pub closed: Vec<SavedTab>,
 }
 
+/// Read `session.json`. A file that isn't a session is kept as `session.json.bad` (so the
+/// next save can't destroy it) and the browser starts empty; a tab that can't be read is
+/// skipped on its own.
 pub fn load_session(dir: Option<&Path>) -> Session {
-    dir.and_then(|d| std::fs::read_to_string(d.join("session.json")).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(path) = dir.map(|d| d.join("session.json")) else { return Session::default() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Session::default() };
+    parse_session(&text).unwrap_or_else(|e| {
+        crate::profile::keep_bad(&path, &e.to_string());
+        Session::default()
+    })
+}
+
+fn parse_session(text: &str) -> Result<Session, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(text)?;
+    let mut list = |key: &str| value.as_object_mut().and_then(|o| o.remove(key));
+    let (tabs, closed) = (list("tabs"), list("closed"));
+    let mut session: Session = serde_json::from_value(value)?;
+    let each = |list: Option<serde_json::Value>| -> Vec<Option<SavedTab>> {
+        match list {
+            Some(serde_json::Value::Array(items)) => items.into_iter().map(|v| serde_json::from_value(v).ok()).collect(),
+            _ => Vec::new(),
+        }
+    };
+    let tabs = each(tabs);
+    let skipped = tabs.iter().filter(|t| t.is_none()).count();
+    if skipped > 0 {
+        tracing::warn!("session.json: skipped {skipped} tab(s) that couldn't be read");
+    }
+    // The active index counts only the tabs that were read.
+    session.active = session.active.filter(|&a| tabs.get(a).is_some_and(Option::is_some)).map(|a| tabs[..a].iter().flatten().count());
+    session.tabs = tabs.into_iter().flatten().collect();
+    session.closed = each(closed).into_iter().flatten().collect();
+    Ok(session)
 }
 
 fn save_session(dir: &Path, json: &str) {
-    // Write then rename, so a crash mid-write can't lose the saved tabs.
-    let (tmp, path) = (dir.join("session.json.tmp"), dir.join("session.json"));
-    if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path)) {
+    let path = dir.join("session.json");
+    if let Err(e) = crate::profile::write_atomic(&path, json.as_bytes()) {
         tracing::error!("could not save session to {}: {e}", path.display());
     }
 }
 
 fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// A saved time, trusted only if it's a real moment no later than `now` (a hand-edited or
+/// corrupt value, or a clock that went backwards, reads as `now`).
+fn from_unix_secs(secs: u64, now: SystemTime) -> SystemTime {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs)).filter(|t| *t <= now).unwrap_or(now)
 }
 
 /// Tab state and the operations on it, shared through context. Everything that activates,
@@ -129,17 +159,22 @@ pub struct TabManager {
     pub spaces: Signal<Vec<String>>,
     pub current_space: Signal<String>,
     /// Most recently closed last.
-    pub closed: Signal<Vec<ClosedTab>>,
+    pub closed: Signal<Vec<SavedTab>>,
     /// The tab layout (Settings → vertical tabs), kept here so the UI re-renders on change.
     pub vertical: Signal<bool>,
     net_provider: CopyValue<Arc<StdNetProvider>>,
 }
 
 impl TabManager {
-    /// Set up tab state, reopening the saved session. `initial_url` (from the command line)
-    /// is shown in a new tab, or in an open tab already showing it.
+    /// Set up tab state, reopening the saved session. Tabs that went idle past the limit
+    /// while the browser was closed go straight to recently closed, without loading.
+    /// `initial_url` (from the command line) is shown in a new tab, or in an open tab already
+    /// showing it.
     pub fn restore(net_provider: Arc<StdNetProvider>, initial_url: Option<Url>, home_url: Url) -> Self {
-        let session = load_session(crate::profile::dir());
+        Self::from_session(load_session(crate::profile::dir()), net_provider, initial_url, home_url)
+    }
+
+    fn from_session(session: Session, net_provider: Arc<StdNetProvider>, initial_url: Option<Url>, home_url: Url) -> Self {
         let mut spaces = session.spaces.clone();
         if spaces.is_empty() {
             spaces.push(FIRST_SPACE.to_string());
@@ -150,19 +185,33 @@ impl TabManager {
             active_tab_id: Signal::new(0),
             spaces: Signal::new(spaces),
             current_space: Signal::new(current_space),
-            closed: Signal::new(Vec::new()),
+            closed: Signal::new(session.closed.clone()),
             vertical: Signal::new(crate::settings::get().vertical_tabs),
             net_provider: CopyValue::new(net_provider),
         };
 
+        let now = SystemTime::now();
+        let metas: Vec<TabMeta> = session
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TabMeta { id: i as TabId, pinned: t.pinned, space: t.space.clone(), last_active: from_unix_secs(t.last_active, now) })
+            .collect();
+        // The tab that was on screen at quit counts as looked at, as it would while running.
+        let stale = idle_tabs(&metas, session.active.map_or(TabId::MAX, |a| a as TabId), now, idle_limit());
+
         let mut active = None;
         for (i, saved) in session.tabs.iter().enumerate() {
+            if stale.contains(&(i as TabId)) {
+                manager.remember_closed(saved.clone());
+                continue;
+            }
             let Ok(url) = Url::parse(&saved.url) else { continue };
             let space = if manager.spaces.peek().contains(&saved.space) { saved.space.clone() } else { manager.current_space.peek().clone() };
             let tab = open_tab(manager.tabs, url, manager.net_provider.cloned(), space);
             *tab.title().write() = saved.title.clone();
             *tab.pinned().write() = saved.pinned;
-            *tab.last_active().write() = UNIX_EPOCH + Duration::from_secs(saved.last_active);
+            *tab.last_active().write() = metas[i].last_active;
             if session.active == Some(i) {
                 active = Some(tab.tab_id());
             }
@@ -249,10 +298,12 @@ impl TabManager {
             return;
         }
         let Some(tab) = self.find(id) else { return };
-        let closed = ClosedTab {
-            url: tab.nav_history().current_url().read().url.clone(),
+        let closed = SavedTab {
+            url: tab.nav_history().current_url().read().url.to_string(),
             title: tab_display_title(tab),
+            pinned: tab.pinned().cloned(),
             space: tab.space().cloned(),
+            last_active: unix_secs(SystemTime::now()),
         };
         let order = self.visible_ids();
         let next = next_active_after_close(&order, id);
@@ -270,8 +321,12 @@ impl TabManager {
         if let Some(idx) = idx {
             self.tabs.remove(idx);
         }
+        self.remember_closed(closed);
+    }
+
+    fn remember_closed(&mut self, tab: SavedTab) {
         let mut list = self.closed.write();
-        list.push(closed);
+        list.push(tab);
         if list.len() > MAX_CLOSED {
             list.remove(0);
         }
@@ -290,27 +345,33 @@ impl TabManager {
 
     /// Close tabs left alone longer than the setting allows.
     pub fn close_idle(&mut self) {
-        let limit = crate::settings::get().close_idle_tabs_hours.map(|h| Duration::from_secs(u64::from(h) * 3600));
+        let limit = idle_limit();
         let active = *self.active_tab_id.peek();
         for id in idle_tabs(&self.metas(), active, SystemTime::now(), limit) {
             self.close(id);
         }
     }
 
-    /// Reopen a closed tab (`index` into `closed`; None for the most recent) and show it.
-    pub fn reopen_closed(&mut self, index: Option<usize>) {
+    /// Reopen a closed tab (`which`, or the most recent if None) and show it, pinned again
+    /// if it was pinned.
+    pub fn reopen_closed(&mut self, which: Option<&SavedTab>) {
         let tab = {
             let mut closed = self.closed.write();
-            let index = index.unwrap_or(closed.len().saturating_sub(1));
-            if index >= closed.len() {
-                return;
-            }
+            let index = match which {
+                Some(which) => closed.iter().rposition(|t| t == which),
+                None => closed.len().checked_sub(1),
+            };
+            let Some(index) = index else { return };
             closed.remove(index)
         };
+        let Ok(url) = Url::parse(&tab.url) else { return };
         if self.spaces.peek().contains(&tab.space) {
             self.current_space.set(tab.space);
         }
-        let id = self.open_tab(tab.url);
+        let id = self.open_tab(url);
+        if let Some(new) = self.find(id) {
+            *new.pinned().write() = tab.pinned;
+        }
         self.activate(id);
     }
 
@@ -342,10 +403,10 @@ impl TabManager {
         }
     }
 
-    /// Add a space and show it. Returns false if the name is empty or taken.
+    /// Add a space and show it. Returns false if the name is empty or taken (ignoring case).
     pub fn create_space(&mut self, name: &str) -> bool {
         let name = name.trim();
-        if name.is_empty() || self.spaces.peek().iter().any(|s| s == name) {
+        if name.is_empty() || self.spaces.peek().iter().any(|s| s.to_lowercase() == name.to_lowercase()) {
             return false;
         }
         self.spaces.write().push(name.to_string());
@@ -383,8 +444,11 @@ impl TabManager {
     }
 
     /// The session as it would be saved now. Reading it subscribes the caller to every tab.
+    /// The tab on screen is saved as just looked at, so it isn't counted idle after a
+    /// restart that shows another tab.
     pub fn session(&self) -> Session {
         let active = *self.active_tab_id.read();
+        let now = unix_secs(SystemTime::now());
         let tabs: Vec<SavedTab> = self
             .tabs
             .iter()
@@ -393,7 +457,7 @@ impl TabManager {
                 title: t.title().cloned(),
                 pinned: t.pinned().cloned(),
                 space: t.space().cloned(),
-                last_active: unix_secs(t.last_active().cloned()),
+                last_active: if t.tab_id() == active { now } else { unix_secs(t.last_active().cloned()) },
             })
             .collect();
         Session {
@@ -401,8 +465,14 @@ impl TabManager {
             tabs,
             spaces: self.spaces.read().clone(),
             current_space: self.current_space.read().clone(),
+            closed: self.closed.read().clone(),
         }
     }
+}
+
+/// The idle limit from settings; None when idle tabs are never closed.
+fn idle_limit() -> Option<Duration> {
+    crate::settings::get().close_idle_tabs_hours.map(|h| Duration::from_secs(u64::from(h) * 3600))
 }
 
 /// Keep `session.json` up to date, and close idle tabs once a minute.
@@ -483,15 +553,43 @@ mod tests {
             active: Some(1),
             spaces: vec!["Main".into(), "Work".into()],
             current_space: "Work".into(),
+            closed: vec![SavedTab { url: "https://closed.test/".into(), ..Default::default() }],
         };
         save_session(&dir, &serde_json::to_string(&session).unwrap());
         assert_eq!(load_session(Some(&dir)), session);
-        assert!(!dir.join("session.json.tmp").exists());
         // No folder (tests) or no file: an empty session, never an error.
         assert_eq!(load_session(None), Session::default());
         std::fs::remove_file(dir.join("session.json")).unwrap();
         assert_eq!(load_session(Some(&dir)), Session::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_tab_costs_only_that_tab_and_a_bad_file_is_kept() {
+        let text = r#"{"tabs":[{"url":"https://a.test/","pinned":true},{"url":7},{"url":"https://c.test/"}],
+                       "active":2,"spaces":["Main"],"closed":[{"title":"x"},"junk"]}"#;
+        let s = parse_session(text).unwrap();
+        assert_eq!(s.tabs.len(), 2, "the second tab is skipped");
+        assert!(s.tabs[0].pinned && s.tabs[0].title.is_empty(), "missing fields get defaults");
+        assert_eq!(s.active, Some(1), "the active index follows the skip");
+        assert_eq!(s.closed.len(), 1);
+        assert_eq!(parse_session(r#"{"tabs":[{"url":7}],"active":0}"#).unwrap().active, None);
+
+        let dir = std::env::temp_dir().join(format!("browser-session-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), "{not json").unwrap();
+        assert_eq!(load_session(Some(&dir)), Session::default());
+        assert!(!dir.join("session.json").exists(), "moved aside before anything saves over it");
+        assert_eq!(std::fs::read_to_string(dir.join("session.json.bad")).unwrap(), "{not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_times_from_the_future_or_out_of_range_read_as_now() {
+        let now = SystemTime::now();
+        assert_eq!(from_unix_secs(u64::MAX, now), now, "no panic on overflow");
+        assert_eq!(from_unix_secs(unix_secs(now) + 3600, now), now);
+        assert_eq!(from_unix_secs(10, now), UNIX_EPOCH + Duration::from_secs(10));
     }
 
     #[test]
@@ -551,6 +649,36 @@ mod tests {
             let session = m.session();
             assert_eq!(session.tabs.len(), 2);
             assert!(session.tabs.iter().any(|t| t.pinned && t.url == "https://a.test/"));
+
+            // A closed pinned tab comes back pinned; picking a closed tab by value.
+            m.close(a);
+            let saved = m.closed.peek().last().cloned().unwrap();
+            assert!(saved.pinned);
+            m.reopen_closed(Some(&saved));
+            assert!(m.find(*m.active_tab_id.peek()).unwrap().pinned().cloned());
+
+            // At startup, tabs idle past the limit (12 hours by default) go straight to
+            // recently closed; pinned and the tab on screen at quit stay.
+            let now = unix_secs(SystemTime::now());
+            let saved = |url: &str, pinned: bool, hours: u64| SavedTab {
+                url: url.into(),
+                pinned,
+                space: FIRST_SPACE.into(),
+                last_active: now - hours * 3600,
+                ..Default::default()
+            };
+            let session = Session {
+                tabs: vec![saved("https://old.test/", false, 13), saved("https://pin.test/", true, 99), saved("https://was-on-screen.test/", false, 50), saved("https://fresh.test/", false, 1)],
+                active: Some(2),
+                closed: vec![saved("https://earlier.test/", false, 0)],
+                ..Default::default()
+            };
+            let gate = Arc::new(crate::gate::Gate::new(Arc::new(blitz_net::Provider::new(None))));
+            let r = TabManager::from_session(session, gate, None, AboutPage::NewTab.parsed_url());
+            let urls: Vec<String> = r.session().tabs.into_iter().map(|t| t.url).collect();
+            assert_eq!(urls, ["https://pin.test/", "https://was-on-screen.test/", "https://fresh.test/"]);
+            let closed: Vec<String> = r.closed.peek().iter().map(|t| t.url.clone()).collect();
+            assert_eq!(closed, ["https://earlier.test/", "https://old.test/"]);
         }
         VirtualDom::new(app).rebuild_in_place();
         assert_eq!(PASSED.get(), Some(true), "the scenario's assertions failed (see the panic above)");

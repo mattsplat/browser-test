@@ -26,6 +26,31 @@ static CURRENT: OnceLock<(String, PathBuf)> = OnceLock::new();
 /// Held open for the life of the process; the OS releases the lock when it exits.
 static LOCK: OnceLock<File> = OnceLock::new();
 
+/// Replace `path` with `bytes` all at once: write a temp file beside it (named for this
+/// process, so two processes never share one), then rename it over. Readers see the old file
+/// or the new one, never half of one, and a process that has the old file memory-mapped
+/// keeps its copy instead of seeing it change underneath it.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// A saved file couldn't be read: keep it as `<name>.bad` (replacing an older one) so the
+/// next save doesn't destroy what's in it, and say so in the log.
+pub fn keep_bad(path: &Path, error: &str) {
+    let bad = path.with_extension(format!("{}.bad", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
+    tracing::error!("{} couldn't be read ({error}); keeping it as {} and starting fresh", path.display(), bad.display());
+    if let Err(e) = std::fs::rename(path, &bad) {
+        tracing::error!("couldn't move {} aside: {e}", path.display());
+    }
+}
+
 /// Names become folder names, so only plain characters: no dots, slashes or leading spaces.
 pub fn valid_name(name: &str) -> bool {
     let len = name.chars().count();
@@ -45,50 +70,76 @@ fn profiles_root() -> Option<PathBuf> {
 
 /// Move the files kept before profiles existed into the Default profile's folder. Only
 /// moves a file when the profile doesn't already have one, so it never overwrites, and an
-/// interrupted run finishes on the next start.
+/// interrupted run finishes on the next start. The history database's journal files move
+/// only with their database: next to another database they'd corrupt it.
 pub fn migrate_legacy(config_dir: &Path, data_dir: &Path, default_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(default_dir)?;
-    let files = [
-        (config_dir, "settings.json"),
-        (data_dir, "history.sqlite3"),
-        (data_dir, "history.sqlite3-wal"),
-        (data_dir, "history.sqlite3-shm"),
-        (data_dir, "history.sqlite3-journal"),
-    ];
-    for (from, name) in files {
+    let move_if_absent = |from: &Path, name: &str| -> io::Result<()> {
         let (src, dst) = (from.join(name), default_dir.join(name));
         if src.is_file() && !dst.exists() {
             std::fs::rename(&src, &dst)?;
+        }
+        Ok(())
+    };
+    move_if_absent(config_dir, "settings.json")?;
+    move_if_absent(data_dir, "history.sqlite3")?;
+    // The database is in the profile and not left behind: moved now or by an earlier run.
+    let db_moved = default_dir.join("history.sqlite3").is_file() && !data_dir.join("history.sqlite3").exists();
+    if db_moved {
+        for name in ["history.sqlite3-wal", "history.sqlite3-shm", "history.sqlite3-journal"] {
+            move_if_absent(data_dir, name)?;
         }
     }
     Ok(())
 }
 
-/// Lock a profile's folder for this process. Fails if another process holds it.
-fn lock(dir: &Path) -> io::Result<File> {
+/// Lock a profile's folder for this process: `Ok(None)` if another process holds it.
+fn lock(dir: &Path) -> io::Result<Option<File>> {
     let file = File::options().create(true).truncate(false).write(true).open(dir.join("lock"))?;
-    file.try_lock().map_err(|_| io::Error::other("it's already open in another window"))?;
-    Ok(file)
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
-/// Make `name` this process's profile: create its folder (migrating old data into Default)
-/// and lock it. Call once, at startup, before anything reads settings or history.
+/// Folder names ignore case on macOS, so "work" is the existing "Work": this returns the
+/// spelling already in `root`, or `name` if there's none.
+fn spelling_in(root: &Path, name: &str) -> String {
+    let lower = name.to_lowercase();
+    list_in(root).into_iter().find(|n| n.to_lowercase() == lower).unwrap_or_else(|| name.to_string())
+}
+
+/// Make `name` this process's profile: create its folder, lock it, and (for Default) move
+/// old data into it. Call once, at startup, before anything reads settings or history.
 pub fn init(name: &str) -> Result<(), String> {
     if !valid_name(name) {
         return Err(format!("\"{name}\" isn't a valid profile name (letters, digits, spaces, - and _)"));
     }
     // No app folder (some mobile targets): run with everything in memory, as before.
     let Some(dirs) = app_dirs() else { return Ok(()) };
-    let dir = dirs.data_dir().join("profiles").join(name);
-    let made = if name == DEFAULT {
-        migrate_legacy(dirs.config_dir(), dirs.data_dir(), &dir)
-    } else {
-        std::fs::create_dir_all(&dir)
+    let root = dirs.data_dir().join("profiles");
+    let name = spelling_in(&root, name);
+    let dir = root.join(&name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    // A window of this profile that's just closing may hold the lock a moment longer.
+    let mut attempts = 0;
+    let file = loop {
+        match lock(&dir) {
+            Ok(Some(file)) => break file,
+            Ok(None) if attempts < 5 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Ok(None) => return Err(format!("profile \"{name}\" is already open in another window")),
+            Err(e) => return Err(format!("profile \"{name}\": couldn't lock {}: {e}", dir.display())),
+        }
     };
-    made.map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
-    let file = lock(&dir).map_err(|e| format!("profile \"{name}\": {e}"))?;
+    if name == DEFAULT {
+        migrate_legacy(dirs.config_dir(), dirs.data_dir(), &dir).map_err(|e| format!("couldn't move old data into {}: {e}", dir.display()))?;
+    }
     let _ = LOCK.set(file);
-    let _ = CURRENT.set((name.to_string(), dir));
+    let _ = CURRENT.set((name, dir));
     Ok(())
 }
 
@@ -118,30 +169,46 @@ fn list_in(root: &Path) -> Vec<String> {
     names
 }
 
-pub fn list() -> Vec<String> {
-    profiles_root().map(|root| list_in(&root)).unwrap_or_else(|| vec![DEFAULT.to_string()])
+/// Every profile, and whether some process (this one included) has it open. Checking
+/// takes each profile's lock for a moment, so call it once per page, not per render.
+pub fn list_with_state() -> Vec<(String, bool)> {
+    let Some(root) = profiles_root() else { return vec![(DEFAULT.to_string(), true)] };
+    list_in(&root)
+        .into_iter()
+        .map(|name| {
+            let open = name == self::name() || matches!(lock(&root.join(&name)), Ok(None));
+            (name, open)
+        })
+        .collect()
 }
 
-/// Whether some process (this one included) has the profile open.
-pub fn is_open(name: &str) -> bool {
-    if name == self::name() && dir().is_some() {
-        return true;
-    }
-    let Some(dir) = profiles_root().map(|r| r.join(name)) else { return false };
-    dir.is_dir() && lock(&dir).is_err()
+/// Whether a profile by this name exists, ignoring case.
+pub fn exists(profiles: &[(String, bool)], name: &str) -> bool {
+    profiles.iter().any(|(n, _)| n.to_lowercase() == name.to_lowercase())
 }
 
-/// Create a profile's folder, so it's listed before it's first opened.
-pub fn create(name: &str) -> Result<(), String> {
+/// Create a profile's folder (or find the existing one, ignoring case), so it's listed
+/// before it's first opened. Returns the name as the folder spells it.
+pub fn create(name: &str) -> Result<String, String> {
     if !valid_name(name) {
         return Err(format!("\"{name}\" isn't a valid profile name"));
     }
-    let dir = profiles_root().ok_or("no app data folder")?.join(name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))
+    let root = profiles_root().ok_or("no app data folder")?;
+    let name = spelling_in(&root, name);
+    let dir = root.join(&name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    Ok(name)
+}
+
+/// Create the profile if needed and start it in a new window. Returns its name as spelled.
+pub fn open(name: &str) -> Result<String, String> {
+    let name = create(name)?;
+    open_in_new_process(&name)?;
+    Ok(name)
 }
 
 /// Start the browser again in another profile, as its own process.
-pub fn open_in_new_process(name: &str) -> Result<(), String> {
+fn open_in_new_process(name: &str) -> Result<(), String> {
     if !valid_name(name) {
         return Err(format!("\"{name}\" isn't a valid profile name"));
     }
@@ -224,6 +291,42 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writes_replace_the_whole_file_and_leave_no_temp_files() {
+        let root = temp_dir("atomic");
+        let path = root.join("settings.json");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "no temp files left");
+        keep_bad(&path, "test");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(root.join("settings.json.bad")).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn journal_files_move_only_with_their_database() {
+        let root = temp_dir("journal");
+        let (config, data, default) = (root.join("config"), root.join("data"), root.join("Default"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        // The profile already has its own database, so the old one and its WAL both stay.
+        std::fs::write(default.join("history.sqlite3"), "new").unwrap();
+        std::fs::write(data.join("history.sqlite3"), "old").unwrap();
+        std::fs::write(data.join("history.sqlite3-wal"), "old wal").unwrap();
+        migrate_legacy(&config, &data, &default).unwrap();
+        assert!(!default.join("history.sqlite3-wal").exists());
+        assert!(data.join("history.sqlite3-wal").exists());
+
+        // A run interrupted after moving the database moves its WAL next time.
+        std::fs::remove_file(data.join("history.sqlite3")).unwrap();
+        migrate_legacy(&config, &data, &default).unwrap();
+        assert_eq!(std::fs::read_to_string(default.join("history.sqlite3-wal")).unwrap(), "old wal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn each_profile_gets_its_own_folder_and_lock() {
         let root = temp_dir("dirs");
         for name in ["Work", "Home"] {
@@ -233,10 +336,20 @@ mod tests {
         assert_eq!(list_in(&root), ["Default", "Home", "Work"]);
 
         let work = lock(&root.join("Work")).unwrap();
-        assert!(lock(&root.join("Work")).is_err(), "a second process can't open the same profile");
-        assert!(lock(&root.join("Home")).is_ok(), "other profiles are unaffected");
+        assert!(work.is_some());
+        assert!(lock(&root.join("Work")).unwrap().is_none(), "a second process can't open the same profile");
+        assert!(lock(&root.join("Home")).unwrap().is_some(), "other profiles are unaffected");
         drop(work);
-        assert!(lock(&root.join("Work")).is_ok(), "the lock goes with the process");
+        assert!(lock(&root.join("Work")).unwrap().is_some(), "the lock goes with the process");
+        // Other failures are errors, not "already open".
+        assert!(lock(&root.join("Missing")).is_err());
+
+        // Names that differ only in case are the same profile.
+        assert_eq!(spelling_in(&root, "work"), "Work");
+        assert_eq!(spelling_in(&root, "DEFAULT"), "Default");
+        assert_eq!(spelling_in(&root, "New"), "New");
+        let profiles = vec![("Work".to_string(), false)];
+        assert!(exists(&profiles, "WORK") && !exists(&profiles, "Home"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

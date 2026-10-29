@@ -602,7 +602,8 @@ pack, so the AI's redacted views leave out the console's input and everything it
 elsewhere) opens one list: open tabs (every space's), commands, recently closed tabs and,
 once you type, history. Arrows move, Enter runs, Esc or a click outside closes. Commands:
 new/close/reload/pin tab, close other tabs, reopen closed, each panel (Inspect, Trace,
-Requests, Site), dev mode, AI access, JavaScript for this site (the Site panel's change,
+Requests, Site), dev mode, AI access, JavaScript for this site (one step of the Site
+panel's cycle, default → always allowed → kept off, via the same `js_permission::cycle_site`,
 then a reload), history, bookmarks, settings, tab layout, switch/move to/remove a space,
 and open a profile. Typing a name also offers "New space “name”" and "New profile “name”".
 - Matching is nucleo's fuzzy matcher, as in the URL bar, run synchronously: the list is at
@@ -628,17 +629,24 @@ plus a test that drives the real store.
   button, shown in every space, skipped by "close other tabs" and by idle closing. Pin or
   unpin from the palette (there's no tab context menu).
 - **Idle ("temporary") tabs:** an unpinned tab nobody has looked at for
-  `close_idle_tabs_hours` (default 12; Settings cycles 1h, 4h, 12h, 1d, 3d, 7d, never) is
-  closed by a once-a-minute check. A tab's idle time starts when you leave it; the tab on
-  screen is never idle. Closed tabs (by hand or idle, last 20) reopen with Cmd+Shift+T or
-  from the palette; that list is in memory only.
+  `close_idle_tabs_hours` (default 12; Settings cycles 1h, 4h, 12h, 1d, 3d, 7d, never, and
+  back to 12h) is closed by a once-a-minute check. A tab's idle time starts when you leave
+  it; the tab on screen is never idle. Closed tabs (by hand or idle, last 50) reopen with
+  Cmd+Shift+T or from the palette, pinned again if they were; the list is saved with the
+  session, so tabs closed while you were away can be found after a restart.
 - **Session restore:** open tabs (URL, title, pin, space, last-left time), the spaces and
   the current space are written to the profile's `session.json` whenever they change
   (write-then-rename) and reopened at startup. Tabs come back at their current page
   **without their back/forward list**, and every restored tab loads at startup (no lazy
-  loading). Tabs idle past the limit while the browser was closed are closed a moment after
-  startup, which is the point of temporary tabs. A URL on the command line opens in a new
-  tab, or focuses an open tab already showing it.
+  loading). Tabs that went idle past the limit while the browser was closed go straight to
+  recently closed without loading; the tab on screen at quit is saved as just looked at, so
+  it stays. A URL on the command line opens in a new tab, or focuses an open tab already
+  showing it.
+- **A damaged session.json** is moved aside as `session.json.bad` (logged) and the browser
+  starts with a new tab, so the next save can't overwrite it; a single unreadable tab is
+  skipped on its own, and impossible times (overflowing or in the future) read as now.
+  `settings.json` gets the same treatment (`settings.json.bad`), so a parse error can't
+  turn into every saved permission being reset on the next change.
 
 **Spaces** only organise: each tab has a space name, the window shows the current space's
 tabs plus pinned ones, and switching shows that space's most recently used tab (or a new
@@ -666,19 +674,35 @@ the palette list profiles and open or create one, which starts a new process.
   would serve one profile's cached (possibly personalised) responses to another. The fork
   gained `blitz_net::set_cache_dir` (vendor/blitz, branch `browser-test`) and each profile
   sets its own. The old shared cache folder is simply no longer used.
-- **Still shared, deliberately:** the compiled JS engine and the dev-mode Dart compile
-  cache. Both are compiled code keyed by a hash of their input, with no user data.
+- **Still shared:** the compiled JS engine (compiled code keyed by a hash of the engine's
+  bytes and wasmtime's version and configuration; no user data) and the dev-mode Dart
+  compile cache. **The Dart cache can hold user data:** for an http(s) page it stores the
+  fetched source and its compiled wasm under `dart-dev/http/<hash>/`, and source a server
+  sends may be personalised for whoever fetched it. Entries are keyed by a hash of the
+  exact bytes, so a profile only ever gets a hit for bytes it fetched itself, but the files
+  sit in a folder every profile can read and nothing deletes them. **Future:** move the
+  http part into the profile folder (or delete entries after the compile) and clean up old
+  entries. Every shared cache file is replaced whole (`profile::write_atomic`: a temp file
+  named for the process, then a rename), never rewritten in place, because another
+  profile's process may have it open or memory-mapped (wasmtime maps the compiled engine;
+  rewriting it underneath could crash that process).
 - **Lock:** a `lock` file (`File::try_lock`) stops two processes using one profile, which
-  would otherwise overwrite each other's session and settings. The OS releases it on exit.
+  would otherwise overwrite each other's session and settings. The OS releases it on exit;
+  startup retries for about 200 ms in case a window of that profile is just closing. Only
+  "would block" means "already open"; any other locking error is reported as itself.
 - **AI access** uses a fixed port, so only one profile can have it on at a time; the other
   reports the port is in use. Each profile writes its own token file.
-- **Migration:** on the first run, `settings.json` (from the config folder) and
-  `history.sqlite3` with its journal files (from the data folder) move into
+- **Migration:** on the first run, after creating and locking the folder, `settings.json`
+  (from the config folder) and `history.sqlite3` (from the data folder) move into
   `profiles/Default/`. A file only moves when the profile doesn't already have one, so it
-  never overwrites, and an interrupted move completes on the next start (tested).
+  never overwrites, and an interrupted move completes on the next start (tested). The
+  `-wal`/`-shm`/`-journal` files move only along with their database (now or in an earlier
+  run), never next to a different one.
 - Profile names become folder names, so they're limited to letters, digits, spaces, `-` and
-  `_` (1–32 characters, no leading or trailing space). Window titles name non-default
-  profiles. There's no rename or delete yet (delete the folder by hand).
+  `_` (1–32 characters, no leading or trailing space). They're compared ignoring case
+  (macOS folders ignore case), so "work" opens the existing "Work". Which profiles are open
+  is checked once when the palette or Settings opens (it takes each one's lock briefly), not
+  on every keystroke. Window titles name non-default profiles. There's no rename or delete yet (delete the folder by hand).
 
 **Testing note:** Dioxus swallows panics during a render, so a test that asserts inside a
 `VirtualDom` app passes even when the assertion fails. `tab_manager`'s store test catches

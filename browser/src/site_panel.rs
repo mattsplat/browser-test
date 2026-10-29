@@ -92,16 +92,9 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
     let o = origin.clone();
     // Cycles: default → always allowed → kept off → default.
     let cycle_js = move |_| {
-        let o = o.clone();
-        js_permission::revoke_this_visit(&o);
-        js_permission::clear_offer(&o);
-        apply(changes, Box::new(move |s| {
-            if s.js_sites.remove(&o) {
-                s.js_blocked.insert(o);
-            } else if !s.js_blocked.remove(&o) {
-                s.js_sites.insert(o);
-            }
-        }))
+        js_permission::cycle_site(&o);
+        let mut changes = changes;
+        changes += 1;
     };
     let cycle_default = move |_| apply(changes, Box::new(|s| s.js_default = s.js_default.next()));
     let o = origin.clone();

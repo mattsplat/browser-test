@@ -50,8 +50,9 @@ pub async fn compile(src: &Url, page: &Url, net: &Arc<StdNetProvider>, signal: &
             let dir = cache_dir()?.join("http").join(hash_of(&bytes[..]));
             std::fs::create_dir_all(&dir)?;
             let source = dir.join("main.dart");
-            std::fs::write(&source, &bytes)?;
-            std::fs::write(dir.join("pubspec.yaml"), WORKSPACE_PUBSPEC)?;
+            // Shared by every profile's process: replace files whole, never rewrite in place.
+            crate::profile::write_atomic(&source, &bytes)?;
+            crate::profile::write_atomic(&dir.join("pubspec.yaml"), WORKSPACE_PUBSPEC.as_bytes())?;
             (source, dir.join("main.wasm"))
         }
         other => bail!("cannot compile Dart from a {other}: URL"),
@@ -108,7 +109,15 @@ fn build(source: &Path, out: &Path) -> Result<()> {
             .context("`dart pub get --offline` failed; run `dart pub get` once with network")?;
     }
     let build_sh = Path::new(env!("CARGO_MANIFEST_DIR")).join("../packs/dart/build.sh");
-    run(Command::new("sandbox-exec").args(["-p", SANDBOX_PROFILE, "sh"]).arg(build_sh).arg(source).arg(out))
+    // Build beside the cache entry under a name of this process's own, then rename it in, so
+    // another process never reads a half-written wasm.
+    let tmp = out.with_extension(format!("{}.tmp.wasm", std::process::id()));
+    let built = run(Command::new("sandbox-exec").args(["-p", SANDBOX_PROFILE, "sh"]).arg(build_sh).arg(source).arg(&tmp))
+        .and_then(|_| std::fs::rename(&tmp, out).context("saving the compiled wasm"));
+    if built.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    built
 }
 
 fn run(command: &mut Command) -> Result<()> {
