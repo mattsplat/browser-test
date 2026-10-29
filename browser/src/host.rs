@@ -179,6 +179,12 @@ impl Objects {
         self.objects.len()
     }
 
+    /// A one-line summary for an exception snapshot: what the pack holds.
+    pub fn summary(&self) -> String {
+        let listeners: usize = self.listeners.values().map(Vec::len).sum();
+        format!("{} live handles, {listeners} listeners, {} timers pending", self.objects.len(), self.timers.len())
+    }
+
     /// A callback can be released once no listener or timer refers to it.
     fn release_if_unused(&mut self, callback: usize) {
         let in_listeners = self.listeners.values().any(|ids| ids.contains(&callback));
@@ -478,7 +484,9 @@ impl PageHost {
             }
             (Obj::Console, "log" | "info" | "warn" | "error" | "debug") => {
                 let line = args.iter().map(|a| a.display()).collect::<Vec<_>>().join(" ");
-                self.console(&if method == "log" { line } else { format!("[{method}] {line}") });
+                // The level travels in `call` ("console.warn"), so the console can filter by it.
+                let call = if method == "log" { "console".to_string() } else { format!("console.{method}") };
+                record(TraceEntry { pack: self.pack, kind: TraceKind::Console, page: self.page.clone(), call, args: line, result: String::new(), micros: 0 });
                 HostValue::Undefined
             }
             (Obj::Math, "random") => {

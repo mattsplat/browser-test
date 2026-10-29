@@ -3,6 +3,7 @@ use std::time::Duration;
 use blitz_traits::net::Url;
 use dioxus_native::prelude::*;
 
+use crate::debug;
 use crate::host::{self, TraceEntry, TraceKind};
 use crate::history::HistoryNav;
 use crate::settings;
@@ -61,7 +62,7 @@ pub fn TracePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Elemen
     let page = active_tab(tabs, active_tab_id()).nav_history().current_url().read().url.clone();
     let origin = settings::origin_of(&page);
     let all = entries.read();
-    let in_scope: Vec<&TraceEntry> = all.iter().filter(|e| all_tabs() || origin_of_page(&e.page) == origin).collect();
+    let in_scope: Vec<&TraceEntry> = all.iter().filter(|e| all_tabs() || debug::same_site(&e.page, &origin)).collect();
     let errors = in_scope.iter().filter(|e| e.kind == TraceKind::Error).count();
     let logged = in_scope.iter().filter(|e| e.kind == TraceKind::Console).count();
     let rows: Vec<&TraceEntry> = in_scope.iter().copied().filter(|e| show().includes(e.kind)).take(MAX_ROWS).collect();
@@ -93,7 +94,11 @@ pub fn TracePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Elemen
                         span { class: "request-url",
                             if all_tabs() { "[{origin_of_page(&entry.page)}] " }
                             match entry.kind {
-                                TraceKind::Console => rsx!("{entry.args}"),
+                                // Logs at other levels say so: "[warn] …".
+                                TraceKind::Console => match entry.call.strip_prefix("console.") {
+                                    Some(level) => rsx!("[{level}] {entry.args}"),
+                                    None => rsx!("{entry.args}"),
+                                },
                                 TraceKind::Load => rsx!("load {entry.args} → {entry.result}"),
                                 _ => rsx!("{entry.call}({entry.args}) → {entry.result}  {entry.micros}µs"),
                             }

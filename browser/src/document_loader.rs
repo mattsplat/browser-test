@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use blitz_dom::{DocumentConfig, FontContext, StyleThreading};
@@ -14,7 +14,7 @@ use linebender_resource_handle::Blob;
 use blitz_dom::{BaseDocument, local_name};
 
 use crate::StdNetProvider;
-use crate::page_document::{JsSource, PackDocument};
+use crate::page_document::{JsSource, PackDocument, PageRef};
 use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
@@ -414,13 +414,10 @@ async fn fetch_dart_program(
     Ok(wasm.to_vec())
 }
 
-/// A handle to a page's DOM that doesn't keep the page alive.
-pub type PageRef = Weak<RefCell<BaseDocument>>;
-
 /// A page without a pack, shown as is.
 fn shown(document: BaseDocument) -> (SubDocumentAttr, Option<PageRef>) {
     let page = Rc::new(RefCell::new(document));
-    (SubDocumentAttr::new(page.clone()), Some(Rc::downgrade(&page)))
+    (SubDocumentAttr::new(page.clone()), Some(PageRef { doc: Rc::downgrade(&page), pack: None }))
 }
 
 fn shown_pack(document: PackDocument) -> (SubDocumentAttr, Option<PageRef>) {

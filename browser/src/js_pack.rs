@@ -141,6 +141,18 @@ impl JsRuntime {
 }
 
 impl PackRuntime for JsRuntime {
+    fn eval(&mut self, source: &str) -> Result<String> {
+        let (ptr, len) = write_str(&mut self.store, &self.instance, source)?;
+        let eval = self.instance.get_typed_func::<(u32, u32), u64>(&mut self.store, "js_eval")?;
+        let packed = eval.call(&mut self.store, (ptr, len))?;
+        let reply: Value = serde_json::from_str(&take_str(&mut self.store, &self.instance, packed)?)?;
+        match (reply["ok"].as_str(), reply["err"].as_str()) {
+            (Some(shown), _) => Ok(shown.to_string()),
+            (None, Some(error)) => Err(anyhow!("{error}")),
+            _ => bail!("unexpected reply from the JS engine: {reply}"),
+        }
+    }
+
     fn release_callback(&mut self, id: usize) {
         if let Ok(release) = self.instance.get_typed_func::<u32, ()>(&mut self.store, "js_release") {
             let _ = release.call(&mut self.store, id as u32);

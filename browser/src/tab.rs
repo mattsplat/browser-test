@@ -12,7 +12,8 @@ use dioxus_native::{NodeHandle, SubDocumentAttr, prelude::*};
 use crate::StdNetProvider;
 use crate::about_pages::{AboutPage, AboutPageView};
 use crate::browser_history::{HistoryEntry, HistoryService};
-use crate::document_loader::{DocumentLoader, DocumentLoaderStatus, LoadedDocument, PageRef};
+use crate::document_loader::{DocumentLoader, DocumentLoaderStatus, LoadedDocument};
+use crate::page_document::PageRef;
 use crate::favicon::probe_favicon_cached;
 use crate::history::{History, HistoryNav, SyncStore};
 

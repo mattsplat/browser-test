@@ -87,6 +87,59 @@
   globalThis.requestAnimationFrame = (f) => window.requestAnimationFrame(f);
   globalThis.cancelAnimationFrame = (handle) => window.cancelAnimationFrame(handle);
 
+  // Console results, formatted for reading: strings quoted, objects and arrays shown a few
+  // levels deep, host objects by what they are. Element names cost two host calls (traced).
+  const knownHosts = new Map([[window, 'Window'], [globalThis.document, 'Document'], [globalThis.console, 'Console'], [math, 'Math']]);
+  const describeHost = (v) => {
+    if (knownHosts.has(v)) return knownHosts.get(v);
+    try {
+      const id = v.id;
+      return `<${v.tagName.toLowerCase()}${id ? ` id="${id}"` : ''}>`;
+    } catch {
+      return `[host object #${v[HANDLE]}]`;
+    }
+  };
+  const MAX_ITEMS = 20;
+  const inspect = (v, depth, seen) => {
+    switch (typeof v) {
+      case 'string': return JSON.stringify(v);
+      case 'undefined': return 'undefined';
+      case 'bigint': return `${v}n`;
+      case 'symbol': return v.toString();
+      case 'function': return `ƒ ${v.name || '(anonymous)'}()`;
+      case 'object': break;
+      default: return String(v);
+    }
+    if (v === null) return 'null';
+    if (v[HANDLE] !== undefined) return describeHost(v);
+    if (v instanceof Error) return v.stack || `${v.name}: ${v.message}`;
+    if (v instanceof Date) return v.toISOString();
+    if (v instanceof RegExp) return String(v);
+    if (v instanceof Promise) return 'Promise {…}';
+    if (seen.has(v)) return '[circular]';
+    if (depth > 2) return Array.isArray(v) ? '[…]' : '{…}';
+    seen.add(v);
+    const more = (n) => (n > MAX_ITEMS ? [`… ${n - MAX_ITEMS} more`] : []);
+    let out;
+    if (Array.isArray(v)) {
+      out = `[${[...v.slice(0, MAX_ITEMS).map((x) => inspect(x, depth + 1, seen)), ...more(v.length)].join(', ')}]`;
+    } else if (v instanceof Map) {
+      const items = [...v].slice(0, MAX_ITEMS).map(([k, x]) => `${inspect(k, depth + 1, seen)} => ${inspect(x, depth + 1, seen)}`);
+      out = `Map(${v.size}) {${[...items, ...more(v.size)].join(', ')}}`;
+    } else if (v instanceof Set) {
+      const items = [...v].slice(0, MAX_ITEMS).map((x) => inspect(x, depth + 1, seen));
+      out = `Set(${v.size}) {${[...items, ...more(v.size)].join(', ')}}`;
+    } else {
+      const keys = Object.keys(v);
+      const items = keys.slice(0, MAX_ITEMS).map((k) => `${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}: ${inspect(v[k], depth + 1, seen)}`);
+      const name = v.constructor && v.constructor !== Object ? `${v.constructor.name} ` : '';
+      out = `${name}{${[...items, ...more(keys.length)].join(', ')}}`;
+    }
+    seen.delete(v);
+    return out;
+  };
+  globalThis.__inspect = (v) => inspect(v, 0, new Set());
+
   // Called by the host to call a listener or timer, and to release one it no longer uses.
   globalThis.__fire = (id, args) => callbacks.get(id)(...JSON.parse(args).map(decode));
   globalThis.__release = (id) => {

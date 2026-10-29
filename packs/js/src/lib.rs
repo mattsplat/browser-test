@@ -6,7 +6,8 @@
 //!
 //! Exports: `js_alloc`/`js_free` (memory for strings), `js_run` (run a page script),
 //! `js_fire` (call a listener or timer) and `js_release` (forget one). `js_run` and `js_fire` return 0 on success, or a packed
-//! (ptr << 32 | len) error message the host must `js_free`.
+//! (ptr << 32 | len) error message the host must `js_free`. `js_eval` runs console input
+//! and always returns a packed JSON reply.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -162,6 +163,32 @@ pub unsafe extern "C" fn js_fire(id: u32, args_ptr: *const u8, args_len: u32) ->
         let _ = ctx.run_jobs();
         result.map_err(|e| format!("Uncaught {e}"))
     })
+}
+
+/// Evaluate console input in the page's context (so it sees the page's globals) and format
+/// the result for reading with the prelude's `__inspect`. Returns a packed JSON reply:
+/// `{"ok": text}` or `{"err": message}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_eval(ptr: *const u8, len: u32) -> u64 {
+    let source = unsafe { read_str(ptr, len) };
+    let mut shown = String::new();
+    let status = with_context(|ctx| {
+        let value = ctx.eval(Source::from_bytes(source.as_bytes()).with_path(std::path::Path::new("console")));
+        let _ = ctx.run_jobs();
+        let value = value.map_err(|e| format!("Uncaught {e}"))?;
+        let inspect = ctx.global_object().get(js_string!("__inspect"), ctx).map_err(|e| e.to_string())?;
+        let inspect = inspect.as_callable().ok_or("the prelude's __inspect is missing")?;
+        let text = inspect.call(&JsValue::undefined(), &[value], ctx).map_err(|e| e.to_string())?;
+        shown = text.to_string(ctx).map_err(|e| e.to_string())?.to_std_string_escaped();
+        Ok(())
+    });
+    if status != 0 {
+        let (p, l) = ((status >> 32) as *mut u8, status as u32);
+        let message = unsafe { read_str(p, l) };
+        unsafe { js_free(p, l) };
+        return pack_string(format!("{{\"err\":{}}}", serde_json_string(&message)));
+    }
+    pack_string(format!("{{\"ok\":{}}}", serde_json_string(&shown)))
 }
 
 /// Give the engine the source of module `url` (fetched by the host through the gate).

@@ -19,21 +19,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use blitz_dom::{BaseDocument, NodeId};
-use blitz_traits::net::Url;
 use dioxus_native::prelude::*;
 use serde_json::{Value, json};
 
+use crate::debug::{self, redact};
 use crate::gate::Gate;
-use crate::history::HistoryNav;
 use crate::host::{self, TraceEntry, TraceKind};
-use crate::settings;
-use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt};
+use crate::tab::{Tab, TabId};
 
 pub const PORT: u16 = 7807;
-
-/// The most a page outline returns, in characters.
-const MAX_OUTLINE: usize = 60_000;
 
 /// A tool call, sent from the server thread to the UI thread.
 struct Query {
@@ -337,55 +331,46 @@ fn answer(tool: &str, args: &Value, tabs: Store<Vec<Tab>>, active: TabId, gate: 
     let limit = args["limit"].as_u64().unwrap_or(100).min(500) as usize;
     if tool == "list_tabs" {
         trace_call(tool, String::new(), "");
-        let list: Vec<Value> = tabs
+        let list: Vec<Value> = debug::tabs(tabs, active)
             .iter()
-            .map(|tab| {
-                let url = tab.nav_history().current_url().read().url.to_string();
-                json!({ "id": tab.tab_id(), "url": redact(&url), "title": tab.title().read().clone(), "active": tab.tab_id() == active })
-            })
+            .map(|t| json!({ "id": t.id, "url": redact(t.url.as_str()), "title": t.title, "active": t.active }))
             .collect();
         return Ok(json!(list));
     }
-    let wanted = args["tab"].as_u64().unwrap_or(active);
-    let tab = tabs.iter().find(|t| t.tab_id() == wanted).ok_or_else(|| format!("no tab {wanted}"))?;
-    let page_url = tab.nav_history().current_url().read().url.clone();
-    let origin = settings::origin_of(&page_url);
-    trace_call(tool, format!("tab {wanted}"), page_url.as_str());
-    let same_site = |page: &str| Url::parse(page).map(|u| settings::origin_of(&u) == origin).unwrap_or(false);
+    let wanted = args["tab"].as_u64();
+    let tab = debug::tab(tabs, active, wanted).ok_or_else(|| format!("no tab {}", wanted.unwrap_or(active)))?;
+    let origin = tab.origin();
+    trace_call(tool, format!("tab {}", tab.id), tab.url.as_str());
     match tool {
         "read_page" => {
-            let page = tab.page().read().clone().and_then(|p| p.upgrade()).ok_or("the tab has no page loaded")?;
-            let outline = outline(&page.borrow());
-            Ok(json!({ "url": redact(page_url.as_str()), "outline": outline }))
+            let page = tab.page.and_then(|p| p.doc()).ok_or("the tab has no page loaded")?;
+            let outline = debug::outline(&page.borrow());
+            Ok(json!({ "url": redact(tab.url.as_str()), "outline": outline }))
         }
         "console" => {
             let errors_only = args["errors_only"].as_bool().unwrap_or(false);
-            let entries: Vec<Value> = host::trace()
+            let entries: Vec<Value> = debug::console(&origin, usize::MAX)
                 .into_iter()
-                .filter(|e| same_site(&e.page) && (e.kind == TraceKind::Error || (!errors_only && e.kind == TraceKind::Console)))
+                .filter(|e| !errors_only || e.level == debug::Level::Error)
                 .take(limit)
-                .map(|e| match e.kind {
-                    TraceKind::Console => json!({ "kind": "log", "pack": e.pack, "text": e.args }),
-                    _ => json!({ "kind": "error", "pack": e.pack, "in": format!("{}({})", e.call, e.args), "error": e.result.trim_start_matches("ERROR ") }),
+                .map(|e| match (&e.input, e.level) {
+                    (Some(input), _) => json!({ "kind": "input", "by": e.pack, "input": input, "result": e.text }),
+                    (None, debug::Level::Error) if !e.context.is_empty() => json!({ "kind": "error", "pack": e.pack, "in": e.context, "error": e.text }),
+                    (None, level) => json!({ "kind": "log", "level": level.name(), "pack": e.pack, "text": e.text }),
                 })
                 .collect();
             Ok(json!(entries))
         }
         "trace" => {
-            let entries: Vec<Value> = host::trace()
+            let entries: Vec<Value> = debug::trace(&origin, limit)
                 .into_iter()
-                .filter(|e| same_site(&e.page) && e.pack != "ai")
-                .take(limit)
                 .map(|e| json!({ "kind": format!("{:?}", e.kind).to_lowercase(), "pack": e.pack, "call": e.call, "args": e.args, "result": e.result, "micros": e.micros }))
                 .collect();
             Ok(json!(entries))
         }
         "requests" => {
-            let entries: Vec<Value> = gate
-                .log()
+            let entries: Vec<Value> = debug::requests(gate, &origin, limit)
                 .into_iter()
-                .filter(|e| e.page.as_deref() == Some(origin.as_str()))
-                .take(limit)
                 .map(|e| json!({ "allowed": e.allowed, "url": redact(&e.url), "reason": e.reason, "third_party": e.third_party }))
                 .collect();
             Ok(json!(entries))
@@ -399,114 +384,9 @@ fn trace_call(tool: &str, args: String, page: &str) {
     host::record(TraceEntry { pack: "ai", kind: TraceKind::Call, page: page.to_string(), call: tool.to_string(), args, result: String::new(), micros: 0 });
 }
 
-/// A URL without the parts that commonly carry secrets: credentials, query values and the
-/// fragment (OAuth tokens travel in both).
-pub fn redact(url: &str) -> String {
-    let Ok(mut u) = Url::parse(url) else { return "[unreadable URL]".into() };
-    let _ = u.set_password(None);
-    let _ = u.set_username("");
-    if u.query().is_some() {
-        let keys = u.query_pairs().map(|(k, _)| format!("{k}=REDACTED")).collect::<Vec<_>>().join("&");
-        u.set_query(if keys.is_empty() { None } else { Some(&keys) });
-    }
-    if u.fragment().is_some() {
-        u.set_fragment(Some("REDACTED"));
-    }
-    u.to_string()
-}
-
-/// The page as indented lines: `tag#id.class attr="…" "text"`. Leaves out scripts, styles,
-/// hidden inputs and every form field's value.
-pub fn outline(doc: &BaseDocument) -> String {
-    let mut out = String::new();
-    write_outline(doc, doc.root_node().id, 0, &mut out);
-    if out.len() > MAX_OUTLINE {
-        let mut cut = MAX_OUTLINE;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-        out.push_str("\n… (truncated)");
-    }
-    out
-}
-
-fn write_outline(doc: &BaseDocument, id: NodeId, depth: usize, out: &mut String) {
-    if out.len() > MAX_OUTLINE {
-        return;
-    }
-    let Some(node) = doc.get_node(id) else { return };
-    let mut depth = depth;
-    if let Some(el) = node.element_data() {
-        let tag = el.name.local.as_ref();
-        if matches!(tag, "script" | "style" | "template" | "link" | "meta") {
-            return;
-        }
-        if tag == "input" && el.attr(blitz_dom::local_name!("type")).is_some_and(|t| t.eq_ignore_ascii_case("hidden")) {
-            return;
-        }
-        let mut line = tag.to_string();
-        if let Some(id) = el.attr(blitz_dom::local_name!("id")) {
-            line.push_str(&format!("#{id}"));
-        }
-        if let Some(class) = el.attr(blitz_dom::local_name!("class")) {
-            for c in class.split_whitespace().take(3) {
-                line.push_str(&format!(".{c}"));
-            }
-        }
-        for attr in el.attrs() {
-            let name = attr.name.local.as_ref();
-            let value = match name {
-                "href" | "src" | "action" => redact_relative(doc, &attr.value),
-                "alt" | "title" | "role" | "aria-label" | "type" | "name" | "placeholder" | "for" | "method" | "disabled" | "checked" => attr.value.to_string(),
-                _ => continue,
-            };
-            line.push_str(&format!(" {name}={value:?}"));
-        }
-        // Form fields: never their value, nor a textarea's contents.
-        let field = matches!(tag, "input" | "textarea" | "select");
-        if field {
-            line.push_str(" [value hidden]");
-        }
-        push_line(out, depth, &line);
-        if tag == "textarea" {
-            return;
-        }
-        depth += 1;
-    } else if let Some(text) = node.text_data() {
-        let text: String = text.content.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.is_empty() {
-            let short: String = text.chars().take(300).collect();
-            push_line(out, depth, &format!("{short:?}"));
-        }
-        return;
-    }
-    for &child in &node.children {
-        write_outline(doc, child, depth, out);
-    }
-}
-
-fn push_line(out: &mut String, depth: usize, line: &str) {
-    for _ in 0..depth {
-        out.push_str("  ");
-    }
-    out.push_str(line);
-    out.push('\n');
-}
-
-/// Attribute URLs are often relative; resolve them against the page so they can be redacted.
-fn redact_relative(doc: &BaseDocument, value: &str) -> String {
-    match doc.url().join(value) {
-        Ok(u) => redact(u.as_str()),
-        Err(_) => "[unreadable URL]".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blitz_dom::DocumentConfig;
-    use blitz_html::HtmlDocument;
 
     fn request(headers: &[(&str, &str)], body: &str) -> HttpRequest {
         HttpRequest {
@@ -563,30 +443,5 @@ mod tests {
         let list = rpc(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["list_tabs", "read_page", "console", "trace", "requests"]);
-    }
-
-    #[test]
-    fn urls_lose_credentials_query_values_and_fragments() {
-        assert_eq!(redact("https://me:pw@example.com/a?token=abc&x=1#access_token=zzz"), "https://example.com/a?token=REDACTED&x=REDACTED#REDACTED");
-        assert_eq!(redact("https://example.com/plain"), "https://example.com/plain");
-    }
-
-    #[test]
-    fn outline_hides_field_values_and_scripts() {
-        let html = r#"<html><head><title>Sign in</title><script>var secret = 1</script></head><body>
-            <h1 id="t" class="big title">Welcome</h1>
-            <a href="/next?session=abc">Next</a>
-            <form><input type="password" name="pw" value="hunter2"><input type="hidden" name="csrf" value="tok">
-            <textarea name="note">private note</textarea></form></body></html>"#;
-        let config = DocumentConfig { base_url: Some("https://example.com/login".into()), ..Default::default() };
-        let doc = HtmlDocument::from_html(html, config).into_inner();
-        let text = outline(&doc);
-        assert!(text.contains("h1#t.big.title"), "{text}");
-        assert!(text.contains("\"Welcome\""), "{text}");
-        assert!(text.contains(r#"href="https://example.com/next?session=REDACTED""#), "{text}");
-        assert!(text.contains(r#"input type="password" name="pw" [value hidden]"#), "{text}");
-        for secret in ["hunter2", "csrf", "tok", "private note", "var secret", "abc"] {
-            assert!(!text.contains(secret), "{secret} leaked:\n{text}");
-        }
     }
 }

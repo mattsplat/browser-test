@@ -31,9 +31,11 @@ macro_rules! local_asset {
 mod about_pages;
 mod ai_access;
 mod dart_pack;
+mod debug;
 mod dev_compile;
 mod gate;
 mod host;
+mod inspector;
 mod js_pack;
 mod js_permission;
 mod page_document;
@@ -75,6 +77,7 @@ pub(crate) enum Panel {
     Requests,
     Trace,
     Site,
+    Inspect,
 }
 
 static BROWSER_UI_STYLES: &str = local_asset!("browser.css");
@@ -240,6 +243,7 @@ fn app() -> Element {
                 Panel::Requests => rsx!(request_panel::RequestPanel {}),
                 Panel::Trace => rsx!(trace_panel::TracePanel { tabs, active_tab_id }),
                 Panel::Site => rsx!(site_panel::SitePanel { tabs, active_tab_id }),
+                Panel::Inspect => rsx!(inspector::Inspector { tabs, active_tab_id, open_panel }),
                 Panel::None => rsx!(),
             }
             StatusBar { tabs, active_tab_id }

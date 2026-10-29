@@ -412,6 +412,7 @@ pub fn Toolbar(
             PanelButton { open_panel, panel: Panel::Site, label: "Site" }
             PanelButton { open_panel, panel: Panel::Requests, label: "Requests" }
             PanelButton { open_panel, panel: Panel::Trace, label: "Trace" }
+            PanelButton { open_panel, panel: Panel::Inspect, label: "Inspect" }
             div { class: "menu-wrapper",
                 IconButton {
                     icon: icons::MENU_ICON,
