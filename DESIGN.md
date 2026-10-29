@@ -893,6 +893,27 @@ are generalisations:
   the error reloads it. Reload by replay (DESIGN "Hot reload" step 2) would restore the
   page's own state too; see time-travel replay below for what that needs.
 
+**Handle inspector and profiler** (Inspector → Handles, Profiler; `RunningPack::handles`,
+`debug::profile`).
+- **Handles** reads the page's `Objects` through `RunningPack::handles`: every handle the
+  pack holds and what it is (`Element p#out`, `Document`), listeners per node and event
+  type with each callback's id and call count, pending timers (kind, due in, callback), the
+  number of distinct callbacks the host refers to, and total calls into the pack. Refreshed
+  twice a second like the other views. WasmGC objects with field names (the original
+  "heap inspector" idea) aren't shown: dart2wasm ships no name section to read them with.
+- **Profiler:** each call into a pack (a listener, a timer or animation frame, and the
+  pack's `start`: loading plus the page's scripts) is now traced as a `TraceKind::Pack`
+  entry whose `micros` is the time **inside the pack**: the elapsed time less the host time
+  it caused, which `PageHost::traced` adds up in `Objects::host_micros`. Host operations
+  keep their own entries. `debug::profile` (tested) groups both by label, slowest first,
+  and the view shows pack time against host time with a bar per row.
+- It's a sorted table with bars, not a flame graph: calls into a pack don't nest (host calls
+  can't call back into the pack), so there's no stack to draw beyond pack → host.
+- **Limitations:** it covers what's in the trace (the last 2000 entries, all tabs), and
+  "Clear" clears the trace (as the console's does). Console and AI input are left out.
+  Pack time includes the pack's own work in Rust (string conversion in the bridge), which
+  is part of crossing the boundary but can't be separated without timing inside each pack.
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).

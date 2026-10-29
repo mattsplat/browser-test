@@ -150,7 +150,7 @@ pub enum Obj {
 }
 
 impl Obj {
-    fn interface(&self) -> &'static str {
+    pub(crate) fn interface(&self) -> &'static str {
         match self {
             Obj::Window => "Window",
             Obj::Document => "Document",
@@ -168,6 +168,17 @@ struct Timer {
     callback: usize,
     /// requestAnimationFrame: called with a timestamp.
     frame: bool,
+}
+
+/// A pending timer, as the Inspector's Handles view shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimerInfo {
+    pub handle: u32,
+    /// "timeout", "interval" or "frame".
+    pub kind: &'static str,
+    /// Milliseconds until it's due (negative: overdue, e.g. while paused).
+    pub due_in_ms: f64,
+    pub callback: usize,
 }
 
 /// A timer callback that is due, as `take_due_timers` hands it out.
@@ -194,6 +205,9 @@ pub struct Objects {
     /// Who the pack is running for, when not the page: console input ("console") or AI
     /// eval ("ai"). Host calls are traced under it.
     pub caller: std::cell::Cell<Option<&'static str>>,
+    /// Time spent in host calls so far, in microseconds, so time inside the pack can be told
+    /// apart from time crossing into the host (the Inspector's profiler).
+    pub host_micros: std::cell::Cell<u64>,
 }
 
 impl Default for Objects {
@@ -209,6 +223,7 @@ impl Default for Objects {
             started: Instant::now(),
             released_callbacks: Vec::new(),
             caller: Default::default(),
+            host_micros: Default::default(),
         }
     }
 }
@@ -275,6 +290,29 @@ impl Objects {
     pub fn summary(&self) -> String {
         let listeners: usize = self.listeners.values().map(Vec::len).sum();
         format!("{} live handles, {listeners} listeners, {} timers pending", self.objects.len(), self.timers.len())
+    }
+
+    /// Every object the pack holds a handle to, oldest first.
+    pub fn held(&self) -> Vec<(u32, Obj)> {
+        let mut held: Vec<(u32, Obj)> = self.objects.iter().map(|(h, o)| (*h, o.clone())).collect();
+        held.sort_by_key(|(h, _)| *h);
+        held
+    }
+
+    /// The timers waiting to run, soonest first.
+    pub fn pending_timers(&self, now: Instant) -> Vec<TimerInfo> {
+        let mut timers: Vec<TimerInfo> = self
+            .timers
+            .iter()
+            .map(|(handle, t)| TimerInfo {
+                handle: *handle,
+                kind: if t.frame { "frame" } else if t.interval.is_some() { "interval" } else { "timeout" },
+                due_in_ms: if t.due >= now { (t.due - now).as_secs_f64() * 1000.0 } else { -((now - t.due).as_secs_f64() * 1000.0) },
+                callback: t.callback,
+            })
+            .collect();
+        timers.sort_by(|a, b| a.due_in_ms.total_cmp(&b.due_in_ms));
+        timers
     }
 
     /// A callback can be released once no listener or timer refers to it.
@@ -374,11 +412,15 @@ impl PageHost {
     fn traced<T>(&mut self, label: String, args: String, f: impl FnOnce(&mut Self) -> Result<T>, show: impl Fn(&T) -> String) -> Result<T> {
         let started = Instant::now();
         let result = f(self);
+        let micros = started.elapsed().as_micros() as u64;
+        let objects = self.objects.borrow();
+        objects.host_micros.set(objects.host_micros.get() + micros);
+        drop(objects);
         let (kind, shown) = match &result {
             Ok(v) => (TraceKind::Call, show(v)),
             Err(e) => (TraceKind::Error, format!("ERROR {e:#}")),
         };
-        record(TraceEntry { pack: self.trace_pack(), kind, page: self.page.clone(), call: label, args, result: shown, micros: started.elapsed().as_micros() as u64 });
+        record(TraceEntry { pack: self.trace_pack(), kind, page: self.page.clone(), call: label, args, result: shown, micros });
         result
     }
 
@@ -658,6 +700,9 @@ pub enum TraceKind {
     Error,
     /// A pack loading, or being skipped.
     Load,
+    /// A call into the pack (a listener, a timer, its start), with the time spent inside the
+    /// pack: its own host calls are entries of their own and aren't counted.
+    Pack,
 }
 
 #[derive(Clone, Debug)]

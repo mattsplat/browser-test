@@ -788,6 +788,44 @@ body,
   color: #666;
 }
 
+/* Phase E: the Inspector's profiler */
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 12px;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.profile-label {
+  flex: 0 0 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-bar-track {
+  flex: 1 1 0px;
+  height: 10px;
+  background: #F3F3F3;
+}
+
+.profile-bar {
+  height: 10px;
+  background: #1565C0;
+
+  &.host {
+    background: #EF6C00;
+  }
+}
+
+.profile-numbers {
+  flex: 0 0 110px;
+  text-align: right;
+  color: #555;
+}
+
 .console-input {
   margin: 8px 12px;
   padding: 6px 8px;

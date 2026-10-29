@@ -366,6 +366,52 @@ pub fn requests(gate: &Gate, origin: &str, limit: usize) -> Vec<LogEntry> {
     gate.log().into_iter().filter(|e| e.page.as_deref() == Some(origin)).take(limit).collect()
 }
 
+// ---- Profiler
+
+/// One kind of call: how often it ran and the time it took, in microseconds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileRow {
+    pub label: String,
+    pub count: u64,
+    pub micros: u64,
+}
+
+/// Where a site's script time went: inside its packs (listeners, timers, start-up), and
+/// crossing into the host (each host operation), each slowest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Profile {
+    pub pack: Vec<ProfileRow>,
+    pub host: Vec<ProfileRow>,
+    pub pack_micros: u64,
+    pub host_micros: u64,
+}
+
+/// Aggregate trace entries (one site's, see `trace`) into a profile. Pack entries already
+/// leave out their host calls, so the two totals don't overlap. Console and AI input aren't
+/// the page's work and are left out.
+pub fn profile(entries: &[TraceEntry]) -> Profile {
+    let mut pack: Vec<ProfileRow> = Vec::new();
+    let mut host: Vec<ProfileRow> = Vec::new();
+    let add = |rows: &mut Vec<ProfileRow>, label: String, micros: u64| match rows.iter_mut().find(|r| r.label == label) {
+        Some(row) => {
+            row.count += 1;
+            row.micros += micros;
+        }
+        None => rows.push(ProfileRow { label, count: 1, micros }),
+    };
+    for e in entries.iter().filter(|e| e.pack != CONSOLE_PACK && e.pack != "ai") {
+        match e.kind {
+            TraceKind::Pack => add(&mut pack, format!("{}: {}", e.pack, e.call), e.micros),
+            // Failed host calls took time too; uncaught errors (no time) aren't host calls.
+            TraceKind::Call | TraceKind::Error if e.micros > 0 && e.call != "eval" => add(&mut host, e.call.clone(), e.micros),
+            _ => {}
+        }
+    }
+    pack.sort_by(|a, b| b.micros.cmp(&a.micros).then(a.label.cmp(&b.label)));
+    host.sort_by(|a, b| b.micros.cmp(&a.micros).then(a.label.cmp(&b.label)));
+    Profile { pack_micros: pack.iter().map(|r| r.micros).sum(), host_micros: host.iter().map(|r| r.micros).sum(), pack, host }
+}
+
 // ---- Exceptions
 
 /// What was true when a pack hit an uncaught error, kept for the Inspector.
@@ -530,6 +576,27 @@ mod tests {
         let eval = console_entry(&eval).unwrap();
         assert_eq!((eval.input.as_deref(), eval.text.as_str()), (Some("1 + 1"), "2"));
         assert!(console_entry(&entry(TraceKind::Call, "Document.querySelector", "#a", "#1")).is_none());
+    }
+
+    #[test]
+    fn profile_separates_pack_time_from_host_time() {
+        let entry = |pack: &'static str, kind, call: &str, micros| TraceEntry { pack, kind, page: "https://p.test/".into(), call: call.into(), args: String::new(), result: String::new(), micros };
+        let entries = [
+            entry("js", TraceKind::Pack, "click listener", 300),
+            entry("js", TraceKind::Pack, "click listener", 100),
+            entry("js", TraceKind::Pack, "timer", 50),
+            entry("js", TraceKind::Call, "Element.textContent =", 40),
+            entry("js", TraceKind::Call, "Document.querySelector", 70),
+            entry("js", TraceKind::Call, "Element.textContent =", 40),
+            entry("js", TraceKind::Error, "click listener", 0),
+            entry(CONSOLE_PACK, TraceKind::Call, "Element.textContent =", 900),
+            entry("js", TraceKind::Console, "console", 0),
+        ];
+        let p = profile(&entries);
+        let rows = |r: &[ProfileRow]| r.iter().map(|r| (r.label.clone(), r.count, r.micros)).collect::<Vec<_>>();
+        assert_eq!(rows(&p.pack), [("js: click listener".to_string(), 2, 400), ("js: timer".to_string(), 1, 50)]);
+        assert_eq!(rows(&p.host), [("Element.textContent =".to_string(), 2, 80), ("Document.querySelector".to_string(), 1, 70)]);
+        assert_eq!((p.pack_micros, p.host_micros), (450, 150));
     }
 
     /// What the user types into the console never reaches the redacted (AI) view.

@@ -5,6 +5,10 @@
 //! - **Console:** what the page logged and the errors it hit, filterable by level, with an
 //!   input line that evaluates in the page's JS or Python pack (Dart can't; see `PackRuntime`).
 //! - **Exceptions:** pause on exceptions, and the snapshots it kept.
+//! - **Handles:** what the page's pack holds: host objects by handle, listeners per node,
+//!   pending timers, and how often each callback ran.
+//! - **Profiler:** time inside the pack per kind of call, and time in each host operation,
+//!   aggregated from the trace (so it covers the trace's last 2000 entries).
 //! - **Network** is the Requests panel.
 //!
 //! Everything is read through `debug`, the same protocol AI access uses. Console input is the
@@ -34,6 +38,8 @@ enum View {
     Elements,
     Console,
     Exceptions,
+    Handles,
+    Profiler,
 }
 
 /// Which console lines show.
@@ -165,6 +171,8 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
         View::Console => rsx!(ConsoleView { page: page.clone(), entries: console, origin: origin.clone() }),
         // A plain function, not a component: it must re-render on every tick.
         View::Exceptions => exceptions_view(page.clone(), origin.clone(), tick, show_dom),
+        View::Handles => handles_view(page.clone()),
+        View::Profiler => profiler_view(&origin),
     };
 
     rsx!(
@@ -177,6 +185,8 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
                 div { class: tab_class(View::Elements), onclick: move |_| view.set(View::Elements), "Elements" }
                 div { class: tab_class(View::Console), onclick: move |_| view.set(View::Console), "Console" }
                 div { class: tab_class(View::Exceptions), onclick: move |_| view.set(View::Exceptions), "Exceptions" }
+                div { class: tab_class(View::Handles), onclick: move |_| view.set(View::Handles), "Handles" }
+                div { class: tab_class(View::Profiler), onclick: move |_| view.set(View::Profiler), "Profiler" }
                 div { class: "request-toggle", onclick: move |_| open_panel.set(Panel::Requests), "Network ↗" }
             }
             {body}
@@ -476,6 +486,89 @@ fn exceptions_view(page: Option<PageRef>, origin: String, mut tick: Signal<u64>,
                     }
                 }
             }
+        }
+    )
+}
+
+// ---- Handles
+
+/// What the page's pack holds, re-read on every tick.
+fn handles_view(page: Option<PageRef>) -> Element {
+    let Some(pack) = page.as_ref().and_then(|p| p.pack()) else {
+        return rsx!(div { class: "inspector-note", "No script runs on this page, so it holds nothing." });
+    };
+    let h = pack.handles();
+    let listener_count: usize = h.listeners.iter().map(|(_, _, ids)| ids.len()).sum();
+    rsx!(
+        div { class: "request-panel-controls",
+            span { class: "request-panel-counts",
+                "{h.objects.len()} handles, {listener_count} listeners, {h.timers.len()} timers, {h.callbacks} callbacks, {h.calls} calls"
+            }
+        }
+        div { class: "request-list",
+            div { class: "detail-section", "Listeners (node, event: callback × calls)" }
+            for (i, (node, kind, ids)) in h.listeners.iter().enumerate() {
+                div { key: "l{i}", class: "detail-row",
+                    span { class: "detail-key", "{node}" }
+                    span { class: "detail-value",
+                        "{kind}: "
+                        {ids.iter().map(|(id, n)| format!("#{id} × {n}")).collect::<Vec<_>>().join(", ")}
+                    }
+                }
+            }
+            div { class: "detail-section", "Timers" }
+            if h.timers.is_empty() {
+                div { class: "inspector-note", "No timers pending." }
+            }
+            for (t, n) in h.timers.iter() {
+                div { key: "t{t.handle}", class: "detail-row",
+                    span { class: "detail-key", "{t.kind} {t.handle}" }
+                    span { class: "detail-value", "in {t.due_in_ms:.0} ms → callback #{t.callback} (ran {n}×)" }
+                }
+            }
+            div { class: "detail-section", "Handles (host objects the pack can reach)" }
+            for (handle, what) in h.objects.iter() {
+                div { key: "h{handle}", class: "detail-row",
+                    span { class: "detail-key", "#{handle}" }
+                    span { class: "detail-value", "{what}" }
+                }
+            }
+        }
+    )
+}
+
+// ---- Profiler
+
+fn profiler_view(origin: &str) -> Element {
+    let p = debug::profile(&debug::trace(origin, Privacy::Full, usize::MAX));
+    let total = (p.pack_micros + p.host_micros).max(1);
+    let pct = |micros: u64| micros * 100 / total;
+    let ms = |micros: u64| format!("{:.1} ms", micros as f64 / 1000.0);
+    let rows = |rows: Vec<debug::ProfileRow>, class: &'static str| {
+        rsx!(
+            for row in rows {
+                div { key: "{row.label}", class: "profile-row",
+                    div { class: "profile-label", "{row.label}" }
+                    div { class: "profile-bar-track",
+                        div { class: "profile-bar {class}", style: "width: {pct(row.micros).max(1)}%" }
+                    }
+                    div { class: "profile-numbers", "{ms(row.micros)} · {row.count}×" }
+                }
+            }
+        )
+    };
+    rsx!(
+        div { class: "request-panel-controls",
+            span { class: "request-panel-counts",
+                "In the pack {ms(p.pack_micros)} ({pct(p.pack_micros)}%) · crossing into the host {ms(p.host_micros)} ({pct(p.host_micros)}%)"
+            }
+            div { class: "request-clear", onclick: move |_| host::clear_trace(), "Clear" }
+        }
+        div { class: "request-list",
+            div { class: "detail-section", "Inside the pack (excluding its host calls), slowest first" }
+            {rows(p.pack, "pack")}
+            div { class: "detail-section", "Host operations, slowest first" }
+            {rows(p.host, "host")}
         }
     )
 }

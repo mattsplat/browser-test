@@ -12,6 +12,7 @@
 //! evaluates in its pack, and pause on exceptions stops delivering it events and timers.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,7 +28,7 @@ use keyboard_types::Modifiers;
 use wasmtime::{Config, Engine, Trap};
 
 use crate::debug;
-use crate::host::{self, EventDetails, HostValue, Objects, PageHost, TraceEntry, TraceKind};
+use crate::host::{self, EventDetails, HostValue, Obj, Objects, PageHost, TimerInfo, TraceEntry, TraceKind};
 
 /// What the document needs from a pack. Every call runs on the UI thread, one at a time,
 /// under the time limit (`TIME_LIMIT_TICKS`).
@@ -136,9 +137,57 @@ pub struct RunningPack {
     /// Wakes the event loop when the next timer is due (set from `poll`).
     waker: Arc<Mutex<Option<Waker>>>,
     timer_thread: RefCell<Option<Sender<Instant>>>,
+    /// How many times each callback has been called, for the Inspector's Handles view.
+    fires: RefCell<HashMap<usize, u64>>,
+}
+
+/// What a page's pack holds, as the Inspector's Handles view shows it.
+pub struct Handles {
+    /// Handle and what it is (`Element button#go`, `Event click`, `Document`).
+    pub objects: Vec<(u32, String)>,
+    /// Node, event type, and each listener's callback id with how often it was called.
+    pub listeners: Vec<(String, String, Vec<(usize, u64)>)>,
+    /// Pending timers, with how often their callback was called.
+    pub timers: Vec<(TimerInfo, u64)>,
+    /// Distinct callbacks the host refers to (listeners and timers).
+    pub callbacks: usize,
+    /// Calls into the pack's callbacks since the page loaded.
+    pub calls: u64,
 }
 
 impl RunningPack {
+    /// What the pack holds right now: its handles, listeners per node, timers and callbacks.
+    pub fn handles(&self) -> Handles {
+        let objects = self.objects.borrow();
+        let doc = self.doc.borrow();
+        let fires = self.fires.borrow();
+        let count = |id: &usize| fires.get(id).copied().unwrap_or(0);
+        let held = objects
+            .held()
+            .into_iter()
+            .map(|(h, obj)| {
+                let what = match &obj {
+                    Obj::Element(node) => format!("Element {}", debug::describe(&doc, *node)),
+                    Obj::Event(e) => format!("Event {}", e.kind),
+                    other => other.interface().to_string(),
+                };
+                (h, what)
+            })
+            .collect();
+        let mut listeners: Vec<(String, String, Vec<(usize, u64)>)> = objects
+            .listeners
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|((node, kind), ids)| (debug::describe(&doc, *node), kind.clone(), ids.iter().map(|id| (*id, count(id))).collect()))
+            .collect();
+        listeners.sort();
+        let timers: Vec<(TimerInfo, u64)> = objects.pending_timers(Instant::now()).into_iter().map(|t| { let n = count(&t.callback); (t, n) }).collect();
+        let mut ids: Vec<usize> = objects.listeners.values().flatten().copied().chain(timers.iter().map(|(t, _)| t.callback)).collect();
+        ids.sort();
+        ids.dedup();
+        Handles { objects: held, listeners, timers, callbacks: ids.len(), calls: fires.values().sum() }
+    }
+
     /// Evaluate console input `source` in the page's pack, on behalf of `by` (the console, or
     /// AI access). Like any call, it goes in the trace; DOM access inside it goes through the
     /// host as usual.
@@ -216,8 +265,9 @@ impl RunningPack {
         }
         let due = self.objects.borrow_mut().take_due_timers(Instant::now());
         for timer in &due {
-            if let Err(e) = self.fire(timer.callback, &timer.args) {
-                self.uncaught("timer", String::new(), &e);
+            let during = if timer.args.is_empty() { "timer" } else { "animation frame" };
+            if let Err(e) = self.call(timer.callback, &timer.args, during, String::new()) {
+                self.uncaught(during, String::new(), &e);
             }
         }
         self.objects.borrow_mut().after_timers_ran(&due);
@@ -260,6 +310,20 @@ impl RunningPack {
     fn fire(&self, id: usize, args: &[HostValue]) -> Result<()> {
         self.runtime.borrow_mut().fire_callback(id, args)
     }
+
+    /// Call page function `id` for `during` (`click listener`, `timer`) on `on`, counted and
+    /// timed: the trace gets one `Pack` entry with the time spent inside the pack. The host
+    /// calls it made have entries of their own, so the profiler can tell the two apart.
+    fn call(&self, id: usize, args: &[HostValue], during: &str, on: String) -> Result<()> {
+        *self.fires.borrow_mut().entry(id).or_default() += 1;
+        let started = Instant::now();
+        let in_host = self.objects.borrow().host_micros.get();
+        let result = self.fire(id, args);
+        let in_host = self.objects.borrow().host_micros.get() - in_host;
+        let micros = (started.elapsed().as_micros() as u64).saturating_sub(in_host);
+        host::record(TraceEntry { pack: self.name, kind: TraceKind::Pack, page: self.page.clone(), call: during.to_string(), args: on, result: String::new(), micros });
+        result
+    }
 }
 
 pub struct PackDocument {
@@ -275,6 +339,8 @@ pub struct Startup {
     objects: Rc<RefCell<Objects>>,
     /// An error while starting paused the page (pause on exceptions is on).
     paused: bool,
+    /// When the pack started loading, for the profiler's `start` entry.
+    started: Instant,
 }
 
 impl Startup {
@@ -300,6 +366,9 @@ impl Startup {
 
     /// The running page, with the pack that started on it.
     pub fn finish(self, runtime: Box<dyn PackRuntime>) -> PackDocument {
+        // Loading the pack and running the page's code, less its host calls.
+        let micros = (self.started.elapsed().as_micros() as u64).saturating_sub(self.objects.borrow().host_micros.get());
+        host::record(TraceEntry { pack: self.name, kind: TraceKind::Pack, page: self.page.clone(), call: "start".into(), args: String::new(), result: String::new(), micros });
         let pack = RunningPack {
             name: self.name,
             page: self.page,
@@ -310,6 +379,7 @@ impl Startup {
             paused: Cell::new(self.paused),
             waker: Default::default(),
             timer_thread: Default::default(),
+            fires: Default::default(),
         };
         PackDocument { pack: Rc::new(pack) }
     }
@@ -329,7 +399,7 @@ impl PackDocument {
         let objects = Rc::new(RefCell::new(Objects::default()));
         let host = PageHost::new(name, doc.clone(), objects.clone());
         let page = host.page.clone();
-        (host, Startup { name, page, doc, objects, paused: false })
+        (host, Startup { name, page, doc, objects, paused: false, started: Instant::now() })
     }
 }
 
@@ -497,9 +567,10 @@ impl EventHandler for PackEventHandler<'_> {
                 e.current_target = *node;
             }
             for id in ids {
-                if let Err(e) = pack.fire(id, &[HostValue::Object(handle)]) {
-                    let on = debug::describe(&pack.doc.borrow(), *node);
-                    pack.uncaught(&format!("{kind} listener"), on, &e);
+                let on = debug::describe(&pack.doc.borrow(), *node);
+                let during = format!("{kind} listener");
+                if let Err(e) = pack.call(id, &[HostValue::Object(handle)], &during, on.clone()) {
+                    pack.uncaught(&during, on, &e);
                 }
                 if flag(|e| e.immediate_propagation_stopped) || pack.paused.get() {
                     break 'nodes;
@@ -1002,6 +1073,32 @@ mod tests {
         assert!(err.contains("script ran too long and was stopped (Dart)"), "{err}");
         let err = page.pack.fire(id, &[event]).unwrap_err().to_string();
         assert!(err.contains("was stopped (it ran too long or crashed)"), "{err}");
+    }
+
+    /// The Handles view sees what the pack holds and how often each callback ran; each call
+    /// into the pack is traced with its own time, apart from its host calls.
+    #[test]
+    fn handles_and_pack_calls_for_the_inspector() {
+        let mut page = js_page("<button id=b>go</button><p id=out></p>", &[
+            "const out = document.querySelector('#out');
+             document.querySelector('#b').addEventListener('click', () => { out.textContent = 'clicked'; });
+             setTimeout(() => {}, 60000);",
+        ]);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        let h = page.pack.handles();
+        assert_eq!(h.listeners.len(), 1);
+        let (node, kind, ids) = &h.listeners[0];
+        assert_eq!((node.as_str(), kind.as_str(), ids[0].1), ("button#b", "click", 2));
+        assert_eq!((h.timers.len(), h.timers[0].0.kind), (1, "timeout"));
+        assert!(h.timers[0].0.due_in_ms > 50_000.0);
+        assert_eq!((h.callbacks, h.calls), (2, 2));
+        assert!(h.objects.iter().any(|(_, what)| what == "Element p#out"), "{:?}", h.objects);
+        assert!(h.objects.iter().all(|(_, what)| !what.starts_with("Event")), "event objects are released");
+        // Each click is a Pack entry on this page, as is the start.
+        let mine: Vec<_> = host::trace().into_iter().filter(|e| e.page == page.pack.page && e.kind == TraceKind::Pack).collect();
+        assert!(mine.iter().any(|e| e.call == "start"));
+        assert!(mine.iter().filter(|e| e.call == "click listener" && e.args == "button#b").count() >= 2);
     }
 
     // ---- The Python pack: the same contract, a third language.
