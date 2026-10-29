@@ -1245,7 +1245,7 @@ mod tests {
             page.pack.run_queued_events();
             page.pack.run_due_timers();
             let objects = page.pack.objects.borrow();
-            if !objects.fetching() && objects.next_deadline().is_none() && objects.queued_events.is_empty() {
+            if objects.fetching == 0 && objects.next_deadline().is_none() && objects.queued_events.is_empty() {
                 break;
             }
         }
@@ -1379,6 +1379,29 @@ mod tests {
         assert_eq!(outcome.diverged, None);
         assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom);
         assert_eq!(replayed.pack().doc.borrow().url().as_str(), "https://traverse.test/b#x");
+    }
+
+    /// Fetches that fail without reaching the network (a bad URL, no network) replay the same.
+    #[tokio::test]
+    async fn failed_fetches_replay_without_diverging() {
+        let url = "https://fetch-fails.test/";
+        replay::arm(url);
+        let html = "<p id=out></p>";
+        let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let scripts = vec![Script { name: "f.js".into(), source: "
+            const out = document.querySelector('#out');
+            fetch('http://[bad').catch((e) => { out.textContent += 'bad:' + e.name + ';'; });
+            fetch('/x').catch((e) => { out.textContent += 'nonet:' + e.name + ';'; });".into(), module: false }];
+        let mut page = crate::js_pack::start(doc, PageEnv::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+        page.attach_recording(html, None, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() });
+        settle_network(&mut page).await;
+        assert_eq!(output(&page), "bad:TypeError;nonet:TypeError;");
+        let recording = page.pack.stop_recording().unwrap();
+        let config = DocumentConfig { base_url: Some(url.into()), ..Default::default() };
+        let (mut replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+        settle_timers(&mut replayed);
+        assert_eq!(outcome.diverged, None);
+        assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom);
     }
 
     // ---- Time-travel replay: record a session, replay it in a fresh pack, same DOM.

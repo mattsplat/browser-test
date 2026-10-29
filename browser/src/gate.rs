@@ -48,6 +48,30 @@ pub fn site_of(url: &Url) -> Option<String> {
     Some(psl::domain_str(host).unwrap_or(host).to_string())
 }
 
+/// Whether `page` is a public site, whose fetches may not reach private addresses. Local
+/// pages aren't: files, IP addresses that are themselves private, `localhost` and the
+/// reserved local names (`.test`, `.localhost`, `.local`, `.internal`), as Herd uses.
+pub fn is_public_page(page: &Url) -> bool {
+    match page.host() {
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name != "localhost" && ![".localhost", ".test", ".local", ".internal", ".home.arpa"].iter().any(|s| name.ends_with(s))
+        }
+        Some(url::Host::Ipv4(ip)) => blitz_net::is_public_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => blitz_net::is_public_ip(ip.into()),
+        None => false,
+    }
+}
+
+/// Whether `url`'s host is a private or local IP address (names are checked as they resolve).
+fn private_address(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => !blitz_net::is_public_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => !blitz_net::is_public_ip(ip.into()),
+        _ => false,
+    }
+}
+
 /// Whether a request from `from` to `to` is cross-site, as `SameSite` cookies see it: their
 /// sites differ, or `from` has none (a file or about page).
 pub fn cross_site(from: &Url, to: &Url) -> bool {
@@ -209,7 +233,13 @@ impl Gate {
                 sent.body = Body::Bytes(Bytes::from(body.clone()));
             }
             sent.signal = request.signal.clone();
-            let response = self.inner.fetch_once(sent, credentials, MAX_BODY, FETCH_TIMEOUT).await.map_err(|e| failed(&url, e.to_string()))?;
+            // A public site's page can't reach this machine or the local network, by an
+            // address or by a name that resolves to one (DNS rebinding).
+            let public_only = is_public_page(page);
+            if public_only && private_address(&url) {
+                return Err(failed(&url, "a public page can't reach private or local addresses".into()));
+            }
+            let response = self.inner.fetch_once(sent, credentials, public_only, MAX_BODY, FETCH_TIMEOUT).await.map_err(|e| failed(&url, e.to_string()))?;
             let header = |name: &str| response.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 if let Some(next) = header("location").and_then(|l| url.join(&l).ok()) {
@@ -544,6 +574,18 @@ mod tests {
         let mut put = PageFetch::new(url("https://a.test/"));
         put.method = "PUT".into();
         assert!(!put.is_simple());
+    }
+
+    /// A public site's page can't reach this machine: not by address, not by a name that
+    /// resolves to it. Local pages can.
+    #[tokio::test]
+    async fn public_pages_cant_reach_private_addresses() {
+        assert!(is_public_page(&url("https://news.example/")));
+        assert!(!is_public_page(&url("http://myapp.test/")) && !is_public_page(&url("http://127.0.0.1:8000/")) && !is_public_page(&url("file:///a.html")));
+        assert!(private_address(&url("http://192.168.1.1/")) && private_address(&url("http://[::1]/")) && private_address(&url("http://10.0.0.8/")));
+        assert!(!private_address(&url("http://93.184.216.34/")) && !private_address(&url("http://example.com/")));
+        // A name that resolves only to this machine is refused by the resolver.
+        assert!(blitz_net::resolve_public("localhost").await.is_err());
     }
 
     /// A blocked request is refused before anything is sent, and logged as the page's.

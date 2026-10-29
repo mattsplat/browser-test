@@ -203,6 +203,18 @@ impl Obj {
     }
 }
 
+/// Whether `history.pushState` may change the page's URL from `current` to `url` (the HTML
+/// spec's rule): the same scheme, username, password, host and port, so no userinfo
+/// spoofing (`https://bank.test@evil.test/`), and on a `file:` page the same path too.
+fn can_rewrite(current: &Url, url: &Url) -> bool {
+    current.scheme() == url.scheme()
+        && current.username() == url.username()
+        && current.password() == url.password()
+        && current.host() == url.host()
+        && current.port() == url.port()
+        && (url.scheme() != "file" || current.path() == url.path())
+}
+
 /// `navigator.language`. Fixed rather than the system's, so pages can't use it to tell
 /// machines apart beyond what the User-Agent already says.
 const LANGUAGE: &str = "en-US";
@@ -315,7 +327,7 @@ pub struct Objects {
     /// Fetches finished on the network's threads, for the UI thread to settle (`take_fetched`).
     fetched: std::sync::Arc<Mutex<Vec<Fetched>>>,
     /// Fetches started and not yet taken.
-    fetching: usize,
+    pub(crate) fetching: usize,
     /// Wakes the page's event loop: a timer is due, or a fetch finished.
     pub waker: std::sync::Arc<Mutex<Option<std::task::Waker>>>,
     /// `history.state` for the page's current entry, as JSON text; None until first read
@@ -522,12 +534,6 @@ impl Objects {
         let done = std::mem::take(&mut *self.fetched.lock().unwrap());
         self.fetching -= done.len().min(self.fetching);
         done
-    }
-
-    /// Whether a `fetch` is still on its way.
-    #[cfg(test)]
-    pub fn fetching(&self) -> bool {
-        self.fetching > 0
     }
 
     /// Settle `promise` with a finished fetch: a new `Response`, or a TypeError message.
@@ -778,22 +784,32 @@ impl PageHost {
             Ok(request)
         })();
         let mut objects = self.objects.borrow_mut();
-        if objects.tape.replaying() {
-            return Ok(HostValue::Object(promise));
-        }
-        let (request, gate, runtime) = match (request, &self.env.gate, tokio::runtime::Handle::try_current()) {
-            (Ok(request), Some(gate), Ok(runtime)) => (request, gate.clone(), runtime),
-            (Err(e), _, _) => {
+        // A bad URL fails the same way every time, replayed or not.
+        let request = match request {
+            Ok(request) => request,
+            Err(e) => {
                 objects.settle(promise, Err(HostValue::str(&format!("{e:#}"))));
                 return Ok(HostValue::Object(promise));
             }
+        };
+        // Replaying, the recorded outcome arrives as a step.
+        if objects.tape.replaying() {
+            return Ok(HostValue::Object(promise));
+        }
+        let (fetched, waker) = (objects.fetched.clone(), objects.waker.clone());
+        objects.fetching += 1;
+        let (gate, runtime) = match (&self.env.gate, tokio::runtime::Handle::try_current()) {
+            (Some(gate), Ok(runtime)) => (gate.clone(), runtime),
             _ => {
-                objects.settle(promise, Err(HostValue::str("TypeError: Failed to fetch: this page has no network")));
+                // No network: it fails like a request that went nowhere, delivered (and
+                // recorded) as any other outcome is, so a replay matches.
+                fetched.lock().unwrap().push((promise, Err("TypeError: Failed to fetch: this page has no network".into())));
+                if let Some(w) = waker.lock().unwrap().as_ref() {
+                    w.wake_by_ref();
+                }
                 return Ok(HostValue::Object(promise));
             }
         };
-        objects.fetching += 1;
-        let (fetched, waker) = (objects.fetched.clone(), objects.waker.clone());
         runtime.spawn(async move {
             let result = gate.fetch_from_page(request, &page).await;
             fetched.lock().unwrap().push((promise, result));
@@ -1191,7 +1207,7 @@ impl PageHost {
                     Some(HostValue::Undefined | HostValue::Null) | None => current.clone(),
                     Some(v) => current.join(&v.display()).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {:?} ({e})", v.display()))?,
                 };
-                if url.origin() != current.origin() {
+                if !can_rewrite(&current, &url) {
                     bail!("SecurityError: {method} can't change the page's origin (to {url})");
                 }
                 self.doc.borrow_mut().set_base_url(url.as_str());
@@ -1493,6 +1509,20 @@ mod tests {
             let n = host.call(&math, "random", &[]).unwrap().as_num().unwrap();
             assert!((0.0..1.0).contains(&n));
         }
+    }
+
+    #[test]
+    fn push_state_can_only_rewrite_within_the_page() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let page = url("https://a.test/app?x=1");
+        assert!(can_rewrite(&page, &url("https://a.test/other#h")));
+        assert!(!can_rewrite(&page, &url("https://paypal.com@a.test/")), "userinfo spoofing");
+        assert!(!can_rewrite(&page, &url("https://b.test/")));
+        assert!(!can_rewrite(&page, &url("http://a.test/app")));
+        assert!(!can_rewrite(&page, &url("https://a.test:8443/app")));
+        let file = url("file:///Users/me/site/index.html");
+        assert!(can_rewrite(&file, &url("file:///Users/me/site/index.html?q=1#x")), "a file page may change its query and fragment");
+        assert!(!can_rewrite(&file, &url("file:///Users/me/site/other.html")));
     }
 
     #[test]
