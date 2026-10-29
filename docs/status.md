@@ -4,7 +4,8 @@ Where the browser stands after Phases B–E and both web-platform parity passes.
 reasoning and per-feature notes live in `DESIGN.md`; the pack contract is in `docs/packs.md`.
 
 Every phase was built, tested, code-reviewed by a separate agent, fixed, and re-tested.
-177 tests pass (`cd browser && cargo test --release`, ~2.6 s); release build has no warnings.
+183 tests pass (`cd browser && cargo test --release`, ~2.8 s; the JS, Python and PHP packs must be
+built first); release build has no warnings.
 
 ## Build and run
 
@@ -26,7 +27,7 @@ cd browser && cargo build --release && ./target/release/browser [--profile <name
 | Area | Delivered |
 |---|---|
 | Phase A | Timers, listener identity, event details, error types and stacks, ES modules, JS permission bar (default Ask) |
-| Phase B | Inspector (Elements, Console with eval, Exceptions, Handles, Profiler, Recording); shared debug layer (`debug.rs`); pause on exceptions; read-only AI access (MCP) and AI control as separate switches; 5 s time limit on pack code |
+| Phase B | Inspector (Elements with an element picker, Console with eval, Exceptions, Handles, Profiler, Recording); shared debug layer (`debug.rs`); pause on exceptions; read-only AI access (MCP) and AI control as separate switches; 5 s time limit on pack code |
 | Phase C | Command palette (Cmd+K / Cmd+Shift+P), vertical tabs, pinned tabs, idle auto-close (12 h default), reopen closed (Cmd+Shift+T, 50 kept across restarts), session restore, spaces, profiles (one process + data folder each) |
 | Phase D | Pack contract (`docs/packs.md`); Python pack; 512 MB memory cap per page; crashed packs stop cleanly |
 | Phase E | Per-site CSS, Split View, dev-mode hot reload with state restore, Dart compiled-code cache (per site and profile), time-travel replay |
@@ -58,7 +59,7 @@ its own tests (`php_*` in `page_document.rs`) but isn't in the cross-pack ones y
 ## Hand checks (not yet done; the agents couldn't drive the GUI)
 
 - [ ] **Dev mode:** prompt on `examples/counter/dev.html`; every Site panel toggle; JS bar on `examples/js-counter` (Allow this visit / Always / Keep off).
-- [ ] **Inspector:** Elements highlight follows selection; Console eval on JS and Python pages; Dart shows the "can't evaluate" note; pause on exceptions, then Resume.
+- [ ] **Inspector:** Elements highlight follows selection; Toggle DevTools, then click an element: it's selected in Elements; Console eval on JS and Python pages; Dart shows the "can't evaluate" note; pause on exceptions, then Resume.
 - [ ] **AI access:** turn on, connect Claude Code (command below); cookies, storage and form values show `(hidden)`; AI control appears only while access is on.
 - [ ] **Tabs and profiles:** Cmd+K; vertical tabs layout (traffic lights, panel offset); restart restores tabs; Cmd+Shift+T; new profile opens a second window; existing history appears under Default.
 - [ ] **Python:** `examples/python-counter`; a `while True: pass` handler stops after ~5 s.

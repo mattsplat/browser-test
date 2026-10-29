@@ -1076,7 +1076,8 @@ mod tests {
 
         let doc = page.pack.doc.borrow();
         assert_eq!(text_of(&doc, "#count"), "2");
-        assert_eq!(text_of(&doc, "#log"), "Click 1, handled in Dart (click)Click 2, handled in Dart (click)");
+        // The counter reuses one <li>, so the log shows only the latest click.
+        assert_eq!(text_of(&doc, "#log"), "Click 2, handled in Dart");
         drop(doc);
 
         // Dart has no runtime compiler, so the console says so instead of evaluating.
