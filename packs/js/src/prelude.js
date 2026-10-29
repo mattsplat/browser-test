@@ -16,7 +16,7 @@
     'setAttribute', 'getAttribute', 'removeAttribute', 'addEventListener', 'removeEventListener',
     'preventDefault', 'stopPropagation', 'stopImmediatePropagation',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
+    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'debug', 'random',
     'fetch', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
     'scrollTo', 'scroll', 'scrollBy',
@@ -24,10 +24,16 @@
     'removeChild', 'cloneNode', 'hasAttribute', 'contains', 'getBoundingClientRect', 'focus', 'blur',
     'add', 'toggle', 'setProperty', 'getPropertyValue', 'removeProperty',
     'WebSocket', 'send', 'close',
+    // IndexedDB. (`transaction` is a method of databases; requests' and stores'
+    // `transaction` properties aren't supported, as one name can't be both.)
+    'open', 'deleteDatabase', 'createObjectStore', 'deleteObjectStore', 'transaction', 'objectStore',
+    'put', 'delete', 'getAll', 'count', 'clear',
   ]);
   // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
   const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
   const STORAGE = new Set(['localStorage', 'sessionStorage']);
+  // The console's methods: `error` is a method there, but a property of an IndexedDB request.
+  const CONSOLE_METHODS = new Set([...METHODS, 'error']);
   // Methods that return a host promise, which becomes a real JS Promise.
   const PROMISES = new Set(['fetch', 'text']);
 
@@ -136,7 +142,7 @@
   const window = request({ op: 'global', name: 'window' });
   globalThis.window = window;
   globalThis.document = request({ op: 'global', name: 'document' });
-  globalThis.console = request({ op: 'global', name: 'console' });
+  globalThis.console = wrap(JSON.parse(__host(JSON.stringify({ op: 'global', name: 'console' }))).ok.o, CONSOLE_METHODS);
   const math = request({ op: 'global', name: 'Math' });
   // Randomness and timers come from the host, as for every pack.
   Math.random = () => math.random();
@@ -168,6 +174,7 @@
   Object.assign(globalThis.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   globalThis.localStorage = window.localStorage;
   globalThis.sessionStorage = window.sessionStorage;
+  globalThis.indexedDB = window.indexedDB;
 
   // Console results, formatted for reading: strings quoted, objects and arrays shown a few
   // levels deep, host objects by what they are. Element names cost two host calls (traced).

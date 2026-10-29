@@ -13,7 +13,7 @@ METHODS = {
     'setAttribute', 'getAttribute', 'removeAttribute', 'addEventListener', 'removeEventListener',
     'preventDefault', 'stopPropagation', 'stopImmediatePropagation',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'error', 'debug', 'random',
+    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'debug', 'random',
     'fetch', 'then', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
     'scrollTo', 'scroll', 'scrollBy',
@@ -21,6 +21,10 @@ METHODS = {
     'removeChild', 'cloneNode', 'hasAttribute', 'contains', 'getBoundingClientRect', 'focus', 'blur',
     'add', 'toggle', 'setProperty', 'getPropertyValue', 'removeProperty',
     'WebSocket', 'send', 'close',
+    # IndexedDB. (`transaction` is a method of databases; requests' and stores'
+    # `transaction` properties aren't supported, as one name can't be both.)
+    'open', 'deleteDatabase', 'createObjectStore', 'deleteObjectStore', 'transaction', 'objectStore',
+    'put', 'delete', 'getAll', 'count', 'clear',
 }
 # Storage's methods. Kept apart because `key` is also a property (of keyboard events).
 STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}
@@ -156,6 +160,12 @@ class HostObject:
         return describe(self)
 
 
+class Console(HostObject):
+    """The console: `error` is a method there, but a property of an IndexedDB request."""
+    __slots__ = ()
+    _methods = METHODS | {'error'}
+
+
 class Storage(HostObject):
     """localStorage or sessionStorage."""
     __slots__ = ()
@@ -200,13 +210,14 @@ class Promise:
 
 window = request({'op': 'global', 'name': 'window'})
 document = request({'op': 'global', 'name': 'document'})
-console = request({'op': 'global', 'name': 'console'})
+console = Console(request({'op': 'global', 'name': 'console'})._handle)
 Math = request({'op': 'global', 'name': 'Math'})
 location = window.location
 navigator = window.navigator
 history = window.history
 localStorage = window.localStorage
 sessionStorage = window.sessionStorage
+indexedDB = window.indexedDB
 
 
 # Timers come from the host, as for every pack. Extra arguments are passed to the callback,
@@ -271,7 +282,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'WebSocket'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'WebSocket', 'indexedDB'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}

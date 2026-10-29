@@ -53,12 +53,14 @@ pub enum Read {
     /// An element's box (`getBoundingClientRect`, as JSON text): layout depends on the window
     /// and the fonts.
     Layout,
+    /// An IndexedDB operation's outcome (JSON text): another tab may change the databases.
+    Idb,
 }
 
 impl Read {
     /// Whether the tape value is an index into the recording's texts.
     fn is_text(self) -> bool {
-        matches!(self, Read::Cookie | Read::Storage | Read::State | Read::Field | Read::Layout)
+        matches!(self, Read::Cookie | Read::Storage | Read::State | Read::Field | Read::Layout | Read::Idb)
     }
 }
 
@@ -81,6 +83,9 @@ pub enum Step {
     Fetch { promise: u32, result: Result<crate::gate::FetchResponse, String> },
     /// Something happened on a WebSocket (by handle): opened, a message, an error, closed.
     Socket { socket: u32, event: crate::websocket::SocketEvent },
+    /// An event the page's own code caused on an object that isn't a node, by handle (an
+    /// IndexedDB request's `success`, a transaction's `complete`).
+    ObjectEvent { target: u32, kind: String },
 }
 
 impl Step {
@@ -94,6 +99,7 @@ impl Step {
             Step::Traverse { url, .. } => format!("moved to {url}"),
             Step::Fetch { result: Ok(r), .. } => format!("fetch answered ({})", r.status),
             Step::Fetch { result: Err(_), .. } => "fetch failed".into(),
+            Step::ObjectEvent { kind, .. } => format!("{kind} (IndexedDB)"),
             Step::Socket { event, .. } => format!("WebSocket {}", match event {
                 crate::websocket::SocketEvent::Open { .. } => "opened",
                 crate::websocket::SocketEvent::Message(_) => "message",
@@ -132,6 +138,7 @@ impl Step {
                 Ok(r) => r.url.len() + r.body.len() + r.headers.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>(),
                 Err(e) => e.len(),
             },
+            Step::ObjectEvent { kind, .. } => kind.len(),
             Step::Socket { event, .. } => match event {
                 crate::websocket::SocketEvent::Message(text) => text.len(),
                 crate::websocket::SocketEvent::Open { protocol } => protocol.len(),

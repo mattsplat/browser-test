@@ -471,6 +471,12 @@ enum Helper {
     Split,
     /// `o => o instanceof Array`
     IsArray,
+    /// `() => []`, `o => [o]`, `(o0, o1) => [o0, o1]`...: an array of the arguments (`jsify`).
+    ArrayLiteral,
+    /// `(a, i) => a.push(i)`
+    Push,
+    /// `0` null/undefined, `2` anything else.
+    ClassifyNull,
     Unsupported(String),
 }
 
@@ -493,6 +499,11 @@ fn classify(body: &str) -> Helper {
             return helper(c[1].to_string());
         }
     }
+    static ARRAY: OnceLock<Regex> = OnceLock::new();
+    let array = ARRAY.get_or_init(|| Regex::new(r"^(?:\(\)|o|\(o\d+(?:, o\d+)*\)) => \[(?:o\d*(?:, o\d+)*)?\]$").unwrap());
+    if array.is_match(b) {
+        return Helper::ArrayLiteral;
+    }
     static LITERAL: OnceLock<Regex> = OnceLock::new();
     let literal = LITERAL.get_or_init(|| Regex::new(r"^(?:\((?:x\d+(?:,x\d+)*)?\)|x\d+) => \(\{(.*)\}\)$").unwrap());
     if let Some(c) = literal.captures(b) {
@@ -506,6 +517,8 @@ fn classify(body: &str) -> Helper {
         "(o, p, v) => o[p] = v" | "(x0,x1,x2) => { x0[x1] = x2 }" => Helper::SetIndex,
         "(string, token) => string.split(token)" => Helper::Split,
         "o => o instanceof Array" => Helper::IsArray,
+        "(a, i) => a.push(i)" => Helper::Push,
+        _ if b.contains("if (o === null || o === undefined) return 0;\nreturn 2;") => Helper::ClassifyNull,
         "(l, r) => l === r" => Helper::StrictEquals,
         "(s, p, i) => s.lastIndexOf(p, i)" => Helper::LastIndexOf,
         _ if b.contains("queueMicrotask(") => Helper::QueueMicrotask,
@@ -851,6 +864,18 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
             caller.data_mut().host.set(&args[0], &args[1].display(), &args[2])?;
             args[2].clone()
         }
+        Helper::ArrayLiteral => {
+            let args = host_args(caller, params)?;
+            caller.data_mut().host.array(args)?
+        }
+        Helper::Push => {
+            let args = host_args(caller, params)?;
+            caller.data_mut().host.call(&args[0], "push", &args[1..])?
+        }
+        Helper::ClassifyNull => HostValue::Num(match to_host(caller, &params[0])? {
+            HostValue::Undefined | HostValue::Null => 0.0,
+            _ => 2.0,
+        }),
         Helper::IsArray => {
             let value = to_host(caller, &params[0])?;
             HostValue::Bool(caller.data_mut().host.is_array(&value))
@@ -1000,6 +1025,9 @@ mod tests {
         assert!(matches!(classify("o => o"), Helper::Identity));
         assert!(matches!(classify("x0 => new WebSocket(x0),"), Helper::Construct(n) if n == "WebSocket"));
         assert!(matches!(classify("() => new Error().stack"), Helper::Stack));
+        assert!(matches!(classify("() => [],"), Helper::ArrayLiteral));
+        assert!(matches!(classify("o => [o],"), Helper::ArrayLiteral));
+        assert!(matches!(classify("(o0, o1, o2) => [o0, o1, o2],"), Helper::ArrayLiteral));
         assert!(matches!(classify("x0 => eval(x0)"), Helper::Unsupported(_)));
     }
 

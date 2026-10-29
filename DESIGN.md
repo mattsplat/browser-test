@@ -13,7 +13,8 @@ CSS, Split View, hot reload with state restoration, the Handles and Profiler vie
 compiled-code cache and time-travel replay (see "Phase E notes"). Web platform parity part 1
 is done: `document.cookie`, `fetch`, `localStorage`/`sessionStorage`, `location`/`history`
 and window basics in all three packs (see "Web platform parity notes"). Part 2 adds DOM
-breadth and form events (see "Web platform parity part 2 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+breadth and form events, `WebSocket` and a subset of IndexedDB (see "Web platform
+parity part 2 notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -374,7 +375,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 | `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | **Done** | Phase A: host-owned timers, woken by the event loop |
 | Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). **`WebSocket` done** (text messages, through the gate; see "Web platform parity part 2 notes"). `XMLHttpRequest` deferred |
-| Storage: `localStorage`, `sessionStorage`, IndexedDB | Partly | **`localStorage` and `sessionStorage` done** (`storage.rs`; see "Web platform parity notes"). IndexedDB deferred |
+| Storage: `localStorage`, `sessionStorage`, IndexedDB | **Done** (subset) | **`localStorage` and `sessionStorage`** (`storage.rs`; see "Web platform parity notes"); **IndexedDB, a useful subset** (`idb.rs`: stores, transactions, put/add/get/delete/getAll/count/clear; no indexes or cursors; see "Web platform parity part 2 notes") |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | **Done** (part 2) | Listeners, details, `preventDefault`, propagation, `popstate`/`hashchange`/`resize`, and form events: `input`, `change`, `submit` (cancellable), `focus`/`blur`; see "Web platform parity part 2 notes" |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | **Done** (part 2) | Queries, tree walking and editing, `classList`, `dataset`, `style`, `innerHTML`/`outerHTML`, `getBoundingClientRect`, `focus`/`blur`, form `value`/`checked`/`disabled`; see "Web platform parity part 2 notes" |
 | `window` and `location`: URL, navigation, `history`, viewport size | **Done** (part 1) | `location`, `history`, `innerWidth`/`innerHeight`, `devicePixelRatio`, scroll, `navigator.userAgent`/`language`, `resize`; see "Web platform parity notes" |
@@ -1367,7 +1368,61 @@ fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
   `ArrayBuffer`/`Blob` in the host), so `binaryType` is ignored; `bufferedAmount` is
   always 0; no extensions (no compression); closing while still connecting waits for the
   connection and closes it then. Events go to non-node objects through a small generic
-  mechanism (`Objects::target_listeners` and `handlers`, `RunningPack::dispatch_object`),
+  mechanism (`Objects::target_listeners` and `handlers`, `RunningPack::dispatch
+**IndexedDB, a useful subset** (`browser/src/idb.rs`; cross-pack test
+`indexed_db_behaves_the_same_in_dart_js_and_python`, fixtures `tests/fixtures/idb.*`, and
+`indexed_db_refuses_what_it_should`).
+- `indexedDB.open(name, version)` with `upgradeneeded` then `success` (or `error`:
+  `VersionError` for an older version), `deleteDatabase`; a database's `name`, `version`,
+  `objectStoreNames`, `createObjectStore(name, {keyPath, autoIncrement})` and
+  `deleteObjectStore` (only during `upgradeneeded`: `InvalidStateError` otherwise),
+  `transaction(stores, mode)` and `close`; a transaction's `objectStore`, `mode` and
+  `complete` event; a store's `name`, `keyPath`, `autoIncrement`, `put`, `add`
+  (`ConstraintError` for an existing key), `get`, `delete`, `getAll`, `count` and `clear`,
+  each returning a request with `result`, `error` (`name`, `message`), `readyState` and
+  `success`/`error` events, through `on<event>` or `addEventListener`.
+- **Storage:** per profile and origin, one JSON file per origin in the profile's
+  `indexeddb/` folder (named by a SHA-256 of the origin), replaced whole on every change, as
+  local storage is; in memory with no profile folder. A change that would take an origin
+  over 10 MB (its JSON; twice local storage's limit) fails with `QuotaExceededError` and
+  changes nothing. SQLite (the `persistence` crate) was considered: it would make big
+  databases cheaper to change, but adds a schema, migrations and a connection per profile
+  for what is today a small subset; whole-file writes keep it the same as local storage and
+  are fine at this size. **Tradeoff:** every write rewrites the origin's file.
+- **Values** are JSON data: strings, numbers, booleans, null, arrays and plain objects, not
+  the whole structured-clone algorithm (no `Date`, `Map`, `Set`, `Blob`, typed arrays or
+  cycles). **Keys** are numbers or strings, numbers first; key paths are a name or a dotted
+  path (`autoIncrement` fills only a top-level one); no array, date or binary keys, and no
+  compound key paths.
+- **How it runs:** each operation runs at once, on the UI thread, and its outcome is kept in
+  its request; the request's `success` or `error` is queued (`Objects::queued_object_events`)
+  and dispatched once the page's code returns, like any task, so handlers set after the call
+  still run. A transaction's `complete` is queued when it's made and waits until its
+  requests' events have gone. So transactions don't isolate or roll back: each operation is
+  committed as it runs, and `abort()` isn't supported. A request's `error` doesn't bubble to
+  its transaction or database. There are no `versionchange` or `blocked` events between
+  tabs. Dart's `jsify` of maps with lists needed three more dart2wasm snippets (`() => []`,
+  `(a, i) => a.push(i)`, `o => [o]` and longer array literals) and a null classifier.
+- **Replay:** every operation's outcome is on the tape (`Read::Idb`): another tab may change
+  the databases at any time. A replay changes nothing (tested: the test changes a record
+  after recording, and the replay still matches while the record stays changed), and the
+  queued events are steps (`Step::ObjectEvent`).
+- **AI:** every `IDB*` call is hidden in redacted views, as are the plain objects values
+  arrive as; the test stores a secret, reads it back without showing it, and checks no
+  redacted view has it.
+- **Handles:** requests, transactions and stores are releasable, but a request or
+  transaction the pack lets go of before its events have been delivered stays until they
+  have. A request's data `result` is copied out on each read, so releasing one read's copy
+  can't free what a later read gets. Connections aren't releasable (a request's `result`
+  holds one). A page holds at most 256 Ki requests, transactions and connections.
+- **One name, two meanings:** `transaction` is a database method but a property of requests
+  and stores, and `error` a console method but a request's property. The JS and Python
+  preludes now keep `error` to the console's own method list (as `key` is kept to
+  Storage's); requests' and stores' `transaction` properties aren't supported.
+- **Not supported:** indexes (`createIndex`, `index()`), cursors (`openCursor`), key
+  ranges (`IDBKeyRange`), `getAllKeys`, `getKey`, `put` with a key range, and
+  `indexedDB.databases()`.
+_object`),
   which IndexedDB uses too.
 
 ## Known local setup notes

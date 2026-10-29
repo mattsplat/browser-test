@@ -202,13 +202,64 @@ pub enum Obj {
     Dataset(NodeId),
     /// A `WebSocket`; its state is in `Objects::sockets`.
     WebSocket,
+    /// IndexedDB (`idb.rs`): `indexedDB`, a request (its state in `Idb::requests`), a
+    /// connection to a database, a transaction (`Idb::transactions`) and an object store in
+    /// one (None: the upgrade's).
+    IdbFactory,
+    IdbRequest,
+    IdbDatabase(String),
+    IdbTransaction,
+    IdbObjectStore { db: String, store: String, tx: Option<u32> },
 }
+
+/// A page's IndexedDB requests and transactions, by handle.
+#[derive(Default)]
+pub struct Idb {
+    requests: HashMap<u32, IdbRequest>,
+    transactions: HashMap<u32, IdbTransaction>,
+    /// Connections whose `upgradeneeded` is under way (they may change their stores).
+    upgrading: std::collections::HashSet<u32>,
+    /// Connections opened. They aren't releasable (a request's `result` holds one), so
+    /// they count against the limit.
+    connections: usize,
+}
+
+struct IdbRequest {
+    tx: Option<u32>,
+    /// What `result` reads: a value or handle (an open's connection), or data, which each
+    /// read hands over as a new object (so the pack releasing one read's copy can't free
+    /// what a later read gets).
+    result: Result<HostValue, serde_json::Value>,
+    /// `error`'s name and message.
+    error: Option<(String, String)>,
+    done: bool,
+    /// Its last event has been delivered: the pack may free it now.
+    finished: bool,
+    /// The connection an `open` request makes.
+    opens: Option<u32>,
+    /// The pack let go of it before its events: freed once they're delivered.
+    release_when_done: bool,
+}
+
+struct IdbTransaction {
+    db: String,
+    stores: Vec<String>,
+    mode: String,
+    /// Requests whose events haven't been delivered: it completes after them.
+    pending: usize,
+    done: bool,
+    finished: bool,
+    release_when_done: bool,
+}
+
+/// The most IndexedDB requests and transactions a page may hold at once.
+const MAX_IDB_OBJECTS: usize = 256 * 1024;
 
 impl Obj {
     /// Objects that get events but aren't nodes: their listeners are in
     /// `Objects::target_listeners`, their `on<event>` handlers in `Objects::handlers`.
     fn is_event_target(&self) -> bool {
-        matches!(self, Obj::WebSocket)
+        matches!(self, Obj::WebSocket | Obj::IdbRequest | Obj::IdbTransaction | Obj::IdbDatabase(_))
     }
 
     pub(crate) fn interface(&self) -> &'static str {
@@ -233,6 +284,11 @@ impl Obj {
             Obj::Style(_) => "CSSStyleDeclaration",
             Obj::Dataset(_) => "DOMStringMap",
             Obj::WebSocket => "WebSocket",
+            Obj::IdbFactory => "IDBFactory",
+            Obj::IdbRequest => "IDBRequest",
+            Obj::IdbDatabase(_) => "IDBDatabase",
+            Obj::IdbTransaction => "IDBTransaction",
+            Obj::IdbObjectStore { .. } => "IDBObjectStore",
         }
     }
 }
@@ -394,6 +450,10 @@ pub struct Objects {
     sockets_made: usize,
     /// What the page's connections received, for the UI thread to deliver.
     pub inbox: crate::websocket::Inbox,
+    pub idb: Idb,
+    /// Events for objects that aren't nodes the page caused (an IndexedDB request's
+    /// `success`), by handle, to dispatch once its code returns.
+    pub queued_object_events: Vec<(u32, String)>,
 }
 
 impl Default for Objects {
@@ -427,6 +487,8 @@ impl Default for Objects {
             sockets: HashMap::new(),
             sockets_made: 0,
             inbox: crate::websocket::Inbox { waker, ..Default::default() },
+            idb: Idb::default(),
+            queued_object_events: Vec::new(),
         }
     }
 }
@@ -528,6 +590,58 @@ impl Objects {
         })
     }
 
+    /// Queue event `kind` for object `target`, to dispatch once the page's code returns.
+    pub(crate) fn queue_object_event(&mut self, target: u32, kind: &str) {
+        self.queued_object_events.push((target, kind.to_string()));
+        if let Some(w) = self.waker.lock().unwrap().as_ref() {
+            w.wake_by_ref();
+        }
+    }
+
+    /// Whether a queued `complete` for transaction `target` must wait for its requests.
+    pub fn transaction_waiting(&self, target: u32, kind: &str) -> bool {
+        kind == "complete" && self.idb.transactions.get(&target).is_some_and(|t| t.pending > 0)
+    }
+
+    /// Before an IndexedDB event is dispatched: the request it ends is done, and an open's
+    /// `success` ends its upgrade.
+    pub fn idb_before(&mut self, target: u32, kind: &str) {
+        if let Some(r) = self.idb.requests.get_mut(&target) {
+            if matches!(kind, "success" | "error") {
+                r.done = true;
+                if let Some(db) = r.opens {
+                    self.idb.upgrading.remove(&db);
+                }
+            }
+        }
+        if let Some(t) = self.idb.transactions.get_mut(&target) {
+            t.done = true;
+        }
+    }
+
+    /// After an IndexedDB event: its transaction has one request fewer to wait for, and a
+    /// request or transaction that's finished and that the pack let go of is freed.
+    pub fn idb_after(&mut self, target: u32) {
+        let (tx, free) = match (self.idb.requests.get_mut(&target), self.idb.transactions.get_mut(&target)) {
+            (Some(r), _) if r.done => {
+                r.finished = true;
+                (r.tx, r.release_when_done)
+            }
+            (_, Some(t)) if t.done => {
+                t.finished = true;
+                (None, t.release_when_done)
+            }
+            _ => return,
+        };
+        if let Some(t) = tx.and_then(|tx| self.idb.transactions.get_mut(&tx)) {
+            t.pending -= t.pending.min(1);
+        }
+        self.forget_target(target);
+        if free {
+            self.release(target);
+        }
+    }
+
     pub fn event_mut(&mut self, handle: u32) -> Option<&mut EventObj> {
         match self.objects.get_mut(&handle) {
             Some(Obj::Event(e)) => Some(e),
@@ -536,6 +650,18 @@ impl Objects {
     }
 
     pub fn release(&mut self, handle: u32) {
+        // A request or transaction whose events are still to come stays until they're done.
+        if let Some(r) = self.idb.requests.get_mut(&handle).filter(|r| !r.finished) {
+            r.release_when_done = true;
+            return;
+        }
+        if let Some(t) = self.idb.transactions.get_mut(&handle).filter(|t| !t.finished) {
+            t.release_when_done = true;
+            return;
+        }
+        self.idb.requests.remove(&handle);
+        self.idb.transactions.remove(&handle);
+        self.idb.upgrading.remove(&handle);
         match self.objects.remove(&handle) {
             Some(Obj::Response(r)) => {
                 self.body_bytes -= r.body.len().min(self.body_bytes);
@@ -554,7 +680,10 @@ impl Objects {
     /// values made for it (responses, their headers, parsed data, promises), not the page's
     /// elements or the singletons.
     pub fn releasable(&self, handle: u32) -> bool {
-        matches!(self.objects.get(&handle), Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_) | Obj::NodeList(_)))
+        matches!(
+            self.objects.get(&handle),
+            Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_) | Obj::NodeList(_) | Obj::IdbRequest | Obj::IdbTransaction | Obj::IdbObjectStore { .. })
+        )
     }
 
     /// A `NodeList` of `nodes`, unless the page already holds too many listed nodes (host
@@ -1029,6 +1158,57 @@ impl PageHost {
         Ok(HostValue::Object(promise))
     }
 
+    /// Run IndexedDB operation `f` on the page's origin (`idb.rs`), changing it if `write`.
+    /// Its outcome is on the tape (another tab may change the databases); a replay changes
+    /// nothing and answers from the tape. The inner error is `"Name: message"`.
+    fn idb_op(&mut self, write: bool, f: impl FnOnce(&mut crate::idb::Origin) -> Result<serde_json::Value, String>) -> Result<Result<serde_json::Value, String>> {
+        let origin = self.storage_origin()?;
+        let live = match self.objects.borrow().tape.replaying() {
+            true => String::new(),
+            false => match crate::idb::local().run(&origin, write, f) {
+                Ok(v) => serde_json::json!({ "ok": v }),
+                Err(e) => serde_json::json!({ "err": e }),
+            }
+            .to_string(),
+        };
+        let text = self.objects.borrow_mut().tape.read_text(Read::Idb, live);
+        let outcome: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        Ok(match outcome.get("ok") {
+            Some(v) => Ok(v.clone()),
+            None => Err(outcome.get("err").and_then(|e| e.as_str()).unwrap_or("UnknownError: the operation failed").to_string()),
+        })
+    }
+
+    /// A request with its outcome already known: its `success` (after `upgradeneeded`, for an
+    /// open that upgrades) or `error` is queued for once the page's code returns. A replay
+    /// gets them as recorded steps.
+    fn idb_request(&mut self, tx: Option<u32>, outcome: Result<Result<HostValue, serde_json::Value>, String>, opens: Option<u32>, upgrade: bool) -> Result<HostValue> {
+        let mut objects = self.objects.borrow_mut();
+        if objects.idb.requests.len() + objects.idb.transactions.len() + objects.idb.connections >= MAX_IDB_OBJECTS {
+            bail!("the page holds too many IndexedDB requests");
+        }
+        let handle = objects.add(Obj::IdbRequest);
+        let (result, error) = match outcome {
+            Ok(v) => (v, None),
+            Err(e) => {
+                let (name, message) = e.split_once(": ").map(|(n, m)| (n.to_string(), m.to_string())).unwrap_or(("UnknownError".into(), e.clone()));
+                (Ok(HostValue::Undefined), Some((name, message)))
+            }
+        };
+        let failed = error.is_some();
+        objects.idb.requests.insert(handle, IdbRequest { tx, result, error, done: false, finished: false, opens, release_when_done: false });
+        if let Some(t) = tx.and_then(|tx| objects.idb.transactions.get_mut(&tx)) {
+            t.pending += 1;
+        }
+        if !objects.tape.replaying() {
+            if upgrade {
+                objects.queue_object_event(handle, "upgradeneeded");
+            }
+            objects.queue_object_event(handle, if failed { "error" } else { "success" });
+        }
+        Ok(HostValue::Object(handle))
+    }
+
     /// `new WebSocket(url, protocols)`: a socket that connects through the gate on a thread of
     /// its own (`websocket.rs`); what happens arrives as events (`deliver_sockets`). Replaying,
     /// nothing connects: the recorded events arrive as steps.
@@ -1451,6 +1631,54 @@ impl PageHost {
                     _ => HostValue::str(&style_value(&declarations, &kebab(prop))),
                 }
             }
+            (Obj::Window, "indexedDB") => self.objects.borrow_mut().singleton("indexedDB", Obj::IdbFactory),
+            (Obj::IdbRequest | Obj::IdbTransaction, _) => {
+                let HostValue::Object(handle) = target else { bail!("not an object") };
+                let objects = self.objects.borrow();
+                let (request, transaction) = (objects.idb.requests.get(handle), objects.idb.transactions.get(handle));
+                match (prop, request, transaction) {
+                    ("result", Some(r), _) => match r.result.clone() {
+                        Ok(v) => v,
+                        Err(data) => {
+                            drop(objects);
+                            self.objects.borrow_mut().from_json(data)
+                        }
+                    },
+                    ("error", Some(r), _) => match r.error.clone() {
+                        Some((name, message)) => {
+                            drop(objects);
+                            self.objects.borrow_mut().from_json(serde_json::json!({"name": name, "message": message}))
+                        }
+                        None => HostValue::Null,
+                    },
+                    ("readyState", Some(r), _) => HostValue::str(if r.done { "done" } else { "pending" }),
+                    ("mode", _, Some(t)) => HostValue::str(&t.mode),
+                    (p, _, _) if p.starts_with("on") => HostValue::Null,
+                    _ => bail!("{}.{prop} is not supported yet", obj.interface()),
+                }
+            }
+            (Obj::IdbDatabase(name), _) => match prop {
+                "name" => HostValue::str(name),
+                "version" => match self.idb_op(false, |o| Ok(o.version(name).into()))? {
+                    Ok(v) => self.objects.borrow_mut().from_json(v),
+                    Err(e) => bail!("{e}"),
+                },
+                "objectStoreNames" => match self.idb_op(false, |o| Ok(o.store_names(name).into()))? {
+                    Ok(v) => self.objects.borrow_mut().from_json(v),
+                    Err(e) => bail!("{e}"),
+                },
+                p if p.starts_with("on") => HostValue::Null,
+                _ => bail!("IDBDatabase.{prop} is not supported yet"),
+            },
+            (Obj::IdbObjectStore { db, store, .. }, _) => match prop {
+                "name" => HostValue::str(store),
+                "keyPath" | "autoIncrement" => {
+                    let info = self.idb_op(false, |o| o.store_info(db, store).map(|(path, auto)| serde_json::json!([path, auto])))?;
+                    let info = info.map_err(|e| anyhow::anyhow!(e))?;
+                    self.objects.borrow_mut().from_json(info[if prop == "keyPath" { 0 } else { 1 }].clone())
+                }
+                _ => bail!("IDBObjectStore.{prop} is not supported yet"),
+            },
             (Obj::WebSocket, _) => {
                 let HostValue::Object(handle) = target else { bail!("not a socket") };
                 let objects = self.objects.borrow();
@@ -1687,6 +1915,134 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Window, "WebSocket") => self.web_socket(args)?,
+            (Obj::IdbFactory, "open") => {
+                let name = text(0)?;
+                let version = args.get(1).and_then(HostValue::as_num);
+                let outcome = self.idb_op(true, |o| o.open(&name, version).map(|(old, new)| serde_json::json!([old, new])))?;
+                match outcome {
+                    Ok(versions) => {
+                        let mut objects = self.objects.borrow_mut();
+                        objects.idb.connections += 1;
+                        let db = objects.add(Obj::IdbDatabase(name));
+                        drop(objects);
+                        let upgrade = versions[0].as_u64() < versions[1].as_u64();
+                        if upgrade {
+                            self.objects.borrow_mut().idb.upgrading.insert(db);
+                        }
+                        self.idb_request(None, Ok(Ok(HostValue::Object(db))), Some(db), upgrade)?
+                    }
+                    Err(e) => self.idb_request(None, Err(e), None, false)?,
+                }
+            }
+            (Obj::IdbFactory, "deleteDatabase") => {
+                let name = text(0)?;
+                let outcome = self.idb_op(true, |o| Ok(o.delete_database(&name)).map(|_| serde_json::Value::Null))?;
+                self.idb_request(None, outcome.map(|_| Ok(HostValue::Undefined)), None, false)?
+            }
+            (Obj::IdbDatabase(db), "createObjectStore" | "deleteObjectStore") => {
+                let HostValue::Object(handle) = target else { bail!("not a database") };
+                if !self.objects.borrow().idb.upgrading.contains(handle) {
+                    bail!("InvalidStateError: object stores can only change during upgradeneeded");
+                }
+                let name = text(0)?;
+                let options = match args.get(1) {
+                    Some(v @ HostValue::Object(_)) => self.objects.borrow().to_json(v)?.unwrap_or_default(),
+                    _ => serde_json::Value::Null,
+                };
+                let key_path = options.get("keyPath").and_then(|k| k.as_str()).map(str::to_string);
+                let auto_increment = options.get("autoIncrement").and_then(|a| a.as_bool()).unwrap_or(false);
+                let outcome = self.idb_op(true, |o| match method {
+                    "createObjectStore" => o.create_store(db, &name, key_path, auto_increment),
+                    _ => o.delete_store(db, &name),
+                }
+                .map(|_| serde_json::Value::Null))?;
+                outcome.map_err(|e| anyhow::anyhow!(e))?;
+                match method {
+                    "createObjectStore" => HostValue::Object(self.objects.borrow_mut().add(Obj::IdbObjectStore { db: db.clone(), store: name, tx: None })),
+                    _ => HostValue::Undefined,
+                }
+            }
+            (Obj::IdbDatabase(db), "transaction") => {
+                let stores: Vec<String> = match args.first() {
+                    Some(v @ HostValue::Object(_)) => match self.objects.borrow().to_json(v)? {
+                        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect(),
+                        _ => Vec::new(),
+                    },
+                    Some(v) => vec![v.display()],
+                    None => Vec::new(),
+                };
+                let mode = match args.get(1) {
+                    Some(HostValue::Undefined) | None => "readonly".to_string(),
+                    Some(m) if matches!(m.display().as_str(), "readonly" | "readwrite") => m.display(),
+                    Some(m) => bail!("TypeError: {:?} isn't a transaction mode", m.display()),
+                };
+                let names = self.idb_op(false, |o| Ok(o.store_names(db).into()))?.map_err(|e| anyhow::anyhow!(e))?;
+                if stores.is_empty() {
+                    bail!("InvalidAccessError: a transaction needs at least one object store");
+                }
+                if let Some(missing) = stores.iter().find(|s| !names.as_array().is_some_and(|n| n.iter().any(|n| n == *s))) {
+                    bail!("NotFoundError: there's no object store {missing:?}");
+                }
+                let mut objects = self.objects.borrow_mut();
+                if objects.idb.requests.len() + objects.idb.transactions.len() + objects.idb.connections >= MAX_IDB_OBJECTS {
+                    bail!("the page holds too many IndexedDB requests");
+                }
+                let tx = objects.add(Obj::IdbTransaction);
+                objects.idb.transactions.insert(tx, IdbTransaction { db: db.clone(), stores, mode, pending: 0, done: false, finished: false, release_when_done: false });
+                // It completes once its requests' events have gone (`transaction_waiting`).
+                if !objects.tape.replaying() {
+                    objects.queue_object_event(tx, "complete");
+                }
+                HostValue::Object(tx)
+            }
+            (Obj::IdbDatabase(_), "close") => HostValue::Undefined,
+            (Obj::IdbTransaction, "objectStore") => {
+                let HostValue::Object(handle) = target else { bail!("not a transaction") };
+                let name = text(0)?;
+                let mut objects = self.objects.borrow_mut();
+                let t = objects.idb.transactions.get(handle).context("this transaction is no longer available")?;
+                if t.done {
+                    bail!("InvalidStateError: the transaction has finished");
+                }
+                if !t.stores.contains(&name) {
+                    bail!("NotFoundError: {name:?} isn't in this transaction");
+                }
+                let db = t.db.clone();
+                HostValue::Object(objects.add(Obj::IdbObjectStore { db, store: name, tx: Some(*handle) }))
+            }
+            (Obj::IdbObjectStore { db, store, tx }, "put" | "add" | "get" | "delete" | "getAll" | "count" | "clear") => {
+                let write = matches!(method, "put" | "add" | "delete" | "clear");
+                if let Some(t) = tx.and_then(|tx| self.objects.borrow().idb.transactions.get(&tx).map(|t| (t.done, t.mode.clone()))) {
+                    if t.0 {
+                        bail!("TransactionInactiveError: the transaction has finished");
+                    }
+                    if write && t.1 == "readonly" {
+                        bail!("ReadOnlyError: the transaction is read-only");
+                    }
+                }
+                let data = |i: usize| -> Result<Option<serde_json::Value>> {
+                    match args.get(i) {
+                        Some(v) => self.objects.borrow().to_json(v),
+                        None => Ok(None),
+                    }
+                };
+                let (first, second) = (data(0)?, data(1)?);
+                let outcome = self.idb_op(write, |o| match method {
+                    "put" | "add" => o.put(db, store, first.unwrap_or_default(), second, method == "add"),
+                    "get" => o.get(db, store, &first.unwrap_or_default()).map(|v| v.unwrap_or(serde_json::json!({"u": 1}))),
+                    "delete" => o.delete(db, store, &first.unwrap_or_default()).map(|_| serde_json::json!({"u": 1})),
+                    "getAll" => o.get_all(db, store).map(serde_json::Value::from),
+                    "count" => o.count(db, store).map(serde_json::Value::from),
+                    _ => o.clear(db, store).map(|_| serde_json::json!({"u": 1})),
+                })?;
+                // `{"u": 1}` stands for undefined (a missing record), which JSON can't say.
+                let result = outcome.map(|v| match v {
+                    serde_json::Value::Object(ref o) if o.len() == 1 && o.get("u") == Some(&serde_json::json!(1)) => Ok(HostValue::Undefined),
+                    v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_)) => Err(v),
+                    v => Ok(self.objects.borrow_mut().from_json(v)),
+                });
+                self.idb_request(*tx, result, None, false)?
+            }
             (Obj::WebSocket, "send" | "close") => {
                 let HostValue::Object(handle) = target else { bail!("not a socket") };
                 let mut objects = self.objects.borrow_mut();
@@ -2042,6 +2398,14 @@ impl PageHost {
                 self.storage_write(*local, |a| Ok(a.remove(&key)))?
             }
             (Obj::Storage(local), "clear") => self.storage_write(*local, |a| Ok(a.clear()))?,
+            (Obj::Json(serde_json::Value::Array(_)), "push") => {
+                let items = args.iter().map(|v| Ok(self.objects.borrow().to_json(v)?.unwrap_or(serde_json::Value::Null))).collect::<Result<Vec<_>>>()?;
+                let HostValue::Object(handle) = target else { bail!("not an array") };
+                let mut objects = self.objects.borrow_mut();
+                let Some(Obj::Json(serde_json::Value::Array(array))) = objects.objects.get_mut(handle) else { bail!("not an array") };
+                array.extend(items);
+                HostValue::Num(array.len() as f64)
+            }
             (Obj::Promise, "then") => {
                 let HostValue::Object(promise) = target else { bail!("not a promise") };
                 let function = |i: usize| match args.get(i) {

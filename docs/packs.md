@@ -190,7 +190,8 @@ not read time or randomness any other way.
   - The prelude's `METHODS` list says which member names are methods (called), as opposed
     to properties (read). Keep it in step with `host.rs`.
   - Storage objects have their own list (`STORAGE_METHODS`), since `key` is a Storage
-    method but a keyboard event property.
+    method but a keyboard event property; the console has its own too, since `error` is
+    a console method but an IndexedDB request's property.
   - Lists (a `NodeList`, an array of data) work as the language's own: JS iterates any
     wrapper by `length` and index (`for...of`, spread, `forEach`); Python's `HostObject` has
     `len`, `[i]` (and `[name]`, for `dataset`) and iteration, and is always true.
@@ -385,7 +386,7 @@ packed JSON reply.
   - The globals are `window`, `document`, `console`, `Math`, `setTimeout`, `setInterval`,
     `clearTimeout`, `clearInterval`, `requestAnimationFrame`, `cancelAnimationFrame`,
     `fetch` (callbacks: `fetch(url).then(on_value, on_error)`), `localStorage`,
-    `sessionStorage`, `location`, `history`, `navigator` and `WebSocket`. `print` goes to the console.
+    `sessionStorage`, `location`, `history`, `navigator`, `WebSocket` and `indexedDB`. `print` goes to the console.
   - Members use Web IDL's camelCase names (`document.querySelector`, `el.textContent`).
   - Numbers from the host that are whole come back as `int`, so `e.clientX` prints `10`,
     not `10.0`.

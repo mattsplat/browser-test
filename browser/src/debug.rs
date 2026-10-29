@@ -380,13 +380,16 @@ pub const HIDDEN: &str = "(hidden)";
 
 /// Host calls whose arguments or results carry what AI access must never see: cookie values,
 /// stored values, request and response bodies and headers, the page's full URLs and history
-/// state (AI sees URLs only redacted), WebSocket URLs and messages, and form fields' values: `value` and `checked`, and
+/// state (AI sees URLs only redacted), WebSocket URLs and messages, IndexedDB values, and form fields' values: `value` and `checked`, and
 /// HTML read or written with `innerHTML`/`outerHTML` (which can hold a field's value, so
 /// they're hidden on every element rather than only on forms).
 pub fn holds_secrets(call: &str) -> bool {
     let member = call.trim_end_matches(" =");
     // Plain objects and arrays hold parsed responses, history states and fetch inits.
-    const INTERFACES: [&str; 9] = ["Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array.", "WebSocket."];
+    const INTERFACES: [&str; 14] = [
+        "Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array.", "WebSocket.",
+        "IDBFactory.", "IDBRequest.", "IDBDatabase.", "IDBTransaction.", "IDBObjectStore.",
+    ];
     INTERFACES.iter().any(|p| member.starts_with(p))
         || [
             "Document.cookie",

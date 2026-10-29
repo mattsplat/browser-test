@@ -388,7 +388,26 @@ impl RunningPack {
             let chain = self.doc.borrow().node_chain(*node);
             self.deliver(&chain, kind, details.clone(), None, false);
         }
-        !queued.is_empty()
+        let objects = std::mem::take(&mut self.objects.borrow_mut().queued_object_events);
+        for (target, kind) in &objects {
+            // A transaction completes after its requests' events.
+            if self.objects.borrow().transaction_waiting(*target, kind) {
+                self.objects.borrow_mut().queue_object_event(*target, kind);
+                continue;
+            }
+            self.objects.borrow_mut().tape.step(|| replay::Step::ObjectEvent { target: *target, kind: kind.clone() });
+            self.object_event(*target, kind);
+        }
+        !queued.is_empty() || !objects.is_empty()
+    }
+
+    /// An event the page caused on an object that isn't a node (an IndexedDB request's
+    /// `success`), with the bookkeeping around it.
+    fn object_event(&self, target: u32, kind: &str) {
+        self.objects.borrow_mut().idb_before(target, kind);
+        self.dispatch_object(target, kind, EventDetails::default());
+        self.objects.borrow_mut().idb_after(target);
+        release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
     }
 
     /// Dispatch an event and the form events that go with it (`form_events`; `change` goes
@@ -610,6 +629,7 @@ impl RunningPack {
             replay::Step::Traverse { url, state } => self.move_to(url, state.clone()),
             replay::Step::Fetch { promise, result } => self.objects.borrow_mut().deliver_fetch(*promise, result.clone()),
             replay::Step::Socket { socket, event } => self.socket_event(*socket, event),
+            replay::Step::ObjectEvent { target, kind } => self.object_event(*target, kind),
         }
         Ok(())
     }
@@ -1749,6 +1769,120 @@ mod tests {
         let scripts = [Script { name: "secure.js".into(), source: source.into(), module: false }];
         let secure = futures_lite_block_on(crate::js_pack::start(doc, PageEnv::default(), &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
         assert_eq!(output(&secure), "SecurityError");
+    }
+
+    // ---- Cross-pack: IndexedDB (`tests/fixtures/idb.*`).
+
+    const IDB_OUTPUT: &[&str] = &[
+        "upgrade:2,0",
+        "open:shop,2,items+notes",
+        "put:1",
+        "add:ConstraintError",
+        "complete",
+        "store:id,true",
+        "get:apple,2,fruit,10",
+        "missing:true",
+        "all:apple+pear",
+        "count:2",
+        "after-delete:1",
+        "cleared:0",
+        "done",
+    ];
+
+    /// Deliver what a page queued (IndexedDB events) and run its timers until nothing's left.
+    fn settle_queued(page: &PackDocument) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            let ran = page.pack.run_queued_events() | page.pack.run_due_timers();
+            let objects = page.pack.objects.borrow();
+            if !ran && objects.queued_object_events.is_empty() && objects.next_deadline().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// One page using IndexedDB (an upgrade creating stores, transactions, put/add/get/
+    /// getAll/count/delete/clear, a constraint error), the same in every pack, kept in the
+    /// profile's databases. A replay ends with the same DOM without touching them; the value
+    /// the page never shows doesn't reach the AI's views.
+    #[tokio::test]
+    async fn indexed_db_behaves_the_same_in_dart_js_and_python() {
+        let wasm = compile("tests/fixtures/idb.dart").await;
+        let html = include_str!("../tests/fixtures/idb.html");
+        for pack in ["dart", "js", "python"] {
+            let url = format!("https://idb-{pack}.test/");
+            let origin = format!("https://idb-{pack}.test");
+            replay::arm(&url);
+            let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+            let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+            let (page, program) = match pack {
+                "dart" => (crate::dart_pack::start(doc, Default::default(), &wasm).unwrap(), replay::Program::Dart(wasm.clone())),
+                "python" => {
+                    let scripts = script("idb.py", include_str!("../tests/fixtures/idb.py"));
+                    (crate::python_pack::start(doc, Default::default(), &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+                }
+                _ => {
+                    let scripts = script("idb.js", include_str!("../tests/fixtures/idb.js"));
+                    let page = crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                    (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
+                }
+            };
+            page.attach_recording(html, None, program);
+            settle_queued(&page);
+            assert_eq!(output(&page).split('|').collect::<Vec<_>>(), IDB_OUTPUT, "{pack}: {:?}", errors_on(&url));
+            assert_eq!(crate::idb::local().run(&origin, false, |o| Ok(o.store_names("shop"))), Ok(vec!["items".to_string(), "notes".to_string()]), "{pack}: kept");
+            // Python lets go of each request as its wrappers go: they're freed once done.
+            if pack == "python" {
+                assert!(page.pack.objects.borrow().live_of("IDBRequest") <= 2, "{pack}: requests piled up");
+            }
+
+            let recording = page.pack.stop_recording().unwrap();
+            assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Idb), "{pack}: outcomes are on the tape");
+            // The databases change meanwhile; the replay reads what the recording did, and
+            // changes nothing.
+            crate::idb::local().run(&origin, true, |o| o.put("shop", "notes", serde_json::json!("changed"), Some(serde_json::json!("greeting")), false)).unwrap();
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            assert_eq!(outcome.diverged, None, "{pack}");
+            assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
+            assert_eq!(crate::idb::local().run(&origin, false, |o| o.get("shop", "notes", &serde_json::json!("greeting"))), Ok(Some(serde_json::json!("changed"))), "{pack}");
+
+            let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+            let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
+            assert!(redacted.iter().any(|e| e.call == "IDBObjectStore.put"), "{pack}");
+            let texts = redacted.iter().flat_map(|e| [e.args.clone(), e.result.clone()]).chain(console.iter().flat_map(|c| [c.context.clone(), c.text.clone()]));
+            for text in texts {
+                assert!(!text.contains("S3CRET-IDB"), "{pack}: a stored value reached the AI's view in {text:?}");
+            }
+        }
+    }
+
+    /// IndexedDB's rules: stores change only during an upgrade, a read-only transaction can't
+    /// write, an older version can't be opened, and a page with no origin has none.
+    #[test]
+    fn indexed_db_refuses_what_it_should() {
+        let script = r#"
+            const r = [];
+            const name = (e) => String(e.message || e).split(':')[0];
+            const open = indexedDB.open('rules', 3);
+            open.onupgradeneeded = () => open.result.createObjectStore('s');
+            open.onsuccess = () => {
+                const db = open.result;
+                try { db.createObjectStore('t'); } catch (e) { r.push(name(e)); }
+                try { db.transaction('s').objectStore('s').put(1, 1); } catch (e) { r.push(name(e)); }
+                try { db.transaction('nope'); } catch (e) { r.push(name(e)); }
+                const older = indexedDB.open('rules', 2);
+                older.onerror = () => { r.push(older.error.name); document.getElementById('out').textContent = r.join('|'); };
+            };
+        "#;
+        let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some("https://idb-rules.test/".into()), ..Default::default() }).into_inner();
+        let scripts = [Script { name: "rules.js".into(), source: script.into(), module: false }];
+        let page = futures_lite_block_on(crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        settle_queued(&page);
+        assert_eq!(output(&page), "InvalidStateError|ReadOnlyError|NotFoundError|VersionError");
+
+        let blank = js_page("<p id=out></p>", &["let r = ''; try { indexedDB.open('x'); } catch (e) { r = e.message.split(':')[0]; } document.getElementById('out').textContent = r;"]);
+        assert_eq!(output(&blank), "SecurityError");
     }
 
     /// Storage over the limit throws, as `QuotaExceededError`; a page with no origin has no

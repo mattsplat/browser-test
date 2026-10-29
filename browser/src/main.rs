@@ -38,6 +38,7 @@ mod debug;
 mod dev_compile;
 mod gate;
 mod host;
+mod idb;
 mod inspector;
 mod interpreter;
 mod js_pack;
