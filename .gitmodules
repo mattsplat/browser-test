@@ -1,3 +1,4 @@
 [submodule "vendor/blitz"]
 	path = vendor/blitz
-	url = https://github.com/DioxusLabs/blitz.git
+	url = https://github.com/mattsplat/blitz.git
+	branch = browser-test
