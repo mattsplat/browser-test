@@ -13,6 +13,10 @@
 //!   folder whenever they change, and reopened at startup. Each tab comes back at its current
 //!   page; its back/forward list doesn't.
 //!
+//! - **Split view**: two tabs side by side, a pair (`split`). It shows while either of the
+//!   two is the active tab; the active one has focus and the toolbar. Not saved with the
+//!   session.
+//!
 //! The rules are pure functions (`display_order`, `next_active_after_close`, `idle_tabs`) so
 //! they're tested without a UI.
 
@@ -60,6 +64,14 @@ pub fn next_active_after_close(order: &[TabId], closing: TabId) -> Option<TabId>
     let idx = order.iter().position(|&id| id == closing)?;
     let rest: Vec<TabId> = order.iter().copied().filter(|&id| id != closing).collect();
     rest.get(idx).or(rest.last()).copied()
+}
+
+/// Which tabs are on screen: the active one, and its split partner if it's in the pair.
+pub fn shown_tabs(active: TabId, split: Option<(TabId, TabId)>) -> Vec<TabId> {
+    match split {
+        Some((a, b)) if a == active || b == active => vec![a, b],
+        _ => vec![active],
+    }
 }
 
 /// Tabs to close because nobody has looked at them for `limit`: unpinned, not the one on
@@ -162,6 +174,8 @@ pub struct TabManager {
     pub closed: Signal<Vec<SavedTab>>,
     /// The tab layout (Settings → vertical tabs), kept here so the UI re-renders on change.
     pub vertical: Signal<bool>,
+    /// Two tabs shown side by side (split view), in no particular order.
+    pub split: Signal<Option<(TabId, TabId)>>,
     net_provider: CopyValue<Arc<StdNetProvider>>,
 }
 
@@ -187,6 +201,7 @@ impl TabManager {
             current_space: Signal::new(current_space),
             closed: Signal::new(session.closed.clone()),
             vertical: Signal::new(crate::settings::get().vertical_tabs),
+            split: Signal::new(None),
             net_provider: CopyValue::new(net_provider),
         };
 
@@ -298,6 +313,10 @@ impl TabManager {
             return;
         }
         let Some(tab) = self.find(id) else { return };
+        // A split loses its pair when either side closes.
+        if self.split.peek().is_some_and(|(a, b)| a == id || b == id) {
+            self.split.set(None);
+        }
         let closed = SavedTab {
             url: tab.nav_history().current_url().read().url.to_string(),
             title: tab_display_title(tab),
@@ -438,6 +457,24 @@ impl TabManager {
         self.spaces.write().retain(|s| s != name);
     }
 
+    /// Show `other` beside the active tab (split view). The active tab keeps focus.
+    pub fn split_with(&mut self, other: TabId) {
+        let active = *self.active_tab_id.peek();
+        if other != active && self.find(other).is_some() {
+            self.split.set(Some((active, other)));
+        }
+    }
+
+    /// Back to one tab: the active one.
+    pub fn close_split(&mut self) {
+        self.split.set(None);
+    }
+
+    /// Whether tab `id` is on screen (the active tab, or its split partner).
+    pub fn is_shown(&self, id: TabId) -> bool {
+        shown_tabs(*self.active_tab_id.read(), *self.split.read()).contains(&id)
+    }
+
     pub fn set_vertical(&mut self, on: bool) {
         crate::settings::update(|s| s.vertical_tabs = on);
         self.vertical.set(on);
@@ -521,6 +558,14 @@ mod tests {
         assert_eq!(next_active_after_close(&[1, 2, 3], 1), Some(2));
         assert_eq!(next_active_after_close(&[7], 7), None);
         assert_eq!(next_active_after_close(&[1, 2], 9), None, "a tab not on screen changes nothing");
+    }
+
+    #[test]
+    fn split_view_shows_the_pair_only_while_one_of_it_is_active() {
+        assert_eq!(shown_tabs(1, None), [1]);
+        assert_eq!(shown_tabs(1, Some((1, 2))), [1, 2]);
+        assert_eq!(shown_tabs(2, Some((1, 2))), [1, 2], "focusing the other side keeps the split");
+        assert_eq!(shown_tabs(3, Some((1, 2))), [3], "another tab shows alone");
     }
 
     #[test]
@@ -619,6 +664,17 @@ mod tests {
             let reopened = *m.active_tab_id.peek();
             assert_eq!(m.find(reopened).unwrap().nav_history().current_url().read().url, url("https://b.test/"));
             assert!(m.closed.peek().is_empty());
+
+            // Split view: the pair shows while either is active; closing one side ends it.
+            m.split_with(reopened);
+            assert_eq!(*m.split.peek(), None, "a tab can't split with itself");
+            m.split_with(a);
+            assert!(m.is_shown(a) && m.is_shown(reopened));
+            m.activate(a);
+            assert!(m.is_shown(reopened), "focus moved to the other side");
+            m.close(reopened);
+            assert_eq!(*m.split.peek(), None);
+            m.reopen_closed(None);
 
             // Pinned tabs come first and survive "close other tabs".
             m.toggle_pin(a);

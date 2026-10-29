@@ -73,6 +73,8 @@ pub enum Action {
     MoveToSpace(String),
     RemoveSpace(String),
     SetVertical(bool),
+    SplitWith(TabId),
+    CloseSplit,
     OpenProfile(String),
     NewProfile(String),
 }
@@ -182,6 +184,16 @@ fn all_items(manager: TabManager, history: &HistoryService, profiles: &[(String,
     items.push(Item::command(Action::ShowAbout(AboutPage::Settings), "Open settings", "profiles, tabs"));
     let vertical = (manager.vertical)();
     items.push(Item::command(Action::SetVertical(!vertical), if vertical { "Use horizontal tabs" } else { "Use vertical tabs" }, "tab layout"));
+    // Split view: the active tab beside another tab on screen in this space.
+    if manager.split.read().is_some_and(|(a, b)| a == active || b == active) {
+        items.push(Item::command(Action::CloseSplit, "Close split view", "split"));
+    } else {
+        for id in manager.visible_ids().into_iter().filter(|&id| id != active) {
+            if let Some(other) = manager.tabs.iter().find(|t| t.tab_id() == id) {
+                items.push(Item::command(Action::SplitWith(id), format!("Split with tab: {}", tab_display_title(other)), "split view"));
+            }
+        }
+    }
     if !manager.closed.read().is_empty() {
         items.push(Item::command(Action::ReopenLastClosed, "Reopen closed tab", format!("{MOD}+Shift+T")));
     }
@@ -285,6 +297,8 @@ fn perform(action: Action, mut manager: TabManager, mut open_panel: Signal<Panel
         Action::MoveToSpace(name) => manager.move_to_space(active, &name),
         Action::RemoveSpace(name) => manager.remove_space(&name),
         Action::SetVertical(on) => manager.set_vertical(on),
+        Action::SplitWith(id) => manager.split_with(id),
+        Action::CloseSplit => manager.close_split(),
         Action::OpenProfile(name) | Action::NewProfile(name) => {
             if let Err(e) = crate::profile::open(&name) {
                 tracing::error!("{e}");

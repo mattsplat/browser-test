@@ -302,12 +302,15 @@ fn app() -> Element {
                 prompt::PromptBar {}
                 js_permission::JsBar { tabs, active_tab_id }
                 ai_access::AiAccess { tabs, active_tab_id }
-                for tab in tabs.iter() {
-                    TabWebView {
-                        key: "{tab.tab_id()}",
-                        tabs,
-                        tab_id: tab.tab_id(),
-                        active_tab_id,
+                // One row, so split view's two tabs sit side by side.
+                div { class: "tab-area",
+                    for tab in tabs.iter() {
+                        TabWebView {
+                            key: "{tab.tab_id()}",
+                            tabs,
+                            tab_id: tab.tab_id(),
+                            active_tab_id,
+                        }
                     }
                 }
                 {fps_overlay_el}

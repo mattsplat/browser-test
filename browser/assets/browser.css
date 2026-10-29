@@ -391,12 +391,29 @@ body,
 }
 
 
+.tab-area {
+  flex: 1 1 0px;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
 .tab-content {
   flex: 1 1 0px;
   min-height: 0;
-  width: 100%;
+  min-width: 0;
   background: white;
   font-family: sans-serif;
+}
+
+/* Split view: two panes, the focused one marked. */
+.split-pane {
+  border-top: 3px solid #DDD;
+  border-left: 1px solid #DDD;
+
+  &.focused {
+    border-top-color: #1565C0;
+  }
 }
 
 .fps-overlay {

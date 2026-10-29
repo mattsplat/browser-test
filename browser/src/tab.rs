@@ -245,10 +245,23 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     let id = tab.tab_id();
     let document = tab.document().cloned();
     let mut node_handle_lens = tab.node_handle();
-    let visibility = if id == active_tab_id() {
-        "display: block"
-    } else {
-        "display: none"
+    // Split view shows the active tab's partner too; the active side is marked.
+    let manager = try_use_context::<crate::tab_manager::TabManager>();
+    let split = manager.is_some_and(|m| m.split.read().is_some_and(|(a, b)| a == active_tab_id() || b == active_tab_id()));
+    let shown = id == active_tab_id() || (split && manager.is_some_and(|m| m.is_shown(id)));
+    let visibility = if shown { "display: block" } else { "display: none" };
+    let class = match (split, id == active_tab_id()) {
+        (false, _) => "tab-content",
+        (true, true) => "tab-content split-pane focused",
+        (true, false) => "tab-content split-pane",
+    };
+    // A click in the other side of a split moves focus (and the toolbar) to it.
+    let focus = move |_| {
+        if let Some(mut m) = manager {
+            if *m.active_tab_id.peek() != id && m.is_shown(id) {
+                m.activate(id);
+            }
+        }
     };
 
     let on_navigate = use_callback(move |req: Request| {
@@ -259,15 +272,17 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
         if let Some(page) = about() {
             div {
                 key: "{id}",
-                class: "tab-content",
+                class,
                 style: visibility,
+                onpointerdown: focus,
                 AboutPageView { page, on_navigate }
             }
         } else {
             web-view {
                 key: "{id}",
-                class: "tab-content",
+                class,
                 style: visibility,
+                onpointerdown: focus,
                 "__webview_document": document,
                 onmounted: move |evt: Event<MountedData>| {
                     let node_handle = evt.downcast::<NodeHandle>().unwrap();

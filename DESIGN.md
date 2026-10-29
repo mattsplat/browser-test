@@ -858,6 +858,19 @@ are generalisations:
     guaranteed against late page styles; `!important` still wins.
   - No preview while typing: it applies on "Apply".
 
+**Split View** (`tab_manager.rs`: `split`, `shown_tabs`; `tab.rs`; palette).
+- Palette → "Split with tab: <title>" puts another tab of the current space beside the
+  active one; "Close split view" ends it. The two are a pair of real tabs, each with its own
+  document, gate view and pack, as before; nothing about loading changed.
+- The pair shows while either of them is the active tab. The active side has focus, a blue
+  top border and the toolbar, URL bar and panels (they already follow the active tab).
+  Clicking in the other side, or its tab in the strip, makes it active. Selecting a third
+  tab shows it alone; going back to either of the pair shows the split again.
+- **Fixed 50/50:** both panes are `flex: 1` in a row (`.tab-area`). No draggable divider:
+  Blitz has no drag-resize primitive in the UI document and a fixed split covers the use.
+- Panes keep tab-store order (left is the tab opened first), so sides don't swap when focus
+  moves. Closing either tab ends the split. The split isn't saved with the session.
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).
