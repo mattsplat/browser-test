@@ -426,6 +426,12 @@ pub fn Toolbar(
                         },
                             if settings::get().dev_mode { "Dev mode: ON (compile Dart source)" } else { "Dev mode: OFF" }
                         }
+                        div { class: "menu-item", onclick: move |_| {
+                            if crate::ai_access::is_on() { crate::ai_access::turn_off() } else { crate::ai_access::turn_on() }
+                            menu_open.set(false);
+                        },
+                            if crate::ai_access::is_on() { "AI access: ON (read-only)" } else { "AI access: OFF" }
+                        }
                         div { class: "menu-item-separator" }
                         div { class: "menu-item", onclick: move |_| nav_about(AboutPage::Settings), "Settings" }
                         div { class: "menu-item", onclick: move |_| nav_about(AboutPage::History), "History" }

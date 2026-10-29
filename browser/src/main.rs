@@ -29,6 +29,7 @@ macro_rules! local_asset {
 }
 
 mod about_pages;
+mod ai_access;
 mod dart_pack;
 mod dev_compile;
 mod gate;
@@ -225,6 +226,7 @@ fn app() -> Element {
             }
             prompt::PromptBar {}
             js_permission::JsBar { tabs, active_tab_id }
+            ai_access::AiAccess { tabs, active_tab_id }
             for tab in tabs.iter() {
                 TabWebView {
                     key: "{tab.tab_id()}",

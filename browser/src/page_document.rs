@@ -62,6 +62,11 @@ impl PackDocument {
         Self { inner, runtime, objects, pack, page, waker: Default::default(), timer_thread: None }
     }
 
+    /// The page's DOM, for AI access to read.
+    pub fn page_ref(&self) -> std::rc::Weak<RefCell<BaseDocument>> {
+        Rc::downgrade(&self.inner)
+    }
+
     fn host(doc: BaseDocument, pack: &'static str) -> (Rc<RefCell<BaseDocument>>, Rc<RefCell<Objects>>, PageHost) {
         let inner = Rc::new(RefCell::new(doc));
         let objects = Rc::new(RefCell::new(Objects::default()));

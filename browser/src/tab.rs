@@ -12,7 +12,7 @@ use dioxus_native::{NodeHandle, SubDocumentAttr, prelude::*};
 use crate::StdNetProvider;
 use crate::about_pages::{AboutPage, AboutPageView};
 use crate::browser_history::{HistoryEntry, HistoryService};
-use crate::document_loader::{DocumentLoader, DocumentLoaderStatus, LoadedDocument};
+use crate::document_loader::{DocumentLoader, DocumentLoaderStatus, LoadedDocument, PageRef};
 use crate::favicon::probe_favicon_cached;
 use crate::history::{History, HistoryNav, SyncStore};
 
@@ -30,6 +30,8 @@ pub struct Tab {
     pub history: SyncStore<History>,
     pub loader: Option<Rc<DocumentLoader>>,
     pub document: Option<SubDocumentAttr>,
+    /// The page's DOM, for AI access to read.
+    pub page: Option<PageRef>,
     pub node_handle: Option<NodeHandle>,
     pub html_source: String,
     pub title: String,
@@ -96,6 +98,7 @@ pub fn open_tab(
         history,
         loader: None,
         document: None,
+        page: None,
         node_handle: None,
         html_source: String::new(),
         title: String::new(),
@@ -152,6 +155,7 @@ fn commit_loaded_document<Lens>(
     *tab.title().write_unchecked() = loaded.title;
     *tab.favicon_url().write_unchecked() = None;
     *tab.document().write_unchecked() = Some(loaded.document);
+    *tab.page().write_unchecked() = loaded.page;
 
     let (Some(candidate), Some(entry_id)) = (candidate, entry_id) else {
         return;
@@ -309,6 +313,7 @@ mod tests {
                     ))),
                     loader: None,
                     document: None,
+                    page: None,
                     node_handle: None,
                     html_source: String::new(),
                     title: String::new(),

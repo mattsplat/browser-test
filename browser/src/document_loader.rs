@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 
 use blitz_dom::{DocumentConfig, FontContext, StyleThreading};
@@ -30,6 +32,8 @@ pub enum DocumentLoaderStatus {
 #[derive(Clone)]
 pub struct LoadedDocument {
     pub document: SubDocumentAttr,
+    /// The page's DOM, for AI access to read; None for the browser's own error pages.
+    pub page: Option<PageRef>,
     pub html_source: String,
     pub title: String,
     // The favicon URL we'd probe for this page, computed without I/O. The
@@ -147,12 +151,13 @@ impl DocumentLoader {
                     (&*body_text, false)
                 };
 
-                let (document, parsed_title, favicon_url) =
+                let ((document, page), parsed_title, favicon_url) =
                     build_page_document(html, config, &net_provider, &signal).await;
                 let favicon_candidate =
                     favicon_candidate(base_url.as_str(), favicon_url.as_deref());
                 LoadedDocument {
                     document,
+                    page,
                     html_source: html.to_string(),
                     title: parsed_title,
                     favicon_candidate,
@@ -181,6 +186,7 @@ impl DocumentLoader {
                     .unwrap_or_default();
                 LoadedDocument {
                     document: SubDocumentAttr::new(document),
+                    page: None,
                     html_source: error_html.to_string(),
                     title: parsed_title,
                     favicon_candidate: None,
@@ -205,7 +211,7 @@ async fn build_page_document(
     config: DocumentConfig,
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
-) -> (SubDocumentAttr, String, Option<String>) {
+) -> ((SubDocumentAttr, Option<PageRef>), String, Option<String>) {
     let document = HtmlDocument::from_html(html, config).into_inner();
     let title = document
         .find_title_node()
@@ -219,7 +225,7 @@ async fn build_page_document(
         // No Dart: the page's JS, if any, runs only where JS is allowed.
         let scripts = js_scripts(&document);
         if scripts.is_empty() {
-            return (SubDocumentAttr::new(document), title, favicon_url);
+            return (shown(document), title, favicon_url);
         }
         match js_permission::decide(&settings::get(), js_permission::allowed_this_visit(&origin), &origin) {
             js_permission::JsDecision::Run => {}
@@ -228,7 +234,7 @@ async fn build_page_document(
                 if offer {
                     js_permission::offer(&origin, scripts.len());
                 }
-                return (SubDocumentAttr::new(document), title, favicon_url);
+                return (shown(document), title, favicon_url);
             }
         }
         let sources = fetch_js_sources(&scripts, &page_url, net_provider, signal).await;
@@ -242,39 +248,39 @@ async fn build_page_document(
             }
         };
         return match PackDocument::start_js(document, &sources, fetch_import).await {
-            Ok(js) => (SubDocumentAttr::new(js), title, favicon_url),
+            Ok(js) => (shown_pack(js), title, favicon_url),
             Err(e) => {
                 trace_pack_load("js", &page_url, &page_url, format!("ERROR {e:#}"));
-                (error_document(&format!("JS pack failed: {e:#}")), title, favicon_url)
+                ((error_document(&format!("JS pack failed: {e:#}")), None), title, favicon_url)
             }
         };
     };
     if settings::get().dart_blocked.contains(&origin) {
         trace_load(&page_url, &src, format!("skipped: Dart is blocked for {origin}"));
-        return (SubDocumentAttr::new(document), title, favicon_url);
+        return (shown(document), title, favicon_url);
     }
     let wasm = if src.path().ends_with(".dart") {
         match dev_mode_compile(&src, &page_url, &origin, net_provider, signal).await {
             Ok(Some(wasm)) => wasm,
-            Ok(None) => return (SubDocumentAttr::new(document), title, favicon_url),
+            Ok(None) => return (shown(document), title, favicon_url),
             // Compile errors are for the developer: show them on the page.
-            Err(e) => return (error_document(&format!("Compiling {src} failed:\n\n{e:#}")), title, favicon_url),
+            Err(e) => return ((error_document(&format!("Compiling {src} failed:\n\n{e:#}")), None), title, favicon_url),
         }
     } else {
         match fetch_dart_program(&src, &page_url, net_provider, signal).await {
             Ok(wasm) => wasm,
             Err(e) => {
                 trace_load(&page_url, &src, format!("ERROR {e:#}"));
-                return (SubDocumentAttr::new(document), title, favicon_url);
+                return (shown(document), title, favicon_url);
             }
         }
     };
     match PackDocument::start_dart(document, &wasm) {
-        Ok(dart) => (SubDocumentAttr::new(dart), title, favicon_url),
+        Ok(dart) => (shown_pack(dart), title, favicon_url),
         // Loading failed partway; the document it was given is gone, so show the error.
         Err(e) => {
             trace_load(&page_url, &src, format!("ERROR {e:#}"));
-            (error_document(&format!("Dart pack failed: {e:#}")), title, favicon_url)
+            ((error_document(&format!("Dart pack failed: {e:#}")), None), title, favicon_url)
         }
     }
 }
@@ -406,6 +412,20 @@ async fn fetch_dart_program(
     let request = Request::get(wasm_url.clone()).signal(signal.clone());
     let (_, wasm) = net_provider.fetch_for_page(request, page).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(wasm.to_vec())
+}
+
+/// A handle to a page's DOM that doesn't keep the page alive.
+pub type PageRef = Weak<RefCell<BaseDocument>>;
+
+/// A page without a pack, shown as is.
+fn shown(document: BaseDocument) -> (SubDocumentAttr, Option<PageRef>) {
+    let page = Rc::new(RefCell::new(document));
+    (SubDocumentAttr::new(page.clone()), Some(Rc::downgrade(&page)))
+}
+
+fn shown_pack(document: PackDocument) -> (SubDocumentAttr, Option<PageRef>) {
+    let page = document.page_ref();
+    (SubDocumentAttr::new(document), Some(page))
 }
 
 fn error_document(message: &str) -> SubDocumentAttr {

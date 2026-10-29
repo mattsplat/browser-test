@@ -259,6 +259,13 @@ runs the same page in Dart and JS and expects identical output):
   console, error, load); the panel shows the active tab's site by default (or all tabs) and
   filters to Console or Errors. Pack start failures now reach the trace, not only the page.
 - Read-only MCP server (AI access), on the same inspection infrastructure as the dev tools.
+  **Done (first version):** `browser/src/ai_access.rs`. Menu → "AI access" (off at every
+  launch). MCP over HTTP at `http://127.0.0.1:7807/mcp`; a new token each time it's turned
+  on, written with the URL to `ai-access.json` (mode 0600) next to settings.json. Requests
+  with an `Origin` header or another `Host` are refused (web pages, DNS rebinding). Tools:
+  `list_tabs`, `read_page` (outline; no form values, scripts or hidden inputs), `console`,
+  `trace`, `requests`. URLs lose credentials, query values and fragments. A bar shows while
+  it's on, with "Turn off"; AI calls appear in the trace as pack "ai".
 - A shared internal debugging protocol, consumed by the browser UI and MCP; DAP for VS Code.
 - **Correction (breakpoints):** real breakpoints are high risk here. wasmtime's guest
   debugging is limited and Boa has few debugger hooks. Start with source-mapped tracing and
