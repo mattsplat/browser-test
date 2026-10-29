@@ -465,8 +465,8 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
   (`document.querySelector('#x').textContent = ...`, `addEventListener`).
 - **No side doors:** the engine's only other imports are 8 WASI functions, implemented in
   `js_pack.rs` (not a WASI runtime): clock and randomness come from the host, there is no
-  environment, no files, no network. `fetch`, `XMLHttpRequest`, `require` etc. don't exist
-  (tested). `Math.random` goes through the host, as for Dart.
+  environment, no files, no network. `require`, `process` etc. don't exist (tested); `fetch`,
+  `XMLHttpRequest` and `WebSocket` came later as host calls through the gate. `Math.random` goes through the host, as for Dart.
 - **Off by default:** a page's classic `<script>`s (inline or `src`, fetched through the gate)
   run only if its origin is in `js_sites`; otherwise the trace says how many were skipped.
   One script failing doesn't stop the next. Module scripts are not supported yet.
