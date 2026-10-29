@@ -215,14 +215,16 @@ async fn build_page_document(
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
 ) -> ((SubDocumentAttr, Option<PageRef>), String, Option<String>) {
-    let document = HtmlDocument::from_html(html, config).into_inner();
+    let mut document = HtmlDocument::from_html(html, config).into_inner();
+    // The site's own stylesheet, if the user gave it one: after the page's, before any script.
+    let origin = settings::origin_of(document.url());
+    crate::site_css::apply(&mut document, crate::site_css::for_origin(&settings::get(), &origin));
     let title = document
         .find_title_node()
         .map(|n| n.text_content())
         .unwrap_or_default();
     let favicon_url = document.favicon_url();
 
-    let origin = settings::origin_of(document.url());
     let page_url = document.url().clone();
     let Some(src) = dart_script_url(&document) else {
         // Python, like Dart, runs unless blocked for the site.

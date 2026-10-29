@@ -6,7 +6,8 @@ use dioxus_native::prelude::*;
 
 use crate::gate::Gate;
 use crate::js_permission;
-use crate::settings::{self, Grant};
+use crate::settings::{self, Grant, SiteCss};
+use crate::site_css;
 use crate::tab::{Tab, TabId, TabStoreImplExt, active_tab};
 use crate::history::HistoryNav;
 
@@ -182,6 +183,7 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
                     }
                 }
             }
+            SiteCssSection { key: "{origin}", origin: origin.clone(), tabs }
             div { class: "request-panel-controls site-footer",
                 div { class: "request-clear", onclick: reload, "Reload to apply" }
             }
@@ -208,6 +210,73 @@ fn ThirdPartyRow(origin: String, site: String, requests: usize, blocked: usize, 
             div { class: if allowed { "request-toggle allowed" } else { "request-toggle" }, onclick: flip,
                 if allowed { "Allowed" } else { "Allow" }
             }
+        }
+    )
+}
+
+/// The site's user stylesheet: edit, apply (to its open pages at once, no reload) and switch
+/// on or off. Keyed by origin in the panel, so the draft starts over on another site.
+#[component]
+fn SiteCssSection(origin: String, tabs: Store<Vec<Tab>>) -> Element {
+    let saved = settings::get().site_css.get(&origin).cloned().unwrap_or_default();
+    let mut draft = use_signal(|| saved.css.clone());
+    let mut enabled = use_signal(|| saved.enabled);
+
+    let save = {
+        let origin = origin.clone();
+        move |css: String, on: bool| {
+            let o = origin.clone();
+            let entry = SiteCss { css, enabled: on };
+            settings::update(move |s| {
+                if entry.css.trim().is_empty() {
+                    s.site_css.remove(&o);
+                } else {
+                    s.site_css.insert(o, entry);
+                }
+            });
+            // Every open page of this site, not just the active tab's.
+            let current = settings::get();
+            let css = site_css::for_origin(&current, &origin);
+            for tab in crate::debug::tabs(tabs, 0) {
+                if tab.origin() == origin {
+                    if let Some(doc) = tab.page.and_then(|p| p.doc()) {
+                        if let Ok(mut doc) = doc.try_borrow_mut() {
+                            site_css::apply(&mut doc, css);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let apply = {
+        let save = save.clone();
+        move |_| {
+            enabled.set(true);
+            save(draft(), true)
+        }
+    };
+    let toggle = move |_| {
+        let on = !enabled();
+        enabled.set(on);
+        save(draft(), on)
+    };
+
+    rsx!(
+        div { class: "site-section",
+            div { class: "site-heading", "Custom CSS for this site" }
+            textarea {
+                class: "site-css-input",
+                placeholder: "body {{ font-size: 18px; }}",
+                value: draft(),
+                oninput: move |evt| draft.set(evt.value()),
+            }
+            div { class: "site-row",
+                div { class: if enabled() { "request-toggle allowed" } else { "request-toggle" }, onclick: toggle,
+                    if enabled() { "On" } else { "Off" }
+                }
+                div { class: "request-clear", onclick: apply, "Apply" }
+            }
+            div { class: "site-note", "Applied after the page's own styles, on this site only. No script runs." }
         }
     )
 }

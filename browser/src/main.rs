@@ -47,6 +47,7 @@ mod prompt;
 mod python_pack;
 mod request_panel;
 mod settings;
+mod site_css;
 mod site_panel;
 mod source_map;
 mod trace_panel;

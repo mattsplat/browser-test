@@ -834,6 +834,30 @@ are generalisations:
   0.16.10 patch release breaks `rustpython-codegen` 0.6.0. Revisit when RustPython 0.6.1 or
   later ships.
 
+## Phase E notes
+
+**Per-site CSS** (`browser/src/site_css.rs`, Site panel → "Custom CSS for this site").
+- **Stored** in the profile's `settings.json` as `site_css` (origin → `{css, enabled}`), so
+  each profile has its own. An empty sheet removes the entry.
+- **Applied** by the loader right after parsing, before any pack runs, so it needs no script
+  and works with JS off. "Apply" and the On/Off switch also update every open page of that
+  site at once, without a reload.
+- **How:** the sheet is the text of a `<style>` element that is created but never inserted
+  in the page's tree, registered with Blitz's `upsert_stylesheet_for_node` (no Blitz
+  changes). It's an author sheet created after the page's own were parsed, so it comes
+  after them in the cascade and wins ties without `!important`.
+- **Isolation:** keyed by origin, so it never reaches another site. The element isn't in the
+  tree, so page code (which can only search the tree) can't find, read or remove it, the
+  Inspector's tree and the AI outline don't show it, and the browser UI is a separate
+  document it never touches. Any `url()` or `@import` in it is fetched through the page's
+  gate, under the page's third-party rules.
+- **Limitations:**
+  - All `file://` pages share one origin, so they share one sheet (as they share grants).
+  - A `<style>` a page script creates later comes after the user sheet, and so does a
+    page sheet if Blitz reuses a lower node id for it. Stylus-style precedence isn't
+    guaranteed against late page styles; `!important` still wins.
+  - No preview while typing: it applies on "Apply".
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).

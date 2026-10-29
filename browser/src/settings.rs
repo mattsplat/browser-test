@@ -70,6 +70,16 @@ pub struct Settings {
     pub vertical_tabs: bool,
     /// Close unpinned tabs left alone this many hours; None (`null`) never closes them.
     pub close_idle_tabs_hours: Option<u32>,
+    /// User stylesheets, by origin (`site_css.rs`).
+    pub site_css: BTreeMap<String, SiteCss>,
+}
+
+/// A site's user stylesheet, applied after the page's own styles while `enabled`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SiteCss {
+    pub css: String,
+    pub enabled: bool,
 }
 
 impl Default for Settings {
@@ -87,6 +97,7 @@ impl Default for Settings {
             allowed_third_party: BTreeMap::new(),
             vertical_tabs: false,
             close_idle_tabs_hours: Some(12),
+            site_css: BTreeMap::new(),
         }
     }
 }
