@@ -1150,7 +1150,7 @@ mod tests {
     fn same_origin_answer(method: &str, path: &str, headers: &str, body: &str) -> (u16, String, String) {
         let cookie = if headers.contains("fromserver=1") { "yes" } else { "no" };
         match (method, path) {
-            ("GET", "/app/data.json") => (200, "Content-Type: application/json\r\nSet-Cookie: fromserver=1; Path=/\r\n".into(), r#"{"name":"web","n":3}"#.into()),
+            ("GET", "/app/data.json") => (200, "Content-Type: application/json\r\nSet-Cookie: fromserver=1; Path=/\r\n".into(), r#"{"name":"web","n":3,"token":"S3CRET-BODY"}"#.into()),
             ("POST", "/app/echo") => {
                 let x_a = headers.lines().find_map(|l| l.strip_prefix("x-a:")).unwrap_or_default().trim();
                 (200, "Content-Type: text/plain\r\n".into(), format!("{method} {body} {x_a} cookie:{cookie}"))
@@ -1205,7 +1205,7 @@ mod tests {
         "cookie:a=1; b=2",
         "cookie:b=2",
         "storage:v,2,null,2,k",
-        "storage:1,n,tab,1",
+        "storage:2,n,tab,1",
         "location:http:,/app/page.html,,,true",
         "push:/app/two,?x=1,2,2",
         "replace:/app/two?x=1#h,three,2",
@@ -1215,7 +1215,7 @@ mod tests {
         "popstate:#next,null",
         "hashchange:true",
         "fetch:200,true,application/json,null",
-        "json:web,3",
+        "json:web,3,11,12",
         "cookie:b=2; fromserver=1",
         "echo:POST hello b cookie:yes",
         "missing:404,false,nope",
@@ -1318,6 +1318,15 @@ mod tests {
             // (What the page itself writes into its DOM is the page's output, and isn't hidden.)
             let secret = |e: &&TraceEntry| debug::holds_secrets(&e.call);
             assert!(redacted.iter().filter(secret).all(|e| e.args == debug::HIDDEN && e.result == debug::HIDDEN), "{pack}: a secret reached the AI's view");
+            // Secrets the page reads but never shows: nowhere in the AI's trace or console.
+            let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
+            let texts = redacted.iter().flat_map(|e| [e.call.clone(), e.args.clone(), e.result.clone()]).chain(console.iter().flat_map(|c| [c.context.clone(), c.text.clone()]));
+            for text in texts {
+                for secret in ["S3CRET-STORE", "S3CRET-STATE", "S3CRET-BODY", "server=secret"] {
+                    assert!(!text.contains(secret), "{pack}: {secret} reached the AI's view in {text:?}");
+                }
+            }
+            assert!(full.iter().any(|e| e.result.contains("S3CRET-STORE") || e.args.contains("S3CRET-STORE")), "{pack}: the user's own trace keeps it");
         }
     }
 
@@ -1336,6 +1345,10 @@ mod tests {
         let tab: crate::storage::Session = Default::default();
         let page = futures_lite_block_on(crate::js_pack::start(doc, PageEnv { session: tab.clone(), ..Default::default() }, &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
         assert_eq!(output(&page), "QuotaExceededError,null");
+        // The failed call's value doesn't reach the AI's console.
+        let console = debug::console("https://quota.test", debug::Privacy::Redacted, usize::MAX);
+        assert!(console.iter().any(|c| c.context.starts_with("Storage.setItem")), "{console:?}");
+        assert!(!console.iter().any(|c| c.context.contains("xxxx") || c.text.contains("xxxx")));
         assert_eq!(tab.borrow()["https://quota.test"].get("mine").as_deref(), Some("1"), "the tab's session storage");
 
         let blank = js_page("<p id=out></p>", &["let r = ''; try { localStorage.getItem('x'); } catch (e) { r = e.message.split(':')[0]; } document.querySelector('#out').textContent = r;"]);

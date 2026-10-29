@@ -31,6 +31,7 @@ localStorage.clear()
 localStorage.setItem('k', 'v')
 localStorage.setItem('n', 2)
 add(f"storage:{localStorage.getItem('k')},{localStorage.getItem('n')},{js(localStorage.getItem('missing'))},{localStorage.length},{localStorage.key(0)}")
+localStorage.setItem('token', 'S3CRET-STORE')
 localStorage.removeItem('k')
 sessionStorage.setItem('s', 'tab')
 add(f"storage:{localStorage.length},{localStorage.key(0)},{sessionStorage.getItem('s')},{sessionStorage.length}")
@@ -40,7 +41,7 @@ add(f"storage:{localStorage.length},{localStorage.key(0)},{sessionStorage.getIte
 add(f'location:{location.protocol},{location.pathname},{location.search},{location.hash},{js(location.href == location.origin + location.pathname)}')
 window.addEventListener('popstate', lambda e: add(f'popstate:{location.hash},{js(e.state)}'))
 window.addEventListener('hashchange', lambda e: add(f"hashchange:{js(e.newURL.endswith('#next'))}"))
-history.pushState({'page': 2}, '', 'two?x=1')
+history.pushState({'page': 2, 'token': 'S3CRET-STATE'}, '', 'two?x=1')
 add(f'push:{location.pathname},{location.search},{history.state.page},{history.length}')
 history.replaceState('three', '', '#h')
 add(f'replace:{location.pathname}{location.search}{location.hash},{history.state},{history.length}')
@@ -71,7 +72,7 @@ def on_data(r):
 
 
 def on_json(data):
-    add(f'json:{data.name},{data.n}')
+    add(f"json:{data.name},{data.n},{len(data.token)},{len(localStorage.getItem('token'))}")
     add(f'cookie:{document.cookie}')
     fetch('echo', {'method': 'POST', 'headers': {'X-A': 'b'}, 'body': 'hello'}).then(lambda r: r.text().then(on_echo))
 

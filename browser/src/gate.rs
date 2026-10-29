@@ -147,17 +147,32 @@ impl Gate {
     /// are `TypeError: ...` messages, as `fetch` rejects. See `PageFetch` for the rules.
     pub async fn fetch_from_page(&self, mut request: PageFetch, page: &Url) -> Result<FetchResponse, String> {
         let failed = |url: &Url, why: String| format!("TypeError: Failed to fetch {url}: {why}");
+        // Forbidden methods: TRACE and TRACK echo the request back, HttpOnly cookies included.
+        if matches!(request.method.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+            return Err(failed(&request.url, format!("{} requests can't be made by a page", request.method)));
+        }
         let page_origin = page.origin();
         let mut redirected = false;
         for _ in 0..MAX_REDIRECTS {
             let url = request.url.clone();
             match url.scheme() {
                 "http" | "https" => {}
-                // Local schemes never leave the machine. A file is readable only by a file page
-                // in the same folder or above it (as Firefox once allowed), not anywhere on disk.
-                "data" | "file" if url.scheme() == "data" || file_beside(&url, page) => {
+                // Local schemes never leave the machine.
+                "data" => {
                     self.allow(&url, Some(page)).map_err(|reason| failed(&url, format!("blocked ({reason})")))?;
                     let (_, body) = self.inner.fetch_async(Request::get(url.clone())).await.map_err(|e| failed(&url, e.to_string()))?;
+                    return Ok(FetchResponse { url: url.to_string(), status: 200, status_text: "OK".into(), headers: Vec::new(), body: String::from_utf8_lossy(&body).into_owned(), redirected, cross_origin: false });
+                }
+                // A file is readable only by a file page, in its folder or below it (as Firefox
+                // once allowed), not anywhere on disk. The checked path is the one read.
+                "file" => {
+                    let path = file_beside(&url, page).ok_or_else(|| failed(&url, "a page can read only files in its own folder".into()))?;
+                    self.allow(&url, Some(page)).map_err(|reason| failed(&url, format!("blocked ({reason})")))?;
+                    let meta = std::fs::metadata(&path).map_err(|e| failed(&url, e.to_string()))?;
+                    if meta.len() as usize > MAX_BODY {
+                        return Err(failed(&url, format!("the file is over {} MB", MAX_BODY >> 20)));
+                    }
+                    let body = std::fs::read(&path).map_err(|e| failed(&url, e.to_string()))?;
                     return Ok(FetchResponse { url: url.to_string(), status: 200, status_text: "OK".into(), headers: Vec::new(), body: String::from_utf8_lossy(&body).into_owned(), redirected, cross_origin: false });
                 }
                 other => return Err(failed(&url, format!("{other}: URLs can't be fetched by this page"))),
@@ -230,10 +245,16 @@ impl Gate {
     }
 }
 
-/// Whether file URL `url` is in page `page`'s folder (or below it), and `page` is a file.
-fn file_beside(url: &Url, page: &Url) -> bool {
-    let folder = page.path().rsplit_once('/').map(|(dir, _)| format!("{dir}/")).unwrap_or_default();
-    page.scheme() == "file" && url.scheme() == "file" && !url.path().contains("/../") && url.path().starts_with(&folder)
+/// The file `url` names, if it's in file page `page`'s folder or below it. Both are decoded
+/// to paths and resolved on disk (`..`, percent-encoded or not, and symlinks), so neither can
+/// lead out of the folder.
+fn file_beside(url: &Url, page: &Url) -> Option<std::path::PathBuf> {
+    if page.scheme() != "file" || url.scheme() != "file" {
+        return None;
+    }
+    let folder = page.to_file_path().ok()?.parent()?.canonicalize().ok()?;
+    let target = url.to_file_path().ok()?.canonicalize().ok()?;
+    target.starts_with(&folder).then_some(target)
 }
 
 const MAX_REDIRECTS: usize = 20;
@@ -472,10 +493,24 @@ mod tests {
     /// cross-origin (there's no preflight); page code can't set forbidden headers.
     #[test]
     fn page_fetch_rules() {
-        let page = url("file:///Users/me/site/index.html");
-        assert!(file_beside(&url("file:///Users/me/site/data/a.json"), &page));
-        assert!(!file_beside(&url("file:///etc/passwd"), &page));
-        assert!(!file_beside(&url("file:///Users/me/site/a.json"), &url("https://x.test/")));
+        // A site folder with a file, a secret beside the folder, and a symlink out of it.
+        let root = std::env::temp_dir().join(format!("file-beside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("site/data")).unwrap();
+        std::fs::write(root.join("site/data/a.json"), "{}").unwrap();
+        std::fs::write(root.join("secret.txt"), "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("secret.txt"), root.join("site/link.txt")).unwrap();
+        let page = Url::from_file_path(root.join("site/index.html")).unwrap();
+        let at = |rel: &str| page.join(rel).unwrap();
+        assert!(file_beside(&at("data/a.json"), &page).is_some());
+        assert!(file_beside(&at("..%2Fsecret.txt"), &page).is_none(), "encoded traversal");
+        assert!(file_beside(&at("data/..%2F..%2Fsecret.txt"), &page).is_none(), "encoded traversal");
+        assert!(file_beside(&at("../secret.txt"), &page).is_none());
+        assert!(file_beside(&at("link.txt"), &page).is_none(), "a symlink out of the folder");
+        assert!(file_beside(&url("file:///etc/passwd"), &page).is_none());
+        assert!(file_beside(&at("data/a.json"), &url("https://x.test/")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
 
         let mut f = PageFetch::new(url("https://a.test/"));
         f.header("Cookie", "stolen=1");
@@ -484,6 +519,10 @@ mod tests {
         assert!(f.is_simple());
         f.header("X-Custom", "1");
         assert!(!f.is_simple());
+        let mut trace = PageFetch::new(url("https://a.test/"));
+        trace.method = "TRACE".into();
+        let refused = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(gate().fetch_from_page(trace, &url("https://a.test/")));
+        assert!(refused.unwrap_err().contains("TRACE requests can't be made"));
         let mut put = PageFetch::new(url("https://a.test/"));
         put.method = "PUT".into();
         assert!(!put.is_simple());
@@ -497,6 +536,6 @@ mod tests {
         assert!(err.starts_with("TypeError: Failed to fetch") && err.contains("tracker.io"), "{err}");
         assert!(!gate.log()[0].allowed);
         let err = gate.fetch_from_page(PageFetch::new(url("file:///etc/passwd")), &url("https://news.example/")).await.unwrap_err();
-        assert!(err.contains("can't be fetched"), "{err}");
+        assert!(err.contains("only files in its own folder"), "{err}");
     }
 }

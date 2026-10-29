@@ -42,7 +42,7 @@ impl Area {
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         let replaced = self.items.get(key).map(|old| units(key) + units(old)).unwrap_or(0);
         if self.size() - replaced + units(key) + units(value) > LIMIT {
-            return Err(format!("QuotaExceededError: setting {key:?} would take this site's storage over {} MB", LIMIT >> 20));
+            return Err(format!("QuotaExceededError: this would take the site's storage over {} MB", LIMIT >> 20));
         }
         self.items.insert(key.to_string(), value.to_string());
         Ok(())

@@ -26,6 +26,7 @@ Future<void> main() async {
   local.setItem('k', 'v');
   local.setItem('n', '2');
   add('storage:${local.getItem('k')},${local.getItem('n')},${local.getItem('missing')},${local.length},${local.key(0)}');
+  local.setItem('token', 'S3CRET-STORE');
   local.removeItem('k');
   session.setItem('s', 'tab');
   add('storage:${local.length},${local.key(0)},${session.getItem('s')},${session.length}');
@@ -36,7 +37,7 @@ Future<void> main() async {
   add('location:${loc.protocol},${loc.pathname},${loc.search},${loc.hash},${loc.href == loc.origin + loc.pathname}');
   window.addEventListener('popstate', ((PopStateEvent e) => add('popstate:${loc.hash},${e.state}')).toJS);
   window.addEventListener('hashchange', ((HashChangeEvent e) => add('hashchange:${e.newURL.endsWith('#next')}')).toJS);
-  hist.pushState({'page': 2}.jsify(), '', 'two?x=1');
+  hist.pushState({'page': 2, 'token': 'S3CRET-STATE'}.jsify(), '', 'two?x=1');
   add('push:${loc.pathname},${loc.search},${(hist.state as JSObject).getProperty('page'.toJS)},${hist.length}');
   hist.replaceState('three'.toJS, '', '#h');
   add('replace:${loc.pathname}${loc.search}${loc.hash},${hist.state},${hist.length}');
@@ -59,7 +60,7 @@ Future<void> main() async {
   final r = await window.fetch('data.json'.toJS).toDart;
   add('fetch:${r.status},${r.ok},${r.headers.get('content-type')},${r.headers.get('set-cookie')}');
   final data = (await r.json().toDart) as JSObject;
-  add('json:${data.getProperty('name'.toJS)},${data.getProperty('n'.toJS)}');
+  add('json:${data.getProperty('name'.toJS)},${data.getProperty('n'.toJS)},${(data.getProperty('token'.toJS) as JSString).toDart.length},${local.getItem('token')!.length}');
   add('cookie:${document.cookie}');
   final init = RequestInit(method: 'POST', headers: {'X-A': 'b'}.jsify() as HeadersInit, body: 'hello'.toJS);
   final echo = await window.fetch('echo'.toJS, init).toDart;

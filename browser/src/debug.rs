@@ -346,7 +346,14 @@ pub fn console(origin: &str, privacy: Privacy, limit: usize) -> Vec<ConsoleEntry
     host::trace()
         .iter()
         .filter(|e| same_site(&e.page, origin) && !(privacy == Privacy::Redacted && e.pack == CONSOLE_PACK))
-        .filter_map(console_entry)
+        .filter_map(|e| {
+            let mut entry = console_entry(e)?;
+            // A failed call that carries secrets (a quota error from `Storage.setItem(k, v)`).
+            if privacy == Privacy::Redacted && e.kind == TraceKind::Error && holds_secrets(&e.call) {
+                entry.context = format!("{}({HIDDEN})", e.call);
+            }
+            Some(entry)
+        })
         .take(limit)
         .collect()
 }
@@ -376,9 +383,10 @@ pub const HIDDEN: &str = "(hidden)";
 /// history state (AI sees URLs only redacted).
 pub fn holds_secrets(call: &str) -> bool {
     let member = call.trim_end_matches(" =");
-    member == "Document.cookie"
-        || ["Storage.", "Response.", "Headers.", "Promise.", "Location.", "History."].iter().any(|p| member.starts_with(p))
-        || member == "Window.fetch"
+    // Plain objects and arrays hold parsed responses, history states and fetch inits.
+    const INTERFACES: [&str; 8] = ["Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array."];
+    INTERFACES.iter().any(|p| member.starts_with(p))
+        || ["Document.cookie", "Window.fetch", "Window.location", "Document.location", "Event.state", "Event.newURL", "Event.oldURL"].contains(&member)
 }
 
 /// Requests pages on site `origin` made, newest first.
