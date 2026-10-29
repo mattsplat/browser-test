@@ -48,6 +48,15 @@ pub fn site_of(url: &Url) -> Option<String> {
     Some(psl::domain_str(host).unwrap_or(host).to_string())
 }
 
+/// Whether a request from `from` to `to` is cross-site, as `SameSite` cookies see it: their
+/// sites differ, or `from` has none (a file or about page).
+pub fn cross_site(from: &Url, to: &Url) -> bool {
+    match (site_of(from), site_of(to)) {
+        (Some(a), Some(b)) => a != b || (from.scheme() == "https") != (to.scheme() == "https"),
+        _ => true,
+    }
+}
+
 /// The policy: `Ok(third_party_site)` to allow, `Err(reason)` to refuse.
 pub fn decide(settings: &Settings, block_all: bool, url: &Url, page: Option<&Url>) -> Result<Option<String>, String> {
     if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
@@ -199,7 +208,8 @@ impl Gate {
             if let Some(body) = &request.body {
                 sent.body = Body::Bytes(Bytes::from(body.clone()));
             }
-            let response = self.inner.fetch_once(sent, credentials).await.map_err(|e| failed(&url, e.to_string()))?;
+            sent.signal = request.signal.clone();
+            let response = self.inner.fetch_once(sent, credentials, MAX_BODY, FETCH_TIMEOUT).await.map_err(|e| failed(&url, e.to_string()))?;
             let header = |name: &str| response.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 if let Some(next) = header("location").and_then(|l| url.join(&l).ok()) {
@@ -258,6 +268,8 @@ fn file_beside(url: &Url, page: &Url) -> Option<std::path::PathBuf> {
 }
 
 const MAX_REDIRECTS: usize = 20;
+/// How long one hop of a page's `fetch` may take.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The biggest response body a page's `fetch` takes, so a page can't fill the browser's
 /// memory (host memory isn't under the pack's cap).
 const MAX_BODY: usize = 64 << 20;
@@ -280,11 +292,13 @@ pub struct PageFetch {
     /// `init.credentials`: "omit", "same-origin" (the default) or "include" (treated as
     /// same-origin: cookies never go to another origin).
     pub credentials: String,
+    /// The page's: aborted when the page goes, which stops the request.
+    pub signal: Option<blitz_traits::net::AbortSignal>,
 }
 
 impl PageFetch {
     pub fn new(url: Url) -> Self {
-        Self { url, method: "GET".into(), headers: Vec::new(), body: None, credentials: "same-origin".into() }
+        Self { url, method: "GET".into(), headers: Vec::new(), body: None, credentials: "same-origin".into(), signal: None }
     }
 
     /// Add a request header, unless it's one page code may not set.
@@ -343,10 +357,14 @@ pub struct PageGate {
 }
 
 impl NetProvider for PageGate {
-    fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+    fn fetch(&self, doc_id: usize, mut request: Request, handler: Box<dyn NetHandler>) {
         if let Err(reason) = self.gate.allow(&request.url, self.page.as_ref()) {
             handler.error(request.url.to_string(), format!("blocked: {reason}"));
             return;
+        }
+        // A page's request to another site gets only cookies SameSite allows across sites.
+        if self.page.as_ref().is_some_and(|page| cross_site(page, &request.url)) {
+            request.cookies = blitz_traits::net::CookieScope::CrossSite;
         }
         self.gate.inner.fetch(doc_id, request, handler);
     }

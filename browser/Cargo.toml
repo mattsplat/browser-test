@@ -78,3 +78,4 @@ sha2 = "0.10"
 # Web platform parity: the cookie jar shared with the network stack (already in the
 # dependency tree, through reqwest)
 cookie_store = "0.22"
+cookie = "0.18"

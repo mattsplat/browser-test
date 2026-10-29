@@ -155,7 +155,9 @@ fn main() {
             Box::new(initial_url_ctx.clone()) as Box<dyn std::any::Any>
         })];
 
-    dioxus_native::launch_cfg(app, contexts, vec![Box::new(window_attributes)])
+    dioxus_native::launch_cfg(app, contexts, vec![Box::new(window_attributes)]);
+    // Cookies save shortly after they change; write any still waiting.
+    cookies::jar().flush();
 }
 
 fn app() -> Element {

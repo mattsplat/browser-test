@@ -36,7 +36,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
+    // Profile files hold cookies, storage and history: readable by this user only.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let write = |options: &std::fs::OpenOptions| -> io::Result<()> {
+        use std::io::Write;
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)
+    };
+    write(&options).and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -122,6 +132,12 @@ pub fn init(name: &str) -> Result<(), String> {
     let name = spelling_in(&root, name);
     let dir = root.join(&name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    // This user's only (it holds cookies, storage and history).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     // A window of this profile that's just closing may hold the lock a moment longer.
     let mut attempts = 0;
     let file = loop {
@@ -340,7 +356,13 @@ mod tests {
         assert!(lock(&root.join("Work")).unwrap().is_none(), "a second process can't open the same profile");
         assert!(lock(&root.join("Home")).unwrap().is_some(), "other profiles are unaffected");
         drop(work);
-        assert!(lock(&root.join("Work")).unwrap().is_some(), "the lock goes with the process");
+        // A process another test is spawning holds a copy of every descriptor between its fork
+        // and exec, lock included, for a moment: retry briefly, as `init` does.
+        let relocked = (0..50).any(|_| lock(&root.join("Work")).unwrap().is_some() || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(relocked, "the lock goes with the process");
         // Other failures are errors, not "already open".
         assert!(lock(&root.join("Missing")).is_err());
 
@@ -351,6 +373,18 @@ mod tests {
         let profiles = vec![("Work".to_string(), false)];
         assert!(exists(&profiles, "WORK") && !exists(&profiles, "Home"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Files written into a profile are this user's only.
+    #[cfg(unix)]
+    #[test]
+    fn profile_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("private");
+        let path = dir.join("cookies.json");
+        write_atomic(&path, b"[]").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

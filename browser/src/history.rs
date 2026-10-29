@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
-use blitz_traits::net::{Method, Request, Url};
+use blitz_traits::net::{CookieScope, Method, Request, Url};
 use dioxus_native::prelude::*;
 
 pub type SyncStore<T> = Store<T, CopyValue<T, SyncStorage>>;
@@ -179,8 +179,19 @@ pub struct BrowserNavProvider {
 }
 
 impl NavigationProvider for BrowserNavProvider {
+    /// A link or form on the current page. Going to another site, the request carries only
+    /// the cookies `SameSite` allows: not Strict ones, and for a POST not Lax ones either (so
+    /// a cross-site form can't ride the user's session).
     fn navigate_to(&self, options: NavigationOptions) {
-        HistoryNav::navigate(&self.history, options.into_request());
+        let mut request = options.into_request();
+        let from = self.history.current_url().read().url.clone();
+        if crate::gate::cross_site(&from, &request.url) {
+            request.cookies = match request.method {
+                Method::GET => CookieScope::CrossSiteNavigation,
+                _ => CookieScope::CrossSite,
+            };
+        }
+        HistoryNav::navigate(&self.history, request);
     }
 }
 

@@ -218,6 +218,8 @@ pub struct PageEnv {
     /// The tab's history, for `location` and `history`; None outside a tab (navigations do
     /// nothing).
     pub nav: Option<Rc<dyn TabNav>>,
+    /// Aborted when the page goes (the tab navigates or closes): its fetches stop.
+    pub signal: Option<blitz_traits::net::AbortSignal>,
 }
 
 /// What a page's `location` and `history` change in its tab (`history::TabHistory`).
@@ -772,6 +774,7 @@ impl PageHost {
                     request.credentials = credentials;
                 }
             }
+            request.signal = self.env.signal.clone();
             Ok(request)
         })();
         let mut objects = self.objects.borrow_mut();

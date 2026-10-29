@@ -117,7 +117,7 @@ impl DocumentLoader {
     /// its session storage and its history.
     fn page_env(&self) -> crate::host::PageEnv {
         let nav = crate::history::TabHistory { history: self.history, reload: self.reload_generation };
-        crate::host::PageEnv { gate: None, session: self.session.clone(), nav: Some(Rc::new(nav)) }
+        crate::host::PageEnv { gate: None, session: self.session.clone(), nav: Some(Rc::new(nav)), signal: None }
     }
 
     pub fn reload(&self) {
@@ -269,7 +269,7 @@ async fn build_page_document(
 
     let page_url = document.url().clone();
     // What the page's code reaches beyond its document: the network, through its gate.
-    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)), ..env };
+    let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)), signal: Some(signal.clone()), ..env };
     let Some(src) = dart_script_url(&document) else {
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");
