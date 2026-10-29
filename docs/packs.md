@@ -114,7 +114,8 @@ Ok(startup.finish(Box::new(runtime)))
   Any other import fails to load.
 - **Interpreters:** `host.request` and a fixed set of `wasi_snapshot_preview1` functions,
   all implemented in `interpreter.rs`:
-  - `random_get` and `clock_time_get`/`clock_res_get` come from the host (principle 4).
+  - `random_get` and `clock_time_get` come from the host (principle 4), through
+    `Host::random_u64` and `Host::clock`; `clock_res_get` is a constant.
   - `fd_write` to stdout goes to the trace as console output; stderr (only ever the
     interpreter's own, e.g. a Rust panic) goes to the browser's log. One write sends at
     most 64 KiB, and one `random_get` fills at most 64 KiB.
@@ -143,6 +144,12 @@ Ok(startup.finish(Box::new(runtime)))
 | `call(target, method, args)` | `target.method(...args)` |
 | `console(text)` | output with no console object (Dart's `print`, a pack's stdout) |
 | `now()` | `Date.now()` |
+| `clock(id)` | an interpreter's WASI clock: real time, or monotonic from the page's start |
+| `random_u64()` | an interpreter's WASI random bytes |
+
+Every nondeterministic value a pack reads (`now`, `Math.random`, `clock`, `random_u64`)
+passes through the page's `Tape` (`replay.rs`), so a recording can replay it. A pack must
+not read time or randomness any other way.
 
 - **Names** are Web IDL's (`querySelector`, `textContent`, `addEventListener`), so Dart's
   `package:web`, JS and Python all use the same ones. A member the host doesn't implement

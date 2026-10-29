@@ -28,6 +28,7 @@ use keyboard_types::Modifiers;
 use wasmtime::{Config, Engine, Trap};
 
 use crate::debug;
+use crate::replay;
 use crate::host::{self, EventDetails, HostValue, Obj, Objects, PageHost, TimerInfo, TraceEntry, TraceKind};
 
 /// What the document needs from a pack. Every call runs on the UI thread, one at a time,
@@ -230,6 +231,7 @@ impl RunningPack {
         let started = Instant::now();
         let result = match self.runtime.try_borrow_mut() {
             Ok(mut runtime) => {
+                self.objects.borrow_mut().tape.step(|| replay::Step::Eval { source: source.to_string(), by });
                 // Host calls the input makes are traced as the caller's, not the page's, so
                 // the AI's redacted views can leave out what the user typed.
                 self.objects.borrow().caller.set(Some(by));
@@ -299,6 +301,15 @@ impl RunningPack {
             return false;
         }
         let due = self.objects.borrow_mut().take_due_timers(Instant::now());
+        self.run_timers(due)
+    }
+
+    /// Run a batch of timers (recorded as one step). Returns whether there were any.
+    fn run_timers(&self, due: Vec<host::DueTimer>) -> bool {
+        if due.is_empty() {
+            return false;
+        }
+        self.objects.borrow_mut().tape.step(|| replay::Step::Timers(due.iter().map(|t| (t.handle, t.args.first().and_then(|a| a.as_num()))).collect()));
         for timer in &due {
             let during = if timer.args.is_empty() { "timer" } else { "animation frame" };
             if let Err(e) = self.call(timer.callback, &timer.args, during, String::new()) {
@@ -307,7 +318,91 @@ impl RunningPack {
         }
         self.objects.borrow_mut().after_timers_ran(&due);
         release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
-        !due.is_empty()
+        true
+    }
+
+    /// Deliver an event of type `kind` along `chain` (target first, then its ancestors) to
+    /// the page's listeners, in bubbling order, recording it as a step. Returns whether a
+    /// listener called `preventDefault`. Idle, or with no listener on the chain, nothing runs.
+    fn dispatch(&self, chain: &[NodeId], kind: &str, details: EventDetails) -> bool {
+        let Some(&target) = chain.first() else { return false };
+        let listening = |node: &NodeId| self.objects.borrow().listeners.contains_key(&(*node, kind.to_string()));
+        // Paused on an exception or stopped, the page's listeners don't run (Blitz's defaults still do).
+        if self.idle() || !chain.iter().any(listening) {
+            return false;
+        }
+        if let Some(path) = replay::path_of(&self.doc.borrow(), target) {
+            let details = details.clone();
+            self.objects.borrow_mut().tape.step(|| replay::Step::Event { kind: kind.to_string(), target: path, details });
+        }
+        // One event object for the whole dispatch, released when it ends.
+        let handle = self.objects.borrow_mut().event(kind, target, details);
+        let flag = |f: fn(&host::EventObj) -> bool| self.objects.borrow_mut().event_mut(handle).is_some_and(|e| f(e));
+        // The chain runs from the target up to the root: bubbling order.
+        'nodes: for node in chain {
+            let ids = self.objects.borrow().listeners.get(&(*node, kind.to_string())).cloned().unwrap_or_default();
+            if let Some(e) = self.objects.borrow_mut().event_mut(handle) {
+                e.current_target = *node;
+            }
+            for id in ids {
+                let on = debug::describe(&self.doc.borrow(), *node);
+                let during = format!("{kind} listener");
+                if let Err(e) = self.call(id, &[HostValue::Object(handle)], &during, on.clone()) {
+                    self.uncaught(&during, on, &e);
+                }
+                if flag(|e| e.immediate_propagation_stopped) || self.paused.get() {
+                    break 'nodes;
+                }
+            }
+            if flag(|e| e.propagation_stopped) {
+                break;
+            }
+        }
+        let prevented = flag(|e| e.default_prevented);
+        self.objects.borrow_mut().release(handle);
+        release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
+        prevented
+    }
+
+    // ---- Recording and replay (`replay.rs`)
+
+    /// Steps recorded so far, if this page is being recorded.
+    pub fn recorded_steps(&self) -> Option<usize> {
+        self.objects.borrow().tape.recording().map(|r| r.steps.len())
+    }
+
+    /// Stop recording and hand back the recording, with the page's DOM as it is now.
+    pub fn stop_recording(&self) -> Option<replay::Recording> {
+        let tape = std::mem::take(&mut self.objects.borrow_mut().tape);
+        match tape {
+            replay::Tape::Record(mut r) => {
+                r.final_dom = replay::dom_text(&self.doc.borrow());
+                Some(*r)
+            }
+            other => {
+                self.objects.borrow_mut().tape = other;
+                None
+            }
+        }
+    }
+
+    /// Apply one recorded step, as it happened.
+    fn replay_step(&self, step: &replay::Step) -> Result<()> {
+        match step {
+            replay::Step::Event { kind, target, details } => {
+                let node = replay::node_at(&self.doc.borrow(), target).ok_or_else(|| anyhow!("the {kind} target {target:?} isn't in the page"))?;
+                let chain = self.doc.borrow().node_chain(node);
+                self.dispatch(&chain, kind, details.clone());
+            }
+            replay::Step::Timers(fired) => {
+                let due = self.objects.borrow_mut().take_timers(fired).ok_or_else(|| anyhow!("timers {fired:?} aren't all pending"))?;
+                self.run_timers(due);
+            }
+            replay::Step::Eval { source, by } => {
+                let _ = self.eval(source, by);
+            }
+        }
+        Ok(())
     }
 
     /// Make sure the event loop wakes when the next timer is due. Not while idle: a due
@@ -337,6 +432,10 @@ impl RunningPack {
     /// snapshot of the page, which then pauses. `during` is what was running.
     fn uncaught(&self, during: &str, args: String, e: &anyhow::Error) {
         record_error(self.name, &self.page, during.to_string(), args.clone(), e);
+        // A replay runs to the end: pausing would stop it partway.
+        if self.objects.borrow().tape.replaying() {
+            return;
+        }
         if snapshot_if_pausing(self.name, &self.page, &self.doc, &self.objects, during, args, e) {
             self.paused.set(true);
         }
@@ -421,6 +520,34 @@ impl Startup {
 }
 
 impl PackDocument {
+    /// With the page being recorded, keep what it loaded: its HTML, site CSS and program
+    /// (the loader calls this once the pack has started).
+    pub fn attach_recording(&self, html: &str, site_css: Option<&str>, program: replay::Program) {
+        if let replay::Tape::Record(r) = &mut self.pack.objects.borrow_mut().tape {
+            r.html = html.to_string();
+            r.site_css = site_css.map(str::to_string);
+            r.program = Some(program);
+        }
+    }
+
+    pub(crate) fn replay_step(&self, step: &replay::Step) -> Result<()> {
+        self.pack.replay_step(step)
+    }
+
+    /// End a replay: the page reads live values from now on. Returns why its reads stopped
+    /// matching the tape, if they did.
+    pub(crate) fn end_replay(&self) -> Option<String> {
+        match std::mem::take(&mut self.pack.objects.borrow_mut().tape) {
+            replay::Tape::Replay { diverged, .. } => diverged,
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pack(&self) -> &RunningPack {
+        &self.pack
+    }
+
     /// The page and its pack, for the browser's tools.
     pub fn page_ref(&self) -> PageRef {
         PageRef { doc: Rc::downgrade(&self.pack.doc), pack: Some(Rc::downgrade(&self.pack)) }
@@ -434,6 +561,13 @@ impl PackDocument {
         let objects = Rc::new(RefCell::new(Objects::default()));
         let host = PageHost::new(name, doc.clone(), objects.clone());
         let page = host.page.clone();
+        // A recording or replay armed for this page starts with it, before the pack reads
+        // anything.
+        let mut tape = replay::take_armed(&page);
+        if let replay::Tape::Record(r) = &mut tape {
+            r.pack = name;
+        }
+        objects.borrow_mut().tape = tape;
         (host, Startup { name, page, doc, objects, paused: false, started: Instant::now() })
     }
 }
@@ -584,42 +718,9 @@ struct PackEventHandler<'a> {
 
 impl EventHandler for PackEventHandler<'_> {
     fn handle_event(&mut self, chain: &[NodeId], event: &mut DomEvent, _doc: &mut dyn Document, state: &mut EventState) {
-        let pack = self.pack;
-        let kind = event.data.name();
-        let Some(&target) = chain.first() else { return };
-        let listening = |node: &NodeId| pack.objects.borrow().listeners.contains_key(&(*node, kind.to_string()));
-        // Paused on an exception or stopped, the page's listeners don't run (Blitz's defaults still do).
-        if pack.idle() || !chain.iter().any(listening) {
-            return;
-        }
-        // One event object for the whole dispatch, released when it ends.
-        let handle = pack.objects.borrow_mut().event(kind, target, event_details(&event.data));
-        let flag = |f: fn(&host::EventObj) -> bool| pack.objects.borrow_mut().event_mut(handle).is_some_and(|e| f(e));
-        // The chain runs from the target up to the root: bubbling order.
-        'nodes: for node in chain {
-            let ids = pack.objects.borrow().listeners.get(&(*node, kind.to_string())).cloned().unwrap_or_default();
-            if let Some(e) = pack.objects.borrow_mut().event_mut(handle) {
-                e.current_target = *node;
-            }
-            for id in ids {
-                let on = debug::describe(&pack.doc.borrow(), *node);
-                let during = format!("{kind} listener");
-                if let Err(e) = pack.call(id, &[HostValue::Object(handle)], &during, on.clone()) {
-                    pack.uncaught(&during, on, &e);
-                }
-                if flag(|e| e.immediate_propagation_stopped) || pack.paused.get() {
-                    break 'nodes;
-                }
-            }
-            if flag(|e| e.propagation_stopped) {
-                break;
-            }
-        }
-        if flag(|e| e.default_prevented) {
+        if self.pack.dispatch(chain, event.data.name(), event_details(&event.data)) {
             state.prevent_default();
         }
-        pack.objects.borrow_mut().release(handle);
-        release_unused(&pack.objects, pack.runtime.borrow_mut().as_mut());
     }
 }
 
@@ -904,6 +1005,92 @@ mod tests {
             timers.sort();
             assert_eq!(timers, ["frame", "interval:3", "timeout"], "{pack}: timers");
         }
+    }
+
+    // ---- Time-travel replay: record a session, replay it in a fresh pack, same DOM.
+
+    /// Record the events scenario on its own URL, plus clicks on `#noise` (random numbers and
+    /// the clock, read now and from a timer) and, where the pack can eval, console input.
+    async fn record_events_session(pack: &str) -> replay::Recording {
+        let url = format!("https://replay-{pack}.test/");
+        replay::arm(&url);
+        let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig { base_url: Some(url), ..Default::default() }).into_inner();
+        let (mut page, program) = match pack {
+            "dart" => {
+                let wasm = compile("tests/fixtures/events.dart").await;
+                (crate::dart_pack::start(doc, &wasm).unwrap(), replay::Program::Dart(wasm))
+            }
+            "python" => {
+                let scripts = vec![Script { name: "events.py".into(), source: include_str!("../tests/fixtures/events.py").into(), module: false }];
+                (crate::python_pack::start(doc, &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+            }
+            _ => {
+                let scripts = vec![Script { name: "events.js".into(), source: include_str!("../tests/fixtures/events.js").into(), module: false }];
+                let page = crate::js_pack::start(doc, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
+            }
+        };
+        page.attach_recording(EVENTS_HTML, None, program);
+        dispatch(&mut page, "#button", click_at(10.0, 20.0, true));
+        dispatch(&mut page, "#noise", click_at(0.0, 0.0, false));
+        dispatch(&mut page, "#stop", click_at(0.0, 0.0, false));
+        dispatch(&mut page, "#field", key_down("a", Code::KeyA, true));
+        settle_timers(&mut page);
+        dispatch(&mut page, "#noise", click_at(0.0, 0.0, false));
+        dispatch(&mut page, "#stream", click_at(0.0, 0.0, false));
+        if page.pack.can_eval() {
+            let add = if pack == "python" { "out.textContent = out.textContent + ',typed'" } else { "out.textContent += ',typed'" };
+            page.pack.eval(add, debug::CONSOLE_PACK).unwrap();
+        }
+        settle_timers(&mut page);
+        page.pack.stop_recording().expect("the page was being recorded")
+    }
+
+    /// In each pack: a recorded session (events, timers, random numbers, the clock, console
+    /// input) replayed in a fresh pack ends with the same DOM, and replaying part of it stops
+    /// at that step.
+    #[tokio::test]
+    async fn a_recorded_session_replays_to_the_same_dom_in_every_pack() {
+        for pack in ["dart", "js", "python"] {
+            let recording = record_events_session(pack).await;
+            assert_eq!(recording.pack, pack);
+            assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Random), "{pack}: Math.random is on the tape");
+            assert!(recording.tape.iter().any(|(k, _)| matches!(k, replay::Read::Now | replay::Read::Clock)), "{pack}: the clock is on the tape");
+            assert!(recording.steps.iter().any(|s| matches!(s, replay::Step::Timers(_))), "{pack}: timers are steps");
+
+            let config = || DocumentConfig { base_url: Some(recording.url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config(), None).await.unwrap();
+            assert_eq!(outcome, replay::Outcome { steps: recording.steps.len(), diverged: None }, "{pack}");
+            assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}: the replayed DOM differs");
+            let noise = text_of(&replayed.pack().doc.borrow(), "#noise");
+            assert_eq!(noise.matches(" t").count(), 2, "{pack}: two clicks' numbers and their timers' numbers: {noise} {:?}", errors_on(&recording.url));
+
+            // Step to event 1: only the first click has happened.
+            let (partial, outcome) = replay::replay(&recording, config(), Some(1)).await.unwrap();
+            assert_eq!(outcome.steps, 1);
+            assert_eq!(text_of(&partial.pack().doc.borrow(), "#out"), "once,click:10,20,0,true", "{pack}");
+            // Afterwards the page is live: it gets events as usual.
+            drop(partial);
+        }
+    }
+
+    /// Without the tape, the same inputs give different numbers: the replay's match above is
+    /// the tape's doing, not luck. A replay that can't apply a step says where it diverged.
+    #[tokio::test]
+    async fn replay_without_the_tape_differs_and_divergence_is_reported() {
+        let mut recording = record_events_session("js").await;
+        let mut untaped = recording.clone();
+        untaped.tape.clear();
+        let config = || DocumentConfig { base_url: Some(recording.url.clone()), ..Default::default() };
+        let (page, outcome) = replay::replay(&untaped, config(), None).await.unwrap();
+        assert!(outcome.diverged.is_some());
+        assert_ne!(replay::dom_text(&page.pack().doc.borrow()), recording.final_dom);
+
+        // A step whose target isn't there.
+        recording.steps.insert(0, replay::Step::Event { kind: "click".into(), target: vec![9, 9, 9], details: Default::default() });
+        let (_, outcome) = replay::replay(&recording, config(), None).await.unwrap();
+        assert_eq!(outcome.steps, 0);
+        assert!(outcome.diverged.unwrap().contains("isn't in the page"));
     }
 
     /// JS errors carry their type, message and a stack with function names and locations.

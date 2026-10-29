@@ -23,6 +23,7 @@ use crate::host::{self, TraceEntry, TraceKind};
 use crate::{dart_pack, js_pack, python_pack};
 use crate::js_permission;
 use crate::prompt;
+use crate::replay;
 use crate::settings::{self, Grant};
 use crate::history::{BrowserNavProvider, History, SyncStore};
 
@@ -218,7 +219,15 @@ async fn build_page_document(
     let mut document = HtmlDocument::from_html(html, config).into_inner();
     // The site's own stylesheet, if the user gave it one: after the page's, before any script.
     let origin = settings::origin_of(document.url());
-    crate::site_css::apply(&mut document, crate::site_css::for_origin(&settings::get(), &origin));
+    let site_css = crate::site_css::for_origin(&settings::get(), &origin).map(str::to_string);
+    crate::site_css::apply(&mut document, site_css.as_deref());
+    // Being recorded (Inspector → Recording): keep what the pack loads, to replay it.
+    let recording = replay::armed(document.url().as_str());
+    let record = |page: &PackDocument, program: replay::Program| {
+        if recording {
+            page.attach_recording(html, site_css.as_deref(), program);
+        }
+    };
     let title = document
         .find_title_node()
         .map(|n| n.text_content())
@@ -237,7 +246,10 @@ async fn build_page_document(
             }
             let sources = fetch_sources("python", &scripts, &page_url, net_provider, signal).await;
             return match python_pack::start(document, &sources) {
-                Ok(python) => (shown_pack(python), title, favicon_url),
+                Ok(python) => {
+                    record(&python, replay::Program::Scripts { pack: "python", scripts: sources, imports: Vec::new() });
+                    (shown_pack(python), title, favicon_url)
+                }
                 Err(e) => {
                     trace_pack_load("python", &page_url, &page_url, format!("ERROR {e:#}"));
                     ((error_document(&format!("Python pack failed: {e:#}")), None), title, favicon_url)
@@ -261,16 +273,24 @@ async fn build_page_document(
         }
         let sources = fetch_sources("js", &scripts, &page_url, net_provider, signal).await;
         // Module imports come through the gate too, as requests from this page.
+        let imports: Rc<RefCell<Vec<(String, String)>>> = Default::default();
         let fetch_import = |url: String| {
-            let (net, page, signal) = (Arc::clone(net_provider), page_url.clone(), signal.clone());
+            let (net, page, signal, imports) = (Arc::clone(net_provider), page_url.clone(), signal.clone(), imports.clone());
             async move {
-                let url = Url::parse(&url)?;
-                let (_, bytes) = net.fetch_for_page(Request::get(url).signal(signal), &page).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
+                let parsed = Url::parse(&url)?;
+                let (_, bytes) = net.fetch_for_page(Request::get(parsed).signal(signal), &page).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let source = String::from_utf8_lossy(&bytes).into_owned();
+                if recording {
+                    imports.borrow_mut().push((url, source.clone()));
+                }
+                Ok(source)
             }
         };
         return match js_pack::start(document, &sources, fetch_import).await {
-            Ok(js) => (shown_pack(js), title, favicon_url),
+            Ok(js) => {
+                record(&js, replay::Program::Scripts { pack: "js", scripts: sources, imports: imports.take() });
+                (shown_pack(js), title, favicon_url)
+            }
             Err(e) => {
                 trace_pack_load("js", &page_url, &page_url, format!("ERROR {e:#}"));
                 ((error_document(&format!("JS pack failed: {e:#}")), None), title, favicon_url)
@@ -299,7 +319,10 @@ async fn build_page_document(
         }
     };
     match dart_pack::start(document, &wasm) {
-        Ok(dart) => (shown_pack(dart), title, favicon_url),
+        Ok(dart) => {
+            record(&dart, replay::Program::Dart(wasm));
+            (shown_pack(dart), title, favicon_url)
+        }
         // Loading failed partway; the document it was given is gone, so show the error.
         Err(e) => {
             trace_load(&page_url, &src, format!("ERROR {e:#}"));

@@ -483,7 +483,8 @@ fn classify(body: &str) -> Helper {
         "o => o.length" => Helper::Get("length".into()),
         "(o, i) => o[i]" => Helper::Index,
         "(string, times) => string.repeat(times)" => Helper::Repeat,
-        "() => Date.now()" => Helper::DateNow,
+        // DateTime.now() imports `Date.now` itself.
+        "() => Date.now()" | "Date.now" => Helper::DateNow,
         "f => f.dartFunction" => Helper::DartFunction,
         "(handle) => clearTimeout(handle)" | "(handle) => clearInterval(handle)" => Helper::ClearTimer,
         _ if b.starts_with("(ms, c) =>") && b.contains("setTimeout(") => Helper::SetTimer { repeat: false },

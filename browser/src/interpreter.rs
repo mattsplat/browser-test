@@ -5,14 +5,13 @@
 //! The interpreter reaches the page through one import, `host.request`, carrying JSON
 //! (`{op: "global"|"get"|"set"|"call"|"console", ...}`; values are tagged as below). Its
 //! only other imports are WASI functions, implemented here rather than with a WASI runtime so
-//! the clock and randomness come from the host (principle 4); there are no files, network or
+//! the clock and randomness come from the host (principle 4: `Host::clock` and
+//! `Host::random_u64`, so a recording can replay them); there are no files, network or
 //! environment, and every file call fails.
 //!
 //! Each interpreter exports the same ABI under its own prefix (`js_`, `py_`): `alloc`/`free`
 //! for strings passed in and out, `run` (a page script), `fire` (a listener or timer),
 //! `release` (forget a callback) and `eval` (console input). See "Language packs" in DESIGN.md.
-
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -47,8 +46,6 @@ pub struct Script {
 struct State {
     lang: &'static Language,
     host: Box<dyn Host>,
-    rng: u64,
-    started: Instant,
     limits: StoreLimits,
 }
 
@@ -105,8 +102,7 @@ fn remove_stale_caches(lang: &Language, current: &std::path::Path) {
 impl Interpreter {
     pub fn load(lang: &'static Language, host: Box<dyn Host>) -> Result<Self> {
         let module = module(lang)?;
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-        let mut store = Store::new(engine(), State { lang, host, rng: seed | 1, started: Instant::now(), limits: memory_limits() });
+        let mut store = Store::new(engine(), State { lang, host, limits: memory_limits() });
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(TIME_LIMIT_TICKS);
         let mut linker = Linker::new(engine());
@@ -333,22 +329,16 @@ fn add_wasi(linker: &mut Linker<State>) -> Result<()> {
             return Ok(EINVAL);
         }
         let mut bytes = vec![0u8; len as usize];
-        for b in bytes.iter_mut() {
-            let rng = &mut caller.data_mut().rng;
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
-            *b = *rng as u8;
+        for chunk in bytes.chunks_mut(8) {
+            let bits = caller.data_mut().host.random_u64().to_le_bytes();
+            chunk.copy_from_slice(&bits[..chunk.len()]);
         }
         caller_memory(&mut caller).map_err(wasm_err)?.write(&mut caller, buf as usize, &bytes)?;
         Ok(0)
     })?;
     linker.func_wrap(WASI, "clock_time_get", move |mut caller: Caller<'_, State>, id: u32, _precision: u64, out: u32| -> wasmtime::Result<i32> {
         // 0 = realtime, otherwise monotonic since the page started.
-        let nanos = match id {
-            0 => SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0),
-            _ => caller.data().started.elapsed().as_nanos() as u64,
-        };
+        let nanos = caller.data_mut().host.clock(id);
         caller_memory(&mut caller).map_err(wasm_err)?.write(&mut caller, out as usize, &nanos.to_le_bytes())?;
         Ok(0)
     })?;

@@ -936,6 +936,58 @@ are generalisations:
 - The dev-mode Dart compile cache (`dart-dev/`) is unchanged; its http part still sits in the
   shared cache folder (see "Phase C notes").
 
+**Time-travel replay** (`browser/src/replay.rs`; Inspector → Recording).
+- **What's recorded**, per page, everything that crosses the host boundary into the pack:
+  - **steps**, in order: events delivered to the page's listeners (type, target as a path
+    of child indexes, mouse and key details), timer batches (which timer handles fired,
+    with an animation frame's timestamp), and console or AI eval input;
+  - **the tape**: every nondeterministic value the pack read, in order: `Date.now()`,
+    `Math.random`, and the interpreters' WASI clock and random bytes;
+  - **the start**: the page's HTML, its site CSS, and its program (Dart's wasm, or the
+    interpreter's scripts plus every JS module import fetched).
+- **The fix this needed (principle 4):** the interpreters' WASI `clock_time_get` and
+  `random_get` had their own clock and generator in `interpreter.rs`, a side path around the
+  host. They now ask the host (`Host::clock`, `Host::random_u64`), and every such read goes
+  through the page's `Tape` (`Objects::tape`: off, recording or replaying). Dart's
+  `DateTime.now()` also failed before (its `Date.now` import wasn't recognised); it now
+  reads `Host::now`.
+- **Replaying** parses the recorded HTML, applies the same site CSS (so node ids line up),
+  starts a fresh pack on the recorded program (nothing is fetched), answers reads from the
+  tape and applies the steps through the same dispatch and timer code as live
+  (`RunningPack::dispatch`, `run_timers`). Timers fire by handle, not by the clock. Then the
+  page goes live. A read of the wrong kind, a missing target or a timer that isn't pending
+  is reported as divergence (`Outcome::diverged`).
+- **Event targets are paths, not node ids:** Blitz allocates anonymous layout nodes in the
+  same slab, so an element the page creates after the first layout gets a different id in a
+  replay that never lays out. Child-index paths over the DOM tree are the same.
+- **Proved by tests:** `a_recorded_session_replays_to_the_same_dom_in_every_pack` records the
+  cross-pack events page (clicks, keys, timeouts, an interval, an animation frame, clicks
+  that print `Math.random` and the clock now and from a timer, console input for JS and
+  Python) in Dart, JS and Python, replays each in a fresh pack and compares the whole DOM;
+  replaying to step 1 stops there. `replay_without_the_tape_differs_and_divergence_is_reported`
+  shows the tape is what makes it match, and that a bad step is reported.
+- **UI:** Inspector → Recording. "Record" arms the tab's URL and reloads (a page's earlier
+  state can't be replayed, so a recording starts with a load); "Stop" keeps it. For a
+  recording: ⏮ ◀ ▶ ⏭ (or click a step) pick step N, "Replay to step N in this tab" swaps a
+  fresh replayed page into the tab (scrubbing back replays from the start), "Verify"
+  replays all of it off screen and compares the DOM with the one at "Stop", "Forget"
+  drops it.
+- **Privacy:** recordings hold what the page received, including console input, so they stay
+  in memory (the last 5) and are never written to disk or reachable by AI access.
+- **Limitations:**
+  - Blitz's own default actions aren't replayed (typing into a field, toggling a checkbox,
+    following a link): only what reached the pack. Pages can't read field values yet, so
+    this doesn't change what a pack sees today; it will once `value` is supported.
+  - Leaving or reloading the page without "Stop" loses the recording. A page whose URL
+    redirects isn't recorded (it's armed by URL).
+  - At most 100,000 steps and 1,000,000 tape values; past that the recording stops at a step
+    boundary and says so.
+  - No saving or sharing recordings as bug reports yet: they'd need a file format and the
+    same redaction review as AI views.
+  - "Reload by replay" for hot reload (replaying a session into recompiled code) isn't
+    built: a code change usually changes which values are read, so the tape diverges; it
+    would need a rule for when to fall back to a plain reload.
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).

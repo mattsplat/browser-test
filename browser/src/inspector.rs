@@ -9,6 +9,8 @@
 //!   pending timers, and how often each callback ran.
 //! - **Profiler:** time inside the pack per kind of call, and time in each host operation,
 //!   aggregated from the trace (so it covers the trace's last 2000 entries).
+//! - **Recording:** record what the page's pack receives (reloading it first), then replay it
+//!   in a fresh pack in this tab, all of it or up to step N (`replay.rs`).
 //! - **Network** is the Requests panel.
 //!
 //! Everything is read through `debug`, the same protocol AI access uses. Console input is the
@@ -26,8 +28,12 @@ use crate::Panel;
 use crate::debug::{self, ConsoleEntry, Level, NodeKind, Privacy};
 use crate::host;
 use crate::nav::is_enter_key;
+use crate::document_loader::make_doc_config;
+use crate::history::HistoryNav;
 use crate::page_document::PageRef;
-use crate::tab::{Tab, TabId};
+use crate::replay;
+use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt, active_tab};
+use dioxus_native::SubDocumentAttr;
 
 /// Tree rows and console lines rendered at once; more make every redraw slow.
 const MAX_ROWS: usize = 1500;
@@ -40,6 +46,7 @@ enum View {
     Exceptions,
     Handles,
     Profiler,
+    Recording,
 }
 
 /// Which console lines show.
@@ -173,6 +180,7 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
         View::Exceptions => exceptions_view(page.clone(), origin.clone(), tick, show_dom),
         View::Handles => handles_view(page.clone()),
         View::Profiler => profiler_view(&origin),
+        View::Recording => rsx!(RecordingView { tabs, active_tab_id, origin: origin.clone(), tick: tick() }),
     };
 
     rsx!(
@@ -187,6 +195,7 @@ pub fn Inspector(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, open_panel
                 div { class: tab_class(View::Exceptions), onclick: move |_| view.set(View::Exceptions), "Exceptions" }
                 div { class: tab_class(View::Handles), onclick: move |_| view.set(View::Handles), "Handles" }
                 div { class: tab_class(View::Profiler), onclick: move |_| view.set(View::Profiler), "Profiler" }
+                div { class: tab_class(View::Recording), onclick: move |_| view.set(View::Recording), "Recording" }
                 div { class: "request-toggle", onclick: move |_| open_panel.set(Panel::Requests), "Network ↗" }
             }
             {body}
@@ -569,6 +578,190 @@ fn profiler_view(origin: &str) -> Element {
             {rows(p.pack, "pack")}
             div { class: "detail-section", "Host operations, slowest first" }
             {rows(p.host, "host")}
+        }
+    )
+}
+
+// ---- Recording
+
+/// Record the page, and replay recordings into this tab. `tick` re-renders it with the
+/// Inspector's poll, so the step count stays current.
+#[component]
+fn RecordingView(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, origin: String, tick: u64) -> Element {
+    let _ = tick;
+    let mut status = use_signal(String::new);
+    // The recording picked, and the step to replay to.
+    let mut chosen: Signal<Option<(u64, usize)>> = use_signal(|| None);
+    let mut changes = use_signal(|| 0u64);
+    let _ = changes();
+
+    let info = debug::tab(tabs, active_tab_id(), None);
+    let url = info.as_ref().map(|t| t.url.to_string()).unwrap_or_default();
+    let pack = info.and_then(|t| t.page).and_then(|p| p.pack());
+    let recording_steps = pack.as_ref().and_then(|p| p.recorded_steps());
+    let recordings = replay::recordings(&origin);
+
+    let record = {
+        let url = url.clone();
+        move |_| {
+            replay::arm(&url);
+            active_tab(tabs, active_tab_id()).reload();
+            status.set("Reloading to record from the start…".into());
+        }
+    };
+    let stop = {
+        let pack = pack.clone();
+        move |_| {
+            if let Some(r) = pack.as_ref().and_then(|p| p.stop_recording()) {
+                let steps = r.steps.len();
+                let id = replay::keep(r);
+                chosen.set(Some((id, steps)));
+                status.set(format!("Recorded {steps} steps."));
+            }
+            changes += 1;
+        }
+    };
+
+    let selected = chosen().and_then(|(id, step)| recordings.iter().find(|r| r.id == id).map(|r| (r.clone(), step)));
+    rsx!(
+        div { class: "site-section",
+            match (recording_steps, &pack) {
+                (Some(n), _) => rsx!(
+                    div { class: "site-row paused-bar",
+                        span { "Recording this page: {n} steps" }
+                        div { class: "prompt-button primary", onclick: stop, "Stop" }
+                    }
+                ),
+                (None, Some(_)) => rsx!(
+                    div { class: "site-row",
+                        span { "Record what this page's script receives" }
+                        div { class: "prompt-button", onclick: record, "Record" }
+                    }
+                ),
+                (None, None) => rsx!(div { class: "inspector-note", "No script runs on this page, so there's nothing to record." }),
+            }
+            div { class: "site-note",
+                "Recording reloads the page, then keeps every event, timer, clock reading and random number its script gets, in memory only. Replaying runs a fresh copy of the page in this tab and feeds them back."
+            }
+            if !status().is_empty() {
+                div { class: "site-note", "{status}" }
+            }
+        }
+        div { class: "request-list",
+            if recordings.is_empty() {
+                div { class: "inspector-note", "No recordings for {origin}." }
+            }
+            for r in recordings.iter() {
+                {
+                    let (id, total) = (r.id, r.steps.len());
+                    let full = if r.full { " (stopped at the size limit)" } else { "" };
+                    let open = selected.as_ref().is_some_and(|(s, _)| s.id == id);
+                    rsx!(
+                        div { key: "{id}", class: "snapshot",
+                            div {
+                                class: "site-heading detail-toggle",
+                                onclick: move |_| chosen.set(if open { None } else { Some((id, total)) }),
+                                if open { "▾ " } else { "▸ " }
+                                "#{id} {r.pack}: {total} steps, {r.tape.len()} values{full}"
+                            }
+                            div { class: "console-text", "{r.url}" }
+                        }
+                    )
+                }
+            }
+            if let Some((rec, step)) = selected {
+                {replay_controls(tabs, active_tab_id, rec, step, chosen, status, changes)}
+            }
+        }
+    )
+}
+
+/// Step through a recording: pick step N and replay up to it in the tab; verify it replays
+/// to the same DOM; forget it.
+fn replay_controls(
+    tabs: Store<Vec<Tab>>,
+    active_tab_id: Signal<TabId>,
+    rec: replay::Recording,
+    step: usize,
+    mut chosen: Signal<Option<(u64, usize)>>,
+    mut status: Signal<String>,
+    mut changes: Signal<u64>,
+) -> Element {
+    let (id, total) = (rec.id, rec.steps.len());
+    let mut to = move |n: usize| chosen.set(Some((id, n.min(total))));
+    let replay_here = {
+        let rec = rec.clone();
+        move |_| {
+            let tab = active_tab(tabs, active_tab_id());
+            if tab.nav_history().current_url().read().url.as_str() != rec.url {
+                status.set(format!("Open {} in this tab to replay it here.", rec.url));
+                return;
+            }
+            let loader = tab.loader_rc();
+            let config = make_doc_config(Some(rec.url.clone()), loader.net_provider.clone(), loader.history, loader.font_ctx.clone(), None);
+            let rec = rec.clone();
+            status.set(format!("Replaying to step {step}…"));
+            spawn(async move {
+                match replay::replay(&rec, config, Some(step)).await {
+                    Ok((page, outcome)) => {
+                        let page_ref = page.page_ref();
+                        *tab.document().write() = Some(SubDocumentAttr::new(page));
+                        *tab.page().write() = Some(page_ref);
+                        status.set(match outcome.diverged {
+                            None => format!("Replayed {} of {total} steps; the page is live from here.", outcome.steps),
+                            Some(why) => format!("Replayed {} steps, then diverged: {why}", outcome.steps),
+                        });
+                    }
+                    Err(e) => status.set(format!("Replay failed: {e:#}")),
+                }
+            });
+        }
+    };
+    let verify = {
+        let rec = rec.clone();
+        move |_| {
+            let rec = rec.clone();
+            spawn(async move {
+                let config = blitz_dom::DocumentConfig { base_url: Some(rec.url.clone()), ..Default::default() };
+                status.set(match replay::replay(&rec, config, None).await {
+                    Ok((page, outcome)) => {
+                        let same = page.page_ref().doc().is_some_and(|d| replay::dom_text(&d.borrow()) == rec.final_dom);
+                        match (outcome.diverged, same) {
+                            (None, true) => format!("Verified: all {total} steps replay to the same DOM."),
+                            (None, false) => "Replayed every step, but the DOM differs from the recording's.".into(),
+                            (Some(why), _) => format!("Diverged: {why}"),
+                        }
+                    }
+                    Err(e) => format!("Replay failed: {e:#}"),
+                });
+            });
+        }
+    };
+    let forget = move |_| {
+        replay::forget(id);
+        chosen.set(None);
+        changes += 1;
+    };
+    rsx!(
+        div { class: "request-panel-controls",
+            div { class: "request-toggle", onclick: move |_| to(0), "⏮" }
+            div { class: "request-toggle", onclick: move |_| to(step.saturating_sub(1)), "◀" }
+            span { class: "request-panel-counts", "step {step} of {total}" }
+            div { class: "request-toggle", onclick: move |_| to(step + 1), "▶" }
+            div { class: "request-toggle", onclick: move |_| to(total), "⏭" }
+        }
+        div { class: "request-panel-controls",
+            div { class: "prompt-button primary", onclick: replay_here, "Replay to step {step} in this tab" }
+            div { class: "prompt-button", onclick: verify, "Verify" }
+            div { class: "request-clear", onclick: forget, "Forget" }
+        }
+        for (i, s) in rec.steps.iter().enumerate().take(MAX_CONSOLE) {
+            div {
+                key: "{i}",
+                class: if i < step { "console-row" } else { "console-row dimmed" },
+                onclick: move |_| to(i + 1),
+                "{i + 1}. {s.describe()}"
+            }
         }
     )
 }

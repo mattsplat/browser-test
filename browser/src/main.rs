@@ -45,6 +45,7 @@ mod page_document;
 mod profile;
 mod prompt;
 mod python_pack;
+mod replay;
 mod request_panel;
 mod settings;
 mod site_css;

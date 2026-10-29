@@ -4,6 +4,14 @@ import 'dart:async';
 import 'dart:js_interop';
 import 'package:web/web.dart';
 
+// Math.random, through the host like any other call.
+extension type JSMath._(JSObject _) implements JSObject {
+  external double random();
+}
+
+@JS('Math')
+external JSMath get math;
+
 void main() {
   final out = document.querySelector('#out')!;
   final log = <String>[];
@@ -57,4 +65,13 @@ void main() {
     }
   });
   window.requestAnimationFrame(((JSNumber t) => add('frame')).toJS);
+
+  // Nondeterminism, for the replay test: Math.random and the clock, now and from a timer.
+  final noise = document.querySelector('#noise')!;
+  noise.addEventListener('click', ((Event e) {
+    noise.textContent = '${noise.textContent} ${(math.random() * 1e9).floor()}:${DateTime.now().millisecondsSinceEpoch}';
+    Timer(const Duration(milliseconds: 1), () {
+      noise.textContent = '${noise.textContent} t${(math.random() * 1e9).floor()}';
+    });
+  }).toJS);
 }

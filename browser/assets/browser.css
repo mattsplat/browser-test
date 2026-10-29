@@ -850,6 +850,10 @@ body,
 }
 
 .console-context,
+.console-row.dimmed {
+  color: #999;
+}
+
 .console-input-echo {
   color: #666;
 }

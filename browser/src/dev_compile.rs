@@ -109,9 +109,12 @@ fn build(source: &Path, out: &Path) -> Result<()> {
             .context("`dart pub get --offline` failed; run `dart pub get` once with network")?;
     }
     let build_sh = Path::new(env!("CARGO_MANIFEST_DIR")).join("../packs/dart/build.sh");
-    // Build beside the cache entry under a name of this process's own, then rename it in, so
-    // another process never reads a half-written wasm.
-    let tmp = out.with_extension(format!("{}.tmp.wasm", std::process::id()));
+    // Build beside the cache entry under a name of this build's own (process and count: two
+    // tabs can compile the same page at once), then rename it in, so nothing reads a
+    // half-written wasm.
+    static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = out.with_extension(format!("{}.{n}.tmp.wasm", std::process::id()));
     let built = run(Command::new("sandbox-exec").args(["-p", SANDBOX_PROFILE, "sh"]).arg(build_sh).arg(source).arg(&tmp))
         .and_then(|_| std::fs::rename(&tmp, out).context("saving the compiled wasm"));
     if built.is_err() {

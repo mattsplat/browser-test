@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use crate::replay::Read;
 use blitz_dom::{BaseDocument, LocalName, NodeId, QualName, ns};
 use wasmtime::{AnyRef, OwnedRooted};
 
@@ -105,6 +106,11 @@ pub trait Host {
     fn console(&mut self, text: &str);
     /// The current time in milliseconds since the Unix epoch (`Date.now()`).
     fn now(&mut self) -> f64;
+    /// Nanoseconds on WASI clock `id`: 0 is the real time since the Unix epoch, anything else
+    /// a monotonic clock from the page's start. An interpreter's own clock (`clock_time_get`).
+    fn clock(&mut self, id: u32) -> u64;
+    /// Random bits for a pack's own randomness (an interpreter's `random_get`).
+    fn random_u64(&mut self) -> u64;
 }
 
 /// Mouse and keyboard details of an event, as the DOM exposes them.
@@ -183,6 +189,7 @@ pub struct TimerInfo {
 
 /// A timer callback that is due, as `take_due_timers` hands it out.
 pub struct DueTimer {
+    pub handle: u32,
     pub callback: usize,
     pub args: Vec<HostValue>,
 }
@@ -208,6 +215,8 @@ pub struct Objects {
     /// Time spent in host calls so far, in microseconds, so time inside the pack can be told
     /// apart from time crossing into the host (the Inspector's profiler).
     pub host_micros: std::cell::Cell<u64>,
+    /// The page's nondeterminism: live, recorded or replayed (`replay.rs`).
+    pub tape: crate::replay::Tape,
 }
 
 impl Default for Objects {
@@ -224,6 +233,7 @@ impl Default for Objects {
             released_callbacks: Vec::new(),
             caller: Default::default(),
             host_micros: Default::default(),
+            tape: Default::default(),
         }
     }
 }
@@ -362,6 +372,7 @@ impl Objects {
         for (_, handle) in due {
             let timer = self.timers.get_mut(&handle).unwrap();
             let fired = DueTimer {
+                handle,
                 callback: timer.callback,
                 args: if timer.frame { vec![HostValue::Num(elapsed_ms)] } else { Vec::new() },
             };
@@ -375,6 +386,27 @@ impl Objects {
             out.push(fired);
         }
         out
+    }
+
+    /// Timers `handles` as if they were due, with the arguments given (a replay's recorded
+    /// batch). None if one of them isn't pending: the replay has diverged.
+    pub fn take_timers(&mut self, fired: &[(u32, Option<f64>)]) -> Option<Vec<DueTimer>> {
+        if !fired.iter().all(|(h, _)| self.timers.contains_key(h)) {
+            return None;
+        }
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (handle, frame) in fired {
+            let timer = self.timers.get_mut(handle)?;
+            out.push(DueTimer { handle: *handle, callback: timer.callback, args: frame.map(|t| vec![HostValue::Num(t)]).unwrap_or_default() });
+            match timer.interval {
+                Some(every) => timer.due = now + every,
+                None => {
+                    self.timers.remove(handle);
+                }
+            }
+        }
+        Some(out)
     }
 
     /// One-shot timer callbacks that have just run and are referenced by nothing else.
@@ -401,6 +433,14 @@ impl PageHost {
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
         let page = doc.borrow().url().to_string();
         Self { pack, page, doc, objects, rng: seed | 1 }
+    }
+
+    /// xorshift64: fast, and good enough for a page's Math.random.
+    fn next_random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
     }
 
     /// The pack name trace entries go under: the page's pack, or whoever it's running for.
@@ -629,11 +669,8 @@ impl PageHost {
                 HostValue::Undefined
             }
             (Obj::Math, "random") => {
-                // xorshift64: fast, and good enough for a page's Math.random.
-                self.rng ^= self.rng << 13;
-                self.rng ^= self.rng >> 7;
-                self.rng ^= self.rng << 17;
-                HostValue::Num((self.rng >> 11) as f64 / (1u64 << 53) as f64)
+                let live = (self.next_random() >> 11) as f64 / (1u64 << 53) as f64;
+                HostValue::Num(f64::from_bits(self.objects.borrow_mut().tape.read(Read::Random, live.to_bits())))
             }
             _ => bail!("{}.{method}() is not supported yet", obj.interface()),
         })
@@ -683,7 +720,21 @@ impl Host for PageHost {
     }
 
     fn now(&mut self) -> f64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+        let live = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
+        f64::from_bits(self.objects.borrow_mut().tape.read(Read::Now, live.to_bits()))
+    }
+
+    fn clock(&mut self, id: u32) -> u64 {
+        let live = match id {
+            0 => SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0),
+            _ => self.objects.borrow().started.elapsed().as_nanos() as u64,
+        };
+        self.objects.borrow_mut().tape.read(Read::Clock, live)
+    }
+
+    fn random_u64(&mut self) -> u64 {
+        let live = self.next_random();
+        self.objects.borrow_mut().tape.read(Read::Bits, live)
     }
 }
 

@@ -49,3 +49,10 @@ const interval = setInterval(() => {
   }
 }, 1);
 requestAnimationFrame(() => add('frame'));
+
+// Nondeterminism, for the replay test: Math.random and the clock, now and from a timer.
+const noise = document.querySelector('#noise');
+noise.addEventListener('click', () => {
+  noise.textContent += ` ${Math.floor(Math.random() * 1e9)}:${Date.now()}`;
+  setTimeout(() => { noise.textContent += ` t${Math.floor(Math.random() * 1e9)}`; }, 1);
+});

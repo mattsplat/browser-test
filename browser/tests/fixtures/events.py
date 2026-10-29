@@ -73,3 +73,20 @@ def tick():
 
 interval = setInterval(tick, 1)
 requestAnimationFrame(lambda t: add('frame'))
+
+
+# Nondeterminism, for the replay test: Math.random and the clock, now and from a timer.
+import time
+noise = document.querySelector('#noise')
+
+
+def later():
+    noise.textContent = noise.textContent + f' t{int(Math.random() * 1e9)}'
+
+
+def on_noise(e):
+    noise.textContent = noise.textContent + f' {int(Math.random() * 1e9)}:{int(time.time() * 1000)}'
+    setTimeout(later, 1)
+
+
+noise.addEventListener('click', on_noise)
