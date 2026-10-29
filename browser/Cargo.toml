@@ -71,3 +71,6 @@ directories = "6.0.0"
 psl = "2"
 url = "2"
 keyboard-types = "0.8"
+
+# Phase E: compiled-code cache keys (already in the dependency tree)
+sha2 = "0.10"

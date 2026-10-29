@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use blitz_dom::{BaseDocument, LocalName, NodeId, QualName, local_name, ns};
@@ -22,7 +21,8 @@ use dioxus_native::prelude::*;
 
 use crate::host::{self, TraceEntry, TraceKind};
 use crate::settings::{self, Grant, Settings};
-use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt};
+use crate::tab::{TabId, TabStoreExt, TabStoreImplExt};
+use crate::tab_manager::TabManager;
 use crate::history::HistoryNav;
 
 /// How often watched files are checked.
@@ -122,18 +122,18 @@ impl PageState {
     }
 }
 
-/// State captured before a hot reload, waiting for that tab's new page.
-static PENDING: Mutex<Vec<(TabId, PageState)>> = Mutex::new(Vec::new());
-
-/// The state to restore on tab `id`'s page that just loaded, if a hot reload saved some.
-pub fn take_pending(id: TabId) -> Option<PageState> {
-    let mut pending = PENDING.lock().unwrap();
-    let at = pending.iter().position(|(t, _)| *t == id)?;
-    Some(pending.remove(at).1)
+/// The state to restore on a page that was just committed: what a hot reload saved, but only
+/// if the page is the one it was saved from. The saved state is taken on every commit, so a
+/// navigation elsewhere (or a slow recompile overtaken by one) drops it rather than passing
+/// it on to another page.
+pub fn restore_for(saved: Option<(Url, PageState)>, committed: &Url) -> Option<PageState> {
+    saved.filter(|(url, _)| url == committed).map(|(_, state)| state)
 }
 
-/// Watch every tab's page and hot reload those whose files change.
-pub fn use_hot_reload(tabs: Store<Vec<Tab>>) {
+/// Watch the pages on screen (the active tab, and its split partner) and hot reload those
+/// whose files change. Tabs out of sight are checked again when they're shown.
+pub fn use_hot_reload(manager: TabManager) {
+    let tabs = manager.tabs;
     use_future(move || async move {
         // Per tab: the URL watched and the newest change seen for it.
         let mut seen: HashMap<TabId, (Url, SystemTime)> = HashMap::new();
@@ -144,7 +144,7 @@ pub fn use_hot_reload(tabs: Store<Vec<Tab>>) {
             for tab in tabs.iter() {
                 let id = tab.tab_id();
                 let url = tab.nav_history().current_url().read().url.clone();
-                if !watching(&current, &url) {
+                if !manager.is_shown(id) || !watching(&current, &url) {
                     continue;
                 }
                 let Some(changed) = url.to_file_path().ok().and_then(|p| newest_change(&p)) else { continue };
@@ -153,9 +153,9 @@ pub fn use_hot_reload(tabs: Store<Vec<Tab>>) {
                     // Same page, and something is newer than last time: reload.
                     Some((watched, at)) if *watched == url && changed > *at => {
                         let page = tab.page().read().clone();
-                        if let Some(doc) = page.and_then(|p| p.doc()) {
-                            PENDING.lock().unwrap().push((id, PageState::capture(&doc.borrow())));
-                        }
+                        // Replaces anything an earlier reload saved for this tab.
+                        let state = page.and_then(|p| p.doc()).map(|doc| (url.clone(), PageState::capture(&doc.borrow())));
+                        *tab.loader_rc().restore.borrow_mut() = state;
                         host::record(TraceEntry { pack: "dev", kind: TraceKind::Load, page: url.to_string(), call: "hot reload".into(), args: url.to_string(), result: "source changed; reloading".into(), micros: 0 });
                         tab.reload();
                     }
@@ -190,6 +190,17 @@ mod tests {
         assert!(!watching(&s, &Url::parse("https://app.test/").unwrap()), "no local files to watch");
     }
 
+    /// Saved state goes back only into the page it came from; any other page gets nothing.
+    #[test]
+    fn saved_state_is_restored_only_on_the_same_page() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let state = PageState { scroll: (0.0, 10.0), fields: vec![("input#a[]".into(), "typed".into())] };
+        let saved = || Some((url("file:///app/index.html"), state.clone()));
+        assert_eq!(restore_for(saved(), &url("file:///app/index.html")), Some(state.clone()));
+        assert_eq!(restore_for(saved(), &url("https://other.test/")), None, "navigated elsewhere meanwhile");
+        assert_eq!(restore_for(None, &url("file:///app/index.html")), None);
+    }
+
     #[test]
     fn a_change_to_a_page_file_or_dart_source_is_seen() {
         let dir = std::env::temp_dir().join(format!("hot-reload-test-{}", std::process::id()));
@@ -211,6 +222,12 @@ mod tests {
         set("lib/main.dart", 300);
         assert_eq!(newest_change(&page), Some(js));
         set("pubspec.yaml", 50);
+        assert_eq!(newest_change(&page), Some(SystemTime::UNIX_EPOCH + Duration::from_secs(300)));
+        // Hidden folders and dependencies aren't walked.
+        for skipped in [".git", "node_modules"] {
+            std::fs::create_dir_all(dir.join(skipped)).unwrap();
+            set(&format!("{skipped}/x.dart"), 800);
+        }
         assert_eq!(newest_change(&page), Some(SystemTime::UNIX_EPOCH + Duration::from_secs(300)));
         let _ = std::fs::remove_dir_all(&dir);
     }

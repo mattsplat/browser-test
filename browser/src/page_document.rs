@@ -89,15 +89,21 @@ pub(crate) fn memory_limits() -> wasmtime::StoreLimits {
     wasmtime::StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build()
 }
 
-/// A key for compiled code: a hash of the Wasm's bytes, wasmtime's version and configuration
-/// (`precompile_compatibility_hash`), and `partition` (empty for code anyone may share).
-pub(crate) fn code_key(wasm: &[u8], partition: &str) -> u64 {
+/// A key for compiled code: a SHA-256 of the Wasm's bytes, wasmtime's version and
+/// configuration (`precompile_compatibility_hash`), and `partition` (empty for code anyone may
+/// share), as hex. A cryptographic hash, so a page can't craft a program that collides with
+/// another's cached code.
+pub(crate) fn code_key(wasm: &[u8], partition: &str) -> String {
+    use sha2::{Digest, Sha256};
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    wasm.hash(&mut hasher);
-    engine().precompile_compatibility_hash().hash(&mut hasher);
-    partition.hash(&mut hasher);
-    hasher.finish()
+    // The compatibility hash is only `Hash`; fold it to bytes first.
+    let mut compat = std::collections::hash_map::DefaultHasher::new();
+    engine().precompile_compatibility_hash().hash(&mut compat);
+    let mut sha = Sha256::new();
+    sha.update(wasm);
+    sha.update(compat.finish().to_le_bytes());
+    sha.update(partition.as_bytes());
+    sha.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Compiled code for `wasm`: loaded from `path` if it's there and loads, otherwise compiled
@@ -282,6 +288,7 @@ impl RunningPack {
 
     /// Let the pack run again after pausing on an exception.
     pub fn resume(&self) {
+        self.objects.borrow_mut().tape.step(|| replay::Step::Resume);
         self.paused.set(false);
         self.doc.borrow().shell_provider.request_redraw();
         // Timers that came due while paused: wake the loop to run them.
@@ -401,6 +408,7 @@ impl RunningPack {
             replay::Step::Eval { source, by } => {
                 let _ = self.eval(source, by);
             }
+            replay::Step::Resume => self.paused.set(false),
         }
         Ok(())
     }
@@ -432,10 +440,6 @@ impl RunningPack {
     /// snapshot of the page, which then pauses. `during` is what was running.
     fn uncaught(&self, during: &str, args: String, e: &anyhow::Error) {
         record_error(self.name, &self.page, during.to_string(), args.clone(), e);
-        // A replay runs to the end: pausing would stop it partway.
-        if self.objects.borrow().tape.replaying() {
-            return;
-        }
         if snapshot_if_pausing(self.name, &self.page, &self.doc, &self.objects, during, args, e) {
             self.paused.set(true);
         }
@@ -475,6 +479,8 @@ pub struct Startup {
     paused: bool,
     /// When the pack started loading, for the profiler's `start` entry.
     started: Instant,
+    /// Time in that spent waiting (fetching imports), which isn't the pack's.
+    waiting: Duration,
 }
 
 impl Startup {
@@ -498,10 +504,16 @@ impl Startup {
         snapshot_if_pausing(self.name, &self.page, &self.doc, &self.objects, during, args, e);
     }
 
+    /// Time spent not running the pack (fetching a module's imports), left out of its start.
+    pub fn not_running(&mut self, waited: Duration) {
+        self.waiting += waited;
+    }
+
     /// The running page, with the pack that started on it.
     pub fn finish(self, runtime: Box<dyn PackRuntime>) -> PackDocument {
-        // Loading the pack and running the page's code, less its host calls.
-        let micros = (self.started.elapsed().as_micros() as u64).saturating_sub(self.objects.borrow().host_micros.get());
+        // Loading the pack and running the page's code, less its host calls and waiting.
+        let running = self.started.elapsed().saturating_sub(self.waiting);
+        let micros = (running.as_micros() as u64).saturating_sub(self.objects.borrow().host_micros.get());
         host::record(TraceEntry { pack: self.name, kind: TraceKind::Pack, page: self.page.clone(), call: "start".into(), args: String::new(), result: String::new(), micros });
         let pack = RunningPack {
             name: self.name,
@@ -568,7 +580,7 @@ impl PackDocument {
             r.pack = name;
         }
         objects.borrow_mut().tape = tape;
-        (host, Startup { name, page, doc, objects, paused: false, started: Instant::now() })
+        (host, Startup { name, page, doc, objects, paused: false, started: Instant::now(), waiting: Duration::ZERO })
     }
 }
 
@@ -611,10 +623,15 @@ fn record_error(pack: &'static str, page: &str, call: String, args: String, e: &
 }
 
 /// With pause on exceptions on, keep a snapshot of the page after an uncaught error and say
-/// it should pause.
+/// it should pause. Whether it pauses is an input like any other (the setting can change at
+/// any time), so it's on the tape: a replay pauses where the recording did, and a recorded
+/// `Resume` step lets it go on.
 fn snapshot_if_pausing(pack: &'static str, page: &str, doc: &RefCell<BaseDocument>, objects: &RefCell<Objects>, during: &str, args: String, e: &anyhow::Error) -> bool {
-    if !debug::pause_on_exceptions() {
-        return false;
+    let live = u64::from(debug::pause_on_exceptions());
+    let pause = objects.borrow_mut().tape.read(replay::Read::Pause, live) != 0;
+    // A replay doesn't keep snapshots again.
+    if !pause || objects.borrow().tape.replaying() {
+        return pause;
     }
     let what = if args.is_empty() { during.to_string() } else { format!("{during} on {args}") };
     let state = objects.borrow().summary();
@@ -1012,12 +1029,15 @@ mod tests {
     /// Record the events scenario on its own URL, plus clicks on `#noise` (random numbers and
     /// the clock, read now and from a timer) and, where the pack can eval, console input.
     async fn record_events_session(pack: &str) -> replay::Recording {
-        let url = format!("https://replay-{pack}.test/");
+        // Its own URL: tests run in parallel, and a recording is armed by URL.
+        static SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let url = format!("https://replay-{pack}-{n}.test/");
+        let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+        let wasm = if pack == "dart" { compile("tests/fixtures/events.dart").await } else { Vec::new() };
         replay::arm(&url);
-        let doc = HtmlDocument::from_html(EVENTS_HTML, DocumentConfig { base_url: Some(url), ..Default::default() }).into_inner();
         let (mut page, program) = match pack {
             "dart" => {
-                let wasm = compile("tests/fixtures/events.dart").await;
                 (crate::dart_pack::start(doc, &wasm).unwrap(), replay::Program::Dart(wasm))
             }
             "python" => {
@@ -1091,6 +1111,36 @@ mod tests {
         let (_, outcome) = replay::replay(&recording, config(), None).await.unwrap();
         assert_eq!(outcome.steps, 0);
         assert!(outcome.diverged.unwrap().contains("isn't in the page"));
+    }
+
+    /// Pause on exceptions while recording: the first click's error pauses the page, so its
+    /// second listener doesn't run; after Resume, with pausing off, both run. A replay pauses
+    /// and resumes at the same points and ends with the same DOM.
+    #[tokio::test]
+    async fn a_pause_on_an_exception_replays_as_recorded() {
+        let url = "https://replay-pause.test/";
+        replay::arm(url);
+        let doc = HtmlDocument::from_html("<button id=b>go</button><p id=out></p>", DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let scripts = vec![Script { name: "pause.js".into(), source: "
+            const b = document.querySelector('#b'), out = document.querySelector('#out');
+            b.addEventListener('click', () => { throw new Error('first listener fails'); });
+            b.addEventListener('click', () => { out.textContent += 'second ran;'; });".into(), module: false }];
+        let mut page = crate::js_pack::start(doc, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+        page.attach_recording("<button id=b>go</button><p id=out></p>", None, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() });
+        debug::set_pause_on_exceptions(true);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        debug::set_pause_on_exceptions(false);
+        assert!(page.pack.is_paused());
+        assert_eq!(output(&page), "");
+        page.pack.resume();
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        assert_eq!(output(&page), "second ran;");
+        let recording = page.pack.stop_recording().unwrap();
+
+        let config = DocumentConfig { base_url: Some(url.into()), ..Default::default() };
+        let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+        assert_eq!(outcome.diverged, None);
+        assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom);
     }
 
     /// JS errors carry their type, message and a stack with function names and locations.

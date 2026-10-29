@@ -51,7 +51,11 @@ where
                 break;
             }
             for url in missing {
-                match fetch(url.clone()).await {
+                // Network time isn't the pack's: keep it out of the profiler's `start`.
+                let fetching = std::time::Instant::now();
+                let fetched = fetch(url.clone()).await;
+                startup.not_running(fetching.elapsed());
+                match fetched {
                     Ok(source) => add_module(&mut runtime, &url, &source)?,
                     Err(e) => {
                         // A failed fetch isn't the page's script failing, so no snapshot.

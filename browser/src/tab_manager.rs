@@ -470,6 +470,11 @@ impl TabManager {
         self.split.set(None);
     }
 
+    /// Whether a split is on screen: the active tab is one of the pair.
+    pub fn split_shown(&self) -> bool {
+        shown_tabs(*self.active_tab_id.read(), *self.split.read()).len() > 1
+    }
+
     /// Whether tab `id` is on screen (the active tab, or its split partner).
     pub fn is_shown(&self, id: TabId) -> bool {
         shown_tabs(*self.active_tab_id.read(), *self.split.read()).contains(&id)

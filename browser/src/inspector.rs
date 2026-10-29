@@ -596,18 +596,15 @@ fn RecordingView(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>, origin: St
     let _ = changes();
 
     let info = debug::tab(tabs, active_tab_id(), None);
-    let url = info.as_ref().map(|t| t.url.to_string()).unwrap_or_default();
     let pack = info.and_then(|t| t.page).and_then(|p| p.pack());
     let recording_steps = pack.as_ref().and_then(|p| p.recorded_steps());
     let recordings = replay::recordings(&origin);
 
-    let record = {
-        let url = url.clone();
-        move |_| {
-            replay::arm(&url);
-            active_tab(tabs, active_tab_id()).reload();
-            status.set("Reloading to record from the start…".into());
-        }
+    let record = move |_| {
+        let tab = active_tab(tabs, active_tab_id());
+        tab.loader_rc().record_next.set(true);
+        tab.reload();
+        status.set("Reloading to record from the start…".into());
     };
     let stop = {
         let pack = pack.clone();

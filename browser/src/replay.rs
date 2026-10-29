@@ -37,6 +37,8 @@ pub enum Read {
     Random,
     Clock,
     Bits,
+    /// Whether an uncaught error paused the page (pause on exceptions).
+    Pause,
 }
 
 /// One input to the page, in the order it arrived.
@@ -49,6 +51,8 @@ pub enum Step {
     Timers(Vec<(u32, Option<f64>)>),
     /// Console or AI input, by whom.
     Eval { source: String, by: &'static str },
+    /// The user resumed the page after it paused on an exception.
+    Resume,
 }
 
 impl Step {
@@ -58,6 +62,7 @@ impl Step {
             Step::Event { kind, target, .. } => format!("{kind} on node {target:?}"),
             Step::Timers(t) => format!("{} timer(s)", t.len()),
             Step::Eval { by, .. } => format!("{by} input"),
+            Step::Resume => "resumed after an exception".into(),
         }
     }
 }
@@ -70,10 +75,24 @@ pub enum Program {
     Scripts { pack: &'static str, scripts: Vec<Script>, imports: Vec<(String, String)> },
 }
 
-/// The most steps and tape values one recording keeps. Past either it stops (at a step
-/// boundary, so what it has still replays).
-const MAX_STEPS: usize = 100_000;
-const MAX_TAPE: usize = 1_000_000;
+/// Roughly the most memory one recording takes, in bytes. Past it the recording stops, at the
+/// start of the step that went over, so what it has still replays.
+const MAX_BYTES: usize = 64 << 20;
+/// What a tape value costs against it.
+const VALUE_BYTES: usize = 16;
+
+impl Step {
+    /// Roughly how much memory the step takes: a step holds as many timers or as long an
+    /// input as the page produced.
+    fn bytes(&self) -> usize {
+        64 + match self {
+            Step::Event { kind, target, .. } => kind.len() + target.len() * 8,
+            Step::Timers(fired) => fired.len() * 16,
+            Step::Eval { source, .. } => source.len(),
+            Step::Resume => 0,
+        }
+    }
+}
 
 /// A recorded session of one page.
 #[derive(Clone, Debug)]
@@ -87,8 +106,12 @@ pub struct Recording {
     pub program: Option<Program>,
     pub steps: Vec<Step>,
     pub tape: Vec<(Read, u64)>,
-    /// Hit a limit; steps after that weren't kept.
+    /// Hit the size limit; steps from the one that went over weren't kept.
     pub full: bool,
+    /// Bytes counted against `MAX_BYTES`.
+    bytes: usize,
+    /// The tape's length when the last step began: its reads come after.
+    step_starts_at: usize,
     /// The page's DOM when recording stopped, to check a replay against.
     pub final_dom: String,
 }
@@ -111,8 +134,12 @@ impl Tape {
         match self {
             Tape::Off => live,
             Tape::Record(r) => {
-                if !r.full && r.tape.len() < MAX_TAPE {
+                if !r.full {
+                    r.bytes += VALUE_BYTES;
                     r.tape.push((kind, live));
+                    if r.bytes > MAX_BYTES {
+                        r.truncate_current_step();
+                    }
                 }
                 live
             }
@@ -129,11 +156,16 @@ impl Tape {
     /// Record an input step, if recording.
     pub fn step(&mut self, step: impl FnOnce() -> Step) {
         if let Tape::Record(r) = self {
-            if r.full || r.steps.len() >= MAX_STEPS || r.tape.len() >= MAX_TAPE {
-                r.full = true;
+            if r.full {
                 return;
             }
-            r.steps.push(step());
+            let step = step();
+            r.bytes += step.bytes();
+            r.steps.push(step);
+            r.step_starts_at = r.tape.len();
+            if r.bytes > MAX_BYTES {
+                r.truncate_current_step();
+            }
         }
     }
 
@@ -149,12 +181,25 @@ impl Tape {
     }
 }
 
+impl Recording {
+    /// Over the size limit: stop, dropping the step under way and its reads, so every step
+    /// kept has all its reads. (Over the limit during start-up, before any step, the
+    /// start's reads go too and a replay reports that it diverged.)
+    fn truncate_current_step(&mut self) {
+        self.full = true;
+        // Reads after `step_starts_at` are the last step's.
+        self.steps.pop();
+        self.tape.truncate(self.step_starts_at);
+    }
+}
+
 // ---- Starting a page with a tape
 
 /// Tapes waiting for a page at a URL to start (`PackDocument::starting` takes them).
 static ARMED: Mutex<Vec<(String, Tape)>> = Mutex::new(Vec::new());
 
-/// Record the next page that starts at `url` (the Recording view arms, then reloads).
+/// Record the next page that starts at `url`. The loader arms it just before starting the
+/// tab's pack, when the tab asked to record (`DocumentLoader::record_next`).
 pub fn arm(url: &str) {
     let recording = Recording {
         id: 0,
@@ -166,16 +211,13 @@ pub fn arm(url: &str) {
         steps: Vec::new(),
         tape: Vec::new(),
         full: false,
+        bytes: 0,
+        step_starts_at: 0,
         final_dom: String::new(),
     };
     let mut armed = ARMED.lock().unwrap();
     armed.retain(|(u, _)| u != url);
     armed.push((url.to_string(), Tape::Record(Box::new(recording))));
-}
-
-/// Whether the next page at `url` will be recorded (the loader then keeps its imports).
-pub fn armed(url: &str) -> bool {
-    ARMED.lock().unwrap().iter().any(|(u, t)| u == url && matches!(t, Tape::Record(_)))
 }
 
 /// The tape for a page starting at `url`: one armed for it, or none.
@@ -311,4 +353,43 @@ pub async fn replay(recording: &Recording, config: DocumentConfig, upto: Option<
     // The tape's own divergence, and back to live.
     let tape_diverged = page.end_replay();
     Ok((page, Outcome { steps: applied, diverged: diverged.or(tape_diverged) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recording(tape: &mut Tape) -> &mut Recording {
+        match tape {
+            Tape::Record(r) => r,
+            _ => panic!("not recording"),
+        }
+    }
+
+    /// Past the size limit the recording stops at the start of the step that went over, so
+    /// every step it keeps has all of its reads; a step's size counts its timers.
+    #[test]
+    fn going_over_the_size_limit_drops_the_step_under_way() {
+        arm("https://size-limit.test/");
+        let mut tape = take_armed("https://size-limit.test/");
+        tape.step(|| Step::Resume);
+        tape.read(Read::Now, 1);
+        recording(&mut tape).bytes = MAX_BYTES - 100;
+        tape.step(|| Step::Timers(vec![(1, None)]));
+        tape.read(Read::Now, 2);
+        tape.read(Read::Now, 3);
+        tape.read(Read::Now, 4);
+        let r = recording(&mut tape);
+        assert!(r.full);
+        assert_eq!(r.steps.len(), 1, "the step under way went");
+        assert_eq!(r.tape, [(Read::Now, 1)], "and its reads");
+        tape.step(|| Step::Resume);
+        assert_eq!(recording(&mut tape).steps.len(), 1, "nothing more once full");
+
+        // One step with very many timers is too big by itself.
+        arm("https://size-limit.test/");
+        let mut tape = take_armed("https://size-limit.test/");
+        tape.step(|| Step::Timers((0..5_000_000).map(|h| (h, None)).collect()));
+        assert!(recording(&mut tape).full && recording(&mut tape).steps.is_empty());
+    }
 }

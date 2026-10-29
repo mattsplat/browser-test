@@ -185,7 +185,7 @@ fn all_items(manager: TabManager, history: &HistoryService, profiles: &[(String,
     let vertical = (manager.vertical)();
     items.push(Item::command(Action::SetVertical(!vertical), if vertical { "Use horizontal tabs" } else { "Use vertical tabs" }, "tab layout"));
     // Split view: the active tab beside another tab on screen in this space.
-    if manager.split.read().is_some_and(|(a, b)| a == active || b == active) {
+    if manager.split_shown() {
         items.push(Item::command(Action::CloseSplit, "Close split view", "split"));
     } else {
         for id in manager.visible_ids().into_iter().filter(|&id| id != active) {

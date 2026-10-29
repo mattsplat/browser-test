@@ -86,9 +86,12 @@ pub(crate) fn newest_source(dir: &Path) -> Option<SystemTime> {
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         let name = entry.file_name();
-        let modified = if path.is_dir() {
-            // Generated folders never hold the user's source.
-            if name == ".dart_tool" || name == "build" { continue }
+        // `file_type` doesn't follow symlinks, so a link can't send the walk elsewhere.
+        let Ok(kind) = entry.file_type() else { continue };
+        let modified = if kind.is_dir() {
+            // Generated and hidden folders (.dart_tool, .git) and dependencies never hold the
+            // user's source.
+            if name.to_string_lossy().starts_with('.') || name == "build" || name == "node_modules" { continue }
             newest_source(&path)
         } else if path.extension().is_some_and(|e| e == "dart") || name == "pubspec.yaml" {
             entry.metadata().and_then(|m| m.modified()).ok()

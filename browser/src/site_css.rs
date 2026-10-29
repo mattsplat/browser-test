@@ -11,8 +11,18 @@ use blitz_dom::{Attribute, BaseDocument, LocalName, NodeId, QualName, local_name
 
 use crate::settings::Settings;
 
-/// Marks the detached `<style>` element that carries the site's CSS.
-const MARK: &str = "data-browser-site-css";
+/// The attribute that marks the detached `<style>` element carrying the site's CSS. Its name
+/// is random per process, so a page can't make an element the browser mistakes for it (and
+/// so receive, or read back, the user's CSS): the carrier is never in the tree, so no page
+/// ever sees the name.
+fn mark() -> &'static str {
+    static MARK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MARK.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let random = std::collections::hash_map::RandomState::new().build_hasher().finish();
+        format!("data-browser-site-css-{random:016x}")
+    })
+}
 
 /// The CSS to apply on `origin`'s pages, if it has some and it's switched on.
 pub fn for_origin<'a>(settings: &'a Settings, origin: &str) -> Option<&'a str> {
@@ -28,7 +38,7 @@ pub fn apply(doc: &mut BaseDocument, css: Option<&str>) {
         (None, None) => return,
         (None, Some(_)) => {
             let mut m = doc.mutate();
-            let attr = Attribute { name: QualName::new(None, ns!(), LocalName::from(MARK)), value: String::new() };
+            let attr = Attribute { name: QualName::new(None, ns!(), LocalName::from(mark())), value: String::new() };
             let style = m.create_element(QualName::new(None, ns!(html), local_name!("style")), vec![attr]);
             let text = m.create_text_node("");
             m.append_children(style, &[text]);
@@ -46,7 +56,7 @@ pub fn apply(doc: &mut BaseDocument, css: Option<&str>) {
 
 /// The detached element holding the site's sheet, if this page has one.
 fn carrier(doc: &BaseDocument) -> Option<NodeId> {
-    doc.stylesheet_owner_nodes().find(|&id| doc.get_node(id).is_some_and(|n| n.parent.is_none() && n.attr(LocalName::from(MARK)).is_some()))
+    doc.stylesheet_owner_nodes().find(|&id| doc.get_node(id).is_some_and(|n| n.parent.is_none() && n.attr(LocalName::from(mark())).is_some()))
 }
 
 #[cfg(test)]
@@ -82,9 +92,25 @@ mod tests {
         assert_eq!(doc.stylesheet_owner_nodes().count(), 2, "replaced, not added again");
         // Not in the tree: queries (all a page's code can use) don't find it.
         assert_eq!(doc.query_selector_all("style").unwrap().len(), 1);
-        assert!(crate::debug::outline(&doc).find(MARK).is_none());
+        assert!(crate::debug::outline(&doc).find(mark()).is_none());
         apply(&mut doc, None);
         assert!(color(&mut doc).contains("255, 0, 0"), "removed");
+    }
+
+    /// A detached `<style>` a page makes with a guess at the marker gets nothing.
+    #[test]
+    fn a_spoofed_carrier_gets_nothing() {
+        let mut doc = page();
+        let mut m = doc.mutate();
+        let guess = Attribute { name: QualName::new(None, ns!(), LocalName::from("data-browser-site-css")), value: String::new() };
+        let spoof = m.create_element(QualName::new(None, ns!(html), local_name!("style")), vec![guess]);
+        let text = m.create_text_node("p { color: rgb(1, 2, 3); }");
+        m.append_children(spoof, &[text]);
+        drop(m);
+        doc.upsert_stylesheet_for_node(spoof);
+        apply(&mut doc, Some("p { color: rgb(0, 0, 255); }"));
+        assert_eq!(doc.get_node(spoof).unwrap().text_content(), "p { color: rgb(1, 2, 3); }", "the user's CSS didn't reach it");
+        assert!(color(&mut doc).contains("0, 0, 255"), "the real sheet still applies");
     }
 
     #[test]

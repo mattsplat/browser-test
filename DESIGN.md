@@ -853,8 +853,10 @@ are generalisations:
 - **Isolation:** keyed by origin, so it never reaches another site. The element isn't in the
   tree, so page code (which can only search the tree) can't find, read or remove it, the
   Inspector's tree and the AI outline don't show it, and the browser UI is a separate
-  document it never touches. Any `url()` or `@import` in it is fetched through the page's
-  gate, under the page's third-party rules.
+  document it never touches. The browser finds the carrier by an attribute whose name is
+  random per process (`site_css::mark`), so a page can't plant a lookalike element to
+  receive or read back the user's CSS (tested). Any `url()` or `@import` in it is fetched
+  through the page's gate, under the page's third-party rules.
 - **Limitations:**
   - All `file://` pages share one origin, so they share one sheet (as they share grants).
   - A `<style>` a page script creates later comes after the user sheet, and so does a
@@ -862,7 +864,7 @@ are generalisations:
     guaranteed against late page styles; `!important` still wins.
   - No preview while typing: it applies on "Apply".
 
-**Split View** (`tab_manager.rs`: `split`, `shown_tabs`; `tab.rs`; palette).
+**Split View** (`tab_manager.rs`: `split`, `shown_tabs`, `split_shown`; `tab.rs`; palette).
 - Palette → "Split with tab: <title>" puts another tab of the current space beside the
   active one; "Close split view" ends it. The two are a pair of real tabs, each with its own
   document, gate view and pack, as before; nothing about loading changed.
@@ -880,8 +882,10 @@ are generalisations:
   (`watching`, tested). Anything else is never watched. Every 500 ms the browser polls the
   modification times of the page's folder (not subfolders) for `.html .js .mjs .py .dart
   .css .wasm` files, plus the whole tree when the folder is a Dart project (has a
-  `pubspec.yaml`; the same walk `dev_compile` uses to decide a recompile). No watcher crate:
-  polling is a few `stat`s per granted tab and needs no new dependency.
+  `pubspec.yaml`; the same walk `dev_compile` uses to decide a recompile, which skips hidden
+  folders, `build` and `node_modules` and doesn't follow symlinks). Only the tabs on screen
+  (the active one and its split partner) are polled; one out of sight is checked when it's
+  shown again. No watcher crate: polling is a few `stat`s and needs no new dependency.
 - **What happens:** a newer file reloads the tab (traced as `hot reload` under pack "dev").
   Dart source recompiles because `dev_compile`'s cache is now stale; JS and Python refetch.
   Per the correction, there's no hot module replacement for any pack: it's a restart with
@@ -891,6 +895,11 @@ are generalisations:
   are never captured. The URL and its hash are kept because it's a reload of the same URL.
   Restoration happens when the new page is committed, after its scripts ran, as a
   browser's form restoration would.
+- **Only into the page it came from:** the saved state lives on the tab's loader
+  (`DocumentLoader::restore`) with the URL it was taken from. A later save replaces it, the
+  tab's next commit takes it, and it's restored only if that commit is the same URL
+  (`restore_for`, tested). Navigating elsewhere during a slow recompile drops it, so one
+  site's form values can't land in another's page.
 - **Limitations:** http(s) pages aren't watched, even with a grant (there are no local files
   to poll; a Herd site would need a dev-server signal). Scripts outside the page's folder
   aren't watched. A compile error page keeps being watched (it's the same URL), so fixing
@@ -906,7 +915,8 @@ are generalisations:
   twice a second like the other views. WasmGC objects with field names (the original
   "heap inspector" idea) aren't shown: dart2wasm ships no name section to read them with.
 - **Profiler:** each call into a pack (a listener, a timer or animation frame, and the
-  pack's `start`: loading plus the page's scripts) is now traced as a `TraceKind::Pack`
+  pack's `start`: loading plus the page's scripts, less time spent fetching JS module
+  imports) is now traced as a `TraceKind::Pack`
   entry whose `micros` is the time **inside the pack**: the elapsed time less the host time
   it caused, which `PageHost::traced` adds up in `Objects::host_micros`. Host operations
   keep their own entries. `debug::profile` (tested) groups both by label, slowest first,
@@ -925,8 +935,10 @@ are generalisations:
   logic moved into `page_document.rs` (where the engine is) so Dart can use it; behaviour
   for the interpreters is unchanged.
 - **New: Dart page programs** are cached too (`dart_pack::compiled`), as
-  `<profile>/compiled-dart/<key>.cwasm`, key = wasm bytes + compatibility hash + the page's
-  origin. Reloads (including hot reload), other tabs and later runs of the same site skip
+  `<profile>/compiled-dart/<key>.cwasm`, key = SHA-256 of the wasm bytes, the compatibility
+  hash and the page's origin (`sha2` was already in the dependency tree; a cryptographic
+  hash means a page can't craft bytes that collide with another program's entry). The
+  interpreters' cache files use the same key, so they recompiled once after this change. Reloads (including hot reload), other tabs and later runs of the same site skip
   Cranelift. At most 32 are kept per profile, newest first.
 - **Decided: Dart's cache is partitioned by site and profile; the interpreters' isn't.** Every
   browser has the same interpreters, so a hit on them reveals nothing. A Dart program is
@@ -946,7 +958,10 @@ are generalisations:
     of child indexes, mouse and key details), timer batches (which timer handles fired,
     with an animation frame's timestamp), and console or AI eval input;
   - **the tape**: every nondeterministic value the pack read, in order: `Date.now()`,
-    `Math.random`, and the interpreters' WASI clock and random bytes;
+    `Math.random`, and the interpreters' WASI clock and random bytes; plus whether each
+    uncaught error paused the page (pause on exceptions is a setting that can change at
+    any time), with "Resume" recorded as a step, so a replay pauses and resumes where the
+    recording did (`a_pause_on_an_exception_replays_as_recorded`);
   - **the start**: the page's HTML, its site CSS, and its program (Dart's wasm, or the
     interpreter's scripts plus every JS module import fetched).
 - **The fix this needed (principle 4):** the interpreters' WASI `clock_time_get` and
@@ -970,8 +985,11 @@ are generalisations:
   Python) in Dart, JS and Python, replays each in a fresh pack and compares the whole DOM;
   replaying to step 1 stops there. `replay_without_the_tape_differs_and_divergence_is_reported`
   shows the tape is what makes it match, and that a bad step is reported.
-- **UI:** Inspector → Recording. "Record" arms the tab's URL and reloads (a page's earlier
-  state can't be replayed, so a recording starts with a load); "Stop" keeps it. For a
+- **UI:** Inspector → Recording. "Record" sets the tab's `DocumentLoader::record_next` and
+  reloads (a page's earlier state can't be replayed, so a recording starts with a load).
+  The flag is taken by the tab's next load whatever URL it ends at; the loader arms the
+  recording just before the pack starts, and clears it after, so a recording never waits
+  around for a later visit; "Stop" keeps it. For a
   recording: ⏮ ◀ ▶ ⏭ (or click a step) pick step N, "Replay to step N in this tab" swaps a
   fresh replayed page into the tab (scrubbing back replays from the start), "Verify"
   replays all of it off screen and compares the DOM with the one at "Stop", "Forget"
@@ -982,10 +1000,11 @@ are generalisations:
   - Blitz's own default actions aren't replayed (typing into a field, toggling a checkbox,
     following a link): only what reached the pack. Pages can't read field values yet, so
     this doesn't change what a pack sees today; it will once `value` is supported.
-  - Leaving or reloading the page without "Stop" loses the recording. A page whose URL
-    redirects isn't recorded (it's armed by URL).
-  - At most 100,000 steps and 1,000,000 tape values; past that the recording stops at a step
-    boundary and says so.
+  - Leaving or reloading the page without "Stop" loses the recording.
+  - A recording is limited by size (about 64 MB, counting each step's timers, input text
+    and path, and each tape value). Going over, it stops and drops the step under way with
+    its reads, so every step it keeps replays (tested). Going over during start-up keeps
+    nothing replayable, and a replay says it diverged.
   - No saving or sharing recordings as bug reports yet: they'd need a file format and the
     same redaction review as AI views.
   - "Reload by replay" for hot reload (replaying a session into recompiled code) isn't

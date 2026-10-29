@@ -168,8 +168,10 @@ fn commit_loaded_document<Lens>(
     *tab.html_source().write_unchecked() = loaded.html_source;
     *tab.title().write_unchecked() = loaded.title;
     *tab.favicon_url().write_unchecked() = None;
-    // A hot reload saved the page's scroll and form values for its new page.
-    if let Some(state) = crate::hot_reload::take_pending(tab.tab_id()) {
+    // A hot reload saved the page's scroll and form values for its new page. Taken on every
+    // commit, and restored only into the page it was saved from.
+    let saved = tab.loader_rc().restore.borrow_mut().take();
+    if let Some(state) = crate::hot_reload::restore_for(saved, &page_url) {
         if let Some(doc) = loaded.page.as_ref().and_then(|p| p.doc()) {
             state.restore(&mut doc.borrow_mut());
         }
@@ -253,8 +255,8 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     let mut node_handle_lens = tab.node_handle();
     // Split view shows the active tab's partner too; the active side is marked.
     let manager = try_use_context::<crate::tab_manager::TabManager>();
-    let split = manager.is_some_and(|m| m.split.read().is_some_and(|(a, b)| a == active_tab_id() || b == active_tab_id()));
-    let shown = id == active_tab_id() || (split && manager.is_some_and(|m| m.is_shown(id)));
+    let split = manager.is_some_and(|m| m.split_shown());
+    let shown = manager.map_or(id == active_tab_id(), |m| m.is_shown(id));
     let visibility = if shown { "display: block" } else { "display: none" };
     let class = match (split, id == active_tab_id()) {
         (false, _) => "tab-content",

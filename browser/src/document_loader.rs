@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +56,12 @@ pub struct DocumentLoader {
     pub history: SyncStore<History>,
     pub reload_generation: Signal<u64>,
     current_abort: Mutex<Option<AbortController>>,
+    /// Record this tab's next page (Inspector → Recording). Taken by the next load, whether or
+    /// not it runs a pack, so it never records a later visit.
+    pub record_next: Cell<bool>,
+    /// Scroll and form values a hot reload saved, with the URL they belong to; taken by the
+    /// tab's next commit (`hot_reload::restore_for`).
+    pub restore: RefCell<Option<(Url, crate::hot_reload::PageState)>>,
 }
 
 pub fn make_doc_config(
@@ -96,6 +102,8 @@ impl DocumentLoader {
             history,
             reload_generation: Signal::new(0),
             current_abort: Mutex::new(None),
+            record_next: Cell::new(false),
+            restore: RefCell::new(None),
         }
     }
 
@@ -154,8 +162,13 @@ impl DocumentLoader {
                     (&*body_text, false)
                 };
 
+                let record = self.record_next.replace(false);
                 let ((document, page), parsed_title, favicon_url) =
-                    build_page_document(html, config, &net_provider, &signal).await;
+                    build_page_document(html, config, &net_provider, &signal, record).await;
+                // Armed only for this load: drop it if no pack started to take it.
+                if let (true, Ok(url)) = (record, Url::parse(&base_url)) {
+                    replay::take_armed(url.as_str());
+                }
                 let favicon_candidate =
                     favicon_candidate(base_url.as_str(), favicon_url.as_deref());
                 LoadedDocument {
@@ -215,14 +228,20 @@ async fn build_page_document(
     config: DocumentConfig,
     net_provider: &Arc<StdNetProvider>,
     signal: &AbortSignal,
+    recording: bool,
 ) -> ((SubDocumentAttr, Option<PageRef>), String, Option<String>) {
     let mut document = HtmlDocument::from_html(html, config).into_inner();
     // The site's own stylesheet, if the user gave it one: after the page's, before any script.
     let origin = settings::origin_of(document.url());
     let site_css = crate::site_css::for_origin(&settings::get(), &origin).map(str::to_string);
     crate::site_css::apply(&mut document, site_css.as_deref());
-    // Being recorded (Inspector → Recording): keep what the pack loads, to replay it.
-    let recording = replay::armed(document.url().as_str());
+    // Being recorded (Inspector → Recording): armed just before the pack starts (which takes
+    // it), and then given what the pack loaded, to replay it.
+    let arm = |url: &Url| {
+        if recording {
+            replay::arm(url.as_str());
+        }
+    };
     let record = |page: &PackDocument, program: replay::Program| {
         if recording {
             page.attach_recording(html, site_css.as_deref(), program);
@@ -245,6 +264,7 @@ async fn build_page_document(
                 return (shown(document), title, favicon_url);
             }
             let sources = fetch_sources("python", &scripts, &page_url, net_provider, signal).await;
+            arm(&page_url);
             return match python_pack::start(document, &sources) {
                 Ok(python) => {
                     record(&python, replay::Program::Scripts { pack: "python", scripts: sources, imports: Vec::new() });
@@ -286,6 +306,7 @@ async fn build_page_document(
                 Ok(source)
             }
         };
+        arm(&page_url);
         return match js_pack::start(document, &sources, fetch_import).await {
             Ok(js) => {
                 record(&js, replay::Program::Scripts { pack: "js", scripts: sources, imports: imports.take() });
@@ -318,6 +339,7 @@ async fn build_page_document(
             }
         }
     };
+    arm(&page_url);
     match dart_pack::start(document, &wasm) {
         Ok(dart) => {
             record(&dart, replay::Program::Dart(wasm));

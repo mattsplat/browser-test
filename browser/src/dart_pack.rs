@@ -291,7 +291,7 @@ const KEEP_COMPILED: usize = 32;
 /// (tests), nothing is saved.
 fn compiled(wasm: &[u8], origin: &str, profile: Option<&std::path::Path>) -> Result<Module> {
     let dir = profile.map(|p| p.join("compiled-dart"));
-    let path = dir.as_ref().map(|d| d.join(format!("{:016x}.cwasm", crate::page_document::code_key(wasm, origin))));
+    let path = dir.as_ref().map(|d| d.join(format!("{}.cwasm", crate::page_document::code_key(wasm, origin))));
     let (module, fresh) = crate::page_document::load_or_compile(wasm, path.as_deref(), "Dart program")?;
     if let (true, Some(dir)) = (fresh, &dir) {
         prune_compiled(dir, KEEP_COMPILED);

@@ -187,7 +187,7 @@ fn app() -> Element {
         TabManager::restore(net_provider.clone(), cli_initial_url.clone(), home_url.clone())
     });
     tab_manager::use_tab_upkeep(manager);
-    hot_reload::use_hot_reload(manager.tabs);
+    hot_reload::use_hot_reload(manager);
     let tabs: Store<Vec<Tab>> = manager.tabs;
     let active_tab_id: Signal<TabId> = manager.active_tab_id;
 
