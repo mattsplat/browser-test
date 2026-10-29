@@ -193,6 +193,8 @@ pub enum Obj {
     Location,
     History,
     Navigator,
+    /// `performance`: the page's clock (`now`, `timeOrigin`).
+    Performance,
     /// `querySelectorAll`, `children`, `childNodes`: a snapshot of nodes (not live).
     NodeList(Rc<Vec<NodeId>>),
     /// An element's `classList`, `style` and `dataset`: views of its attributes, one each per
@@ -307,6 +309,7 @@ impl Obj {
             Obj::Location => "Location",
             Obj::History => "History",
             Obj::Navigator => "Navigator",
+            Obj::Performance => "Performance",
             Obj::NodeList(_) => "NodeList",
             Obj::ClassList(_) => "DOMTokenList",
             Obj::Style(_) => "CSSStyleDeclaration",
@@ -1629,6 +1632,10 @@ impl PageHost {
             (Obj::Window, "navigator") => self.objects.borrow_mut().singleton("navigator", Obj::Navigator),
             (Obj::Navigator, "userAgent") => HostValue::str(blitz_net::USER_AGENT),
             (Obj::Navigator, "language") => HostValue::str(LANGUAGE),
+            (Obj::Window, "performance") => self.objects.borrow_mut().singleton("performance", Obj::Performance),
+            // When the page started, as Date.now() would have said then. Both clocks come
+            // through the tape, so a replay reads the same value.
+            (Obj::Performance, "timeOrigin") => HostValue::Num(self.now() - self.clock(1) as f64 / 1e6),
             (Obj::Window, "history") => self.objects.borrow_mut().singleton("history", Obj::History),
             (Obj::Location, _) => {
                 let url = self.doc.borrow().url().clone();
@@ -2795,6 +2802,8 @@ impl PageHost {
                     (_, false) => HostValue::str(&values.join(", ")),
                 }
             }
+            // Milliseconds since the page started, monotonic, from the tape like every clock.
+            (Obj::Performance, "now") => HostValue::Num(self.clock(1) as f64 / 1e6),
             (Obj::Math, "random") => {
                 let live = (self.next_random() >> 11) as f64 / (1u64 << 53) as f64;
                 HostValue::Num(f64::from_bits(self.objects.borrow_mut().tape.read(Read::Random, live.to_bits())))

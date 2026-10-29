@@ -138,6 +138,7 @@ $document = __request(['op' => 'global', 'name' => 'document']);
 $console = __request(['op' => 'global', 'name' => 'console']);
 $location = $window->location;
 $navigator = $window->navigator;
+$performance = $window->performance;
 $history = $window->history;
 $localStorage = $window->localStorage;
 $sessionStorage = $window->sessionStorage;

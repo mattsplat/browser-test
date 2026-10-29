@@ -44,6 +44,6 @@ mkdir -p target
 (cd src && xxd -i prelude.php) > .build/prelude.h
 INC="-I$SRC -I$SRC/main -I$SRC/Zend -I$SRC/TSRM -I$SRC/sapi/embed -I$here/.build"
 # PHP recurses deeply (the compiler, nested calls): 8 MiB of Wasm stack.
-$CC $CFLAGS -D_GNU_SOURCE $INC -mexec-model=reactor -Wl,-z,stack-size=8388608 \
+$CC $CFLAGS -D_GNU_SOURCE -DHOST_API="$(cat ../HOST_API)" $INC -mexec-model=reactor -Wl,-z,stack-size=8388608 \
   src/pack.c shim/posix_stubs.c "$SRC/.libs/libphp.a" $LDFLAGS -lm -o target/php_pack.wasm
 echo "built target/php_pack.wasm ($(du -h target/php_pack.wasm | cut -f1))"

@@ -2929,6 +2929,27 @@ setInterval(tick, 1)
     /// PHP reaches the DOM through the host: properties, methods, a closure as a listener (the
     /// page's globals are superglobals, so it needs no `use`), echo to the console, and one
     /// global scope across scripts.
+    /// `performance` is the page's clock in every interpreter: `now()` counts milliseconds from
+    /// the page's start and never goes back, and `timeOrigin` is the wall time it started.
+    #[test]
+    fn performance_clock_in_every_interpreter() {
+        let html = "<p id=out></p>";
+        let pages = [
+            ("js", js_page(html, &["document.querySelector('#out').textContent = [performance.now(), performance.now(), performance.timeOrigin].join(' ')"])),
+            ("python", python_page(html, &["document.querySelector('#out').textContent = ' '.join(str(x) for x in [performance.now(), performance.now(), performance.timeOrigin])"])),
+            ("php", php_page(html, &["$document->querySelector('#out')->textContent = implode(' ', [$performance->now(), $performance->now(), $performance->timeOrigin]);"])),
+        ];
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
+        for (name, page) in pages {
+            let out = text_of(&page.pack.doc.borrow(), "#out");
+            let errors: Vec<String> = host::trace().into_iter().filter(|e| e.pack == name && e.kind == TraceKind::Error).map(|e| e.result).collect();
+            let values: Vec<f64> = out.split(' ').map(|v| v.parse().unwrap_or_else(|_| panic!("{name}: {out:?} {errors:?}"))).collect();
+            let [first, second, origin] = values[..] else { panic!("{name}: {out}") };
+            assert!(0.0 <= first && first <= second && second < 5_000.0, "{name}: {out}");
+            assert!((wall - origin).abs() < 60_000.0, "{name}: {out}");
+        }
+    }
+
     #[test]
     fn php_runs_and_handles_clicks() {
         let page = php_page("<button id=increment>+</button><p id=count>0</p><ul id=log></ul><p id=status></p>", &[

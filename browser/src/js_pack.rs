@@ -102,3 +102,4 @@ fn run_module(js: &mut Interpreter, url: &str) -> Result<()> {
     let status = js.call::<(u32, u32), u64>("run_module", (u, ul))?;
     js.check(status)
 }
+

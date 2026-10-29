@@ -101,7 +101,7 @@ the editor instead of at runtime.
 | `window` | see [Window](#window-location-history-navigator) |
 | `document` | see [Document](#document) |
 | `console` | `log`, `info`, `warn`, `error`, `debug` |
-| `location`, `history`, `navigator` | also on `window` |
+| `location`, `history`, `navigator`, `performance` | also on `window` |
 | `localStorage`, `sessionStorage` | also on `window` |
 | `indexedDB` | JS and Python; PHP uses `$window->indexedDB` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `requestAnimationFrame` | extra `setTimeout`/`setInterval` arguments are passed to the callback |
@@ -261,10 +261,11 @@ IndexedDB has no indexes, cursors, key ranges or rollback.
 
 | Object | Members |
 |---|---|
-| `window` | `innerWidth`, `innerHeight`, `devicePixelRatio`, `scrollX`/`pageXOffset`, `scrollY`/`pageYOffset`, `scrollTo(x, y)`, `scroll`, `scrollBy(dx, dy)`, plus the globals above |
+| `window` | `performance`, `innerWidth`, `innerHeight`, `devicePixelRatio`, `scrollX`/`pageXOffset`, `scrollY`/`pageYOffset`, `scrollTo(x, y)`, `scroll`, `scrollBy(dx, dy)`, plus the globals above |
 | `location` | `href`, `protocol`, `host`, `hostname`, `port`, `pathname`, `search`, `hash`, `origin`, `toString()`; setting `href` or `hash` navigates; `assign(url)`, `replace(url)`, `reload()` |
 | `history` | `length`, `state`, `pushState(state, '', url)`, `replaceState(...)`, `back()`, `forward()`, `go(n)`; `pushState` URLs must stay on the page's origin |
 | `navigator` | `userAgent`, `language` |
+| `performance` | `now()` (milliseconds since the page started, never goes back), `timeOrigin` (the wall time it started); recorded for replay. No `mark`/`measure` or timing entries |
 
 ## Canvas 2D
 
@@ -310,7 +311,7 @@ Each of these errors with "... is not supported yet":
   - setting `outerHTML`.
 - **APIs:**
   - `URL`, `URLSearchParams`, `FormData`, `Blob`, `FileReader`;
-  - `crypto`, `performance`;
+  - `crypto`, and `performance` beyond `now()` and `timeOrigin`;
   - `MutationObserver`, `IntersectionObserver`, `ResizeObserver`;
   - `matchMedia`, `getComputedStyle`;
   - `alert`, `confirm`, `prompt`;

@@ -240,6 +240,11 @@ class Navigator:
     userAgent: str
     language: str
 
+class Performance:
+    timeOrigin: float
+    def now(self) -> float:
+        """Milliseconds since the page started; never goes back."""
+
 class Console:
     def log(self, *args: object) -> None: ...
     def info(self, *args: object) -> None: ...
@@ -336,6 +341,7 @@ class Window(EventTarget):
     location: Location
     history: History
     navigator: Navigator
+    performance: Performance
     localStorage: Storage
     sessionStorage: Storage
     indexedDB: IDBFactory
@@ -363,6 +369,7 @@ console: Console
 Math: _Math
 location: Location
 navigator: Navigator
+performance: Performance
 history: History
 localStorage: Storage
 sessionStorage: Storage

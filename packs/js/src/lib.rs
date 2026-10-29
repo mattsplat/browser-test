@@ -82,6 +82,12 @@ fn rejection(value: JsValue) -> String {
     format!("Uncaught {}", JsError::from_opaque(value))
 }
 
+/// The host API this pack was built for (packs/HOST_API); the browser refuses a mismatch.
+#[unsafe(no_mangle)]
+pub extern "C" fn js_host_api() -> u32 {
+    include_str!("../../HOST_API").trim().parse().unwrap_or(0)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn js_alloc(len: u32) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len as usize);

@@ -30,6 +30,10 @@ extern uint64_t host_request(const char *json, uint32_t len);
 
 #define EXPORT(name) __attribute__((export_name(#name)))
 
+/* The host API this pack was built for (packs/HOST_API, passed in by build.sh); the browser
+ * refuses a mismatch. */
+EXPORT(php_host_api) uint32_t php_host_api(void) { return HOST_API; }
+
 EXPORT(php_alloc) void *php_alloc(uint32_t len) { return malloc(len ? len : 1); }
 EXPORT(php_free) void php_free(void *ptr, uint32_t len) { (void)len; free(ptr); }
 
@@ -126,7 +130,7 @@ static bool started;
 static zend_string *prelude_error;
 
 /* Page globals, reachable from any function or closure without `global` or `use`. */
-static const char *const SUPERGLOBALS[] = {"document", "window", "console", "localStorage", "sessionStorage", "location", "history", "navigator"};
+static const char *const SUPERGLOBALS[] = {"document", "window", "console", "localStorage", "sessionStorage", "location", "history", "navigator", "performance"};
 
 static void start(void) {
 	if (started) {

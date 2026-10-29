@@ -40,6 +40,12 @@ thread_local! {
 /// Frames in the prelude are the bridge, not the page's code, so tracebacks leave them out.
 const PRELUDE_NAME: &str = "<prelude>";
 
+/// The host API this pack was built for (packs/HOST_API); the browser refuses a mismatch.
+#[unsafe(no_mangle)]
+pub extern "C" fn py_host_api() -> u32 {
+    include_str!("../../HOST_API").trim().parse().unwrap_or(0)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn py_alloc(len: u32) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len as usize);

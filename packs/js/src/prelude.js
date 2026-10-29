@@ -16,7 +16,7 @@
     'setAttribute', 'getAttribute', 'removeAttribute', 'addEventListener', 'removeEventListener',
     'preventDefault', 'stopPropagation', 'stopImmediatePropagation',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'debug', 'random',
+    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'debug', 'random', 'now',
     'fetch', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
     'scrollTo', 'scroll', 'scrollBy',
@@ -161,6 +161,7 @@
   globalThis.fetch = (input, init) => window.fetch(String(input), init);
   globalThis.location = window.location;
   globalThis.navigator = window.navigator;
+  globalThis.performance = window.performance;
   // The window's size and scroll, read from the host each time.
   for (const name of ['innerWidth', 'innerHeight', 'devicePixelRatio', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset']) {
     Object.defineProperty(globalThis, name, { get: () => window[name], configurable: true });

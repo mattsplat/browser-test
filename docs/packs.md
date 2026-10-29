@@ -51,6 +51,11 @@ Ok(startup.finish(Box::new(runtime)))
 
 ## Initialisation and loading
 
+- **Host API version** (`packs/HOST_API`). Each interpreter pack exports
+  `<prefix>_host_api`, the number it was built with; the browser refuses a pack whose number
+  differs from its own and says which side to rebuild (`interpreter.rs`, `check_host_api`).
+  Bump the number when a prelude starts relying on something new in `host.rs` (as `performance`
+  did, for 2), then rebuild the browser and every pack.
 - **Choosing a pack** (`document_loader.rs`, `build_page_document`). A page runs one pack:
   the first of Dart (`<script type="application/dart" src="app.wasm">`), Python
   (`<script type="text/python">`, inline or `src`), PHP (`<script type="text/php">`), JS (a plain `<script>` or

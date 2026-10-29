@@ -99,6 +99,31 @@ fn remove_stale_caches(lang: &Language, current: &std::path::Path) {
     }
 }
 
+/// The host API this browser offers. Packs build in the same number (`<prefix>_host_api`); bump
+/// `packs/HOST_API` when a pack's prelude starts relying on something new in host.rs.
+fn host_api() -> u32 {
+    include_str!("../../packs/HOST_API").trim().parse().unwrap_or(0)
+}
+
+/// A pack built for another host API fails in confusing ways (its prelude asks for something
+/// this browser lacks, or the other way round), so it isn't run: say which side to rebuild.
+fn check_host_api(lang: &Language, built_for: Option<u32>) -> Result<()> {
+    let ours = host_api();
+    match built_for {
+        Some(v) if v == ours => Ok(()),
+        Some(v) if v > ours => bail!(
+            "the {} pack was built for host API {v}, newer than this browser's ({ours}): rebuild the browser (cd browser && cargo build --release)",
+            lang.label
+        ),
+        theirs => bail!(
+            "the {} pack was built for host API {}, older than this browser's ({ours}): rebuild it ({})",
+            lang.label,
+            theirs.map_or("1 or earlier".to_string(), |v| v.to_string()),
+            lang.build
+        ),
+    }
+}
+
 impl Interpreter {
     pub fn load(lang: &'static Language, host: Box<dyn Host>) -> Result<Self> {
         let module = module(lang)?;
@@ -109,6 +134,8 @@ impl Interpreter {
         linker.func_wrap("host", "request", host_request)?;
         add_wasi(&mut linker)?;
         let instance = linker.instantiate(&mut store, module)?;
+        let built_for = instance.get_typed_func::<(), u32>(&mut store, &format!("{}_host_api", lang.prefix)).ok().map(|f| f.call(&mut store, ())).transpose()?;
+        check_host_api(lang, built_for)?;
         // A wasip1 library ("reactor") initialises itself here.
         if let Ok(init) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
             init.call(&mut store, ())?;
@@ -436,4 +463,22 @@ fn add_wasi(linker: &mut Linker<State>) -> Result<()> {
     linker.func_wrap(WASI, "sched_yield", || -> i32 { 0 })?;
     linker.func_wrap(WASI, "proc_exit", |code: u32| -> wasmtime::Result<()> { Err(wasmtime::Error::msg(format!("the pack exited with code {code}"))) })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pack built for another host API isn't run, and the error says which side to rebuild.
+    #[test]
+    fn packs_must_match_the_host_api() {
+        let php = &crate::php_pack::PHP;
+        assert!(check_host_api(php, Some(host_api())).is_ok());
+        let old = check_host_api(php, Some(host_api() - 1)).unwrap_err().to_string();
+        assert!(old.contains("older") && old.contains("packs/php/build.sh"), "{old}");
+        let unversioned = check_host_api(php, None).unwrap_err().to_string();
+        assert!(unversioned.contains("1 or earlier"), "{unversioned}");
+        let new = check_host_api(php, Some(host_api() + 1)).unwrap_err().to_string();
+        assert!(new.contains("newer") && new.contains("cargo build"), "{new}");
+    }
 }

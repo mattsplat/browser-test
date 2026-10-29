@@ -11,7 +11,7 @@
 //   /** @var Console $console */
 //
 // The globals are $window, $document, $console, $location, $history, $navigator,
-// $localStorage and $sessionStorage. The functions (setTimeout, fetch, ...) are in the prelude.
+// $performance, $localStorage and $sessionStorage. The functions (setTimeout, fetch, ...) are in the prelude.
 
 /** A host promise: `then` calls one callback later. */
 class Promise {
@@ -281,6 +281,12 @@ class Navigator {
     public string $language;
 }
 
+class Performance {
+    public float $timeOrigin;
+    /** Milliseconds since the page started; never goes back. */
+    public function now(): float {}
+}
+
 class Console {
     public function log(mixed ...$args): void {}
     public function info(mixed ...$args): void {}
@@ -385,6 +391,7 @@ class Window extends EventTarget {
     public Location $location;
     public History $history;
     public Navigator $navigator;
+    public Performance $performance;
     public Storage $localStorage;
     public Storage $sessionStorage;
     public IDBFactory $indexedDB;

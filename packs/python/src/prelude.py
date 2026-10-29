@@ -13,7 +13,7 @@ METHODS = {
     'setAttribute', 'getAttribute', 'removeAttribute', 'addEventListener', 'removeEventListener',
     'preventDefault', 'stopPropagation', 'stopImmediatePropagation',
     'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'debug', 'random',
+    'requestAnimationFrame', 'cancelAnimationFrame', 'log', 'info', 'warn', 'debug', 'random', 'now',
     'fetch', 'then', 'text', 'json', 'get', 'has',
     'pushState', 'replaceState', 'back', 'forward', 'go', 'assign', 'replace', 'reload',
     'scrollTo', 'scroll', 'scrollBy',
@@ -217,6 +217,7 @@ console = Console(request({'op': 'global', 'name': 'console'})._handle)
 Math = request({'op': 'global', 'name': 'Math'})
 location = window.location
 navigator = window.navigator
+performance = window.performance
 history = window.history
 localStorage = window.localStorage
 sessionStorage = window.sessionStorage
@@ -290,7 +291,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'WebSocket', 'indexedDB', 'XMLHttpRequest'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'performance', 'WebSocket', 'indexedDB', 'XMLHttpRequest'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}
