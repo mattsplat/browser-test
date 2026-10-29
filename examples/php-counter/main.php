@@ -1,4 +1,9 @@
 <?php
+// The page's globals come from the browser. For editor completion, open the repo root: IDEs
+// index typings/browser.stub.php, and these lines name the globals' types.
+/** @var Document $document */
+/** @var Console $console */
+
 $document->querySelector('#status')->textContent = 'PHP ' . PHP_VERSION . ' is running, as a pack in WebAssembly.';
 $clicks = 0;
 

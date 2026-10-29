@@ -16,28 +16,13 @@
   <h1>Python counter</h1>
   <p>The same counter as the Dart and JS examples, in Python. Python is a language pack like
   Dart: it runs by default and can be blocked for a site in the Site panel. The page ships
-  source; the browser runs it with RustPython, compiled to WebAssembly.</p>
+  source (<code>main.py</code>); the browser runs it with RustPython, compiled to WebAssembly.</p>
   <p id="status">Python is blocked for this site.</p>
   <div class="counter">
     <span id="count">0</span>
     <button id="increment">Add one</button>
   </div>
   <ul id="log"></ul>
-  <script type="text/python">
-    document.querySelector('#status').textContent = 'Python is running, as a pack in WebAssembly.'
-    count = document.querySelector('#count')
-    log = document.querySelector('#log')
-    clicks = 0
-
-    def add_one(event):
-        global clicks
-        clicks += 1
-        count.textContent = str(clicks)
-        item = document.createElement('li')
-        item.textContent = f'Click {clicks}, handled in Python ({event.type})'
-        log.appendChild(item)
-
-    document.querySelector('#increment').addEventListener('click', add_one)
-  </script>
+  <script type="text/python" src="main.py"></script>
 </body>
 </html>

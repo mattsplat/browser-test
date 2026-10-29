@@ -40,7 +40,8 @@ using the same web platform names in each.
   sees every call, and a page's run can be recorded and replayed step by step.
 - **Source first.** The console and stack traces show your source, not raw Wasm.
 
-The reasoning behind these, and per-feature notes, are in [`DESIGN.md`](DESIGN.md).
+The reasoning behind these, and per-feature notes, are in [`DESIGN.md`](DESIGN.md). What
+page code can call, in each language, is in [`docs/api.md`](docs/api.md).
 
 ## What's in it
 

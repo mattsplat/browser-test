@@ -2680,13 +2680,15 @@ let count = 0;
         crate::python_pack::start(doc, Default::default(), &scripts).expect("Python pack missing? run packs/python/build.sh")
     }
 
-    /// The Python counter example, end to end: its inline script in the Python pack
-    /// (RustPython in wasm), the same host as Dart and JS, the real Blitz DOM.
+    /// The Python counter example, end to end: its main.py in the Python pack (RustPython in
+    /// wasm), the same host as Dart and JS, the real Blitz DOM.
     #[test]
     fn python_counter_example_runs_and_handles_clicks() {
-        let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/python-counter/index.html")).unwrap();
-        let script = html.split("<script type=\"text/python\">").nth(1).unwrap().split("</script>").next().unwrap();
-        let page = python_page(&html, &[&crate::python_pack::dedent(script)]);
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/python-counter");
+        let html = std::fs::read_to_string(format!("{dir}/index.html")).unwrap();
+        assert!(html.contains(r#"<script type="text/python" src="main.py"></script>"#));
+        let script = std::fs::read_to_string(format!("{dir}/main.py")).unwrap();
+        let page = python_page(&html, &[&script]);
         assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Python is running, as a pack in WebAssembly.");
 
         let (button, id) = listener(&page, "#increment", "click");
