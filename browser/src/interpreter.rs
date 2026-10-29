@@ -218,7 +218,8 @@ impl PackRuntime for Interpreter {
 
     fn fire_callback(&mut self, id: usize, args: &[HostValue]) -> Result<()> {
         self.enter()?;
-        let encoded = Value::Array(args.iter().map(encode).collect::<Result<_>>()?).to_string();
+        let host = self.store.data_mut().host.as_mut();
+        let encoded = Value::Array(args.iter().map(|a| encode(host, a)).collect::<Result<_>>()?).to_string();
         let (ptr, len) = self.write_str(&encoded)?;
         let status = self.call::<(u32, u32, u32), u64>("fire", (id as u32, ptr, len))?;
         self.check(status)
@@ -277,13 +278,19 @@ fn dispatch(host: &mut dyn Host, request: &Value) -> Result<Value> {
             let args = field("args")?.as_array().context("args is not an array")?.iter().map(|a| decode(host, a)).collect::<Result<Vec<_>>>()?;
             host.call(&target()?, &name()?, &args)?
         }
+        Some("release") => {
+            if let HostValue::Object(h) = target()? {
+                host.release(h);
+            }
+            HostValue::Undefined
+        }
         Some("console") => {
             host.console(field("text")?.as_str().unwrap_or_default());
             HostValue::Undefined
         }
         other => bail!("unknown request op {other:?}"),
     };
-    encode(&value)
+    encode(host, &value)
 }
 
 /// JSON → host value. Undefined, host objects, callbacks and plain objects use small tagged
@@ -306,13 +313,16 @@ fn decode(host: &mut dyn Host, v: &Value) -> Result<HostValue> {
     })
 }
 
-fn encode(v: &HostValue) -> Result<Value> {
+/// Host value → JSON. A host object the pack should release when it drops its wrapper is
+/// marked `{"o": h, "r": 1}`.
+fn encode(host: &mut dyn Host, v: &HostValue) -> Result<Value> {
     Ok(match v {
         HostValue::Null => Value::Null,
         HostValue::Undefined => json!({ "u": 1 }),
         HostValue::Bool(b) => json!(b),
         HostValue::Num(n) => json!(n),
         HostValue::Str(_) => Value::String(v.display()),
+        HostValue::Object(h) if host.releasable(*h) => json!({ "o": h, "r": 1 }),
         HostValue::Object(h) => json!({ "o": h }),
         HostValue::CallbackId(id) => json!({ "cb": id }),
         other => bail!("{} cannot be passed to the pack", other.display()),

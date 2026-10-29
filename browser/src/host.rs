@@ -121,6 +121,11 @@ pub trait Host {
     fn array(&mut self, items: Vec<HostValue>) -> Result<HostValue>;
     /// `value instanceof Array`.
     fn is_array(&mut self, value: &HostValue) -> bool;
+    /// The pack no longer holds `handle` (its wrapper was collected). Only values made for
+    /// the pack (responses, headers, parsed data, promises) are freed; others are kept.
+    fn release(&mut self, handle: u32);
+    /// Whether `release` would free `handle`, so the pack knows to report it.
+    fn releasable(&mut self, handle: u32) -> bool;
 }
 
 /// Mouse and keyboard details of an event, as the DOM exposes them.
@@ -214,6 +219,9 @@ fn can_rewrite(current: &Url, url: &Url) -> bool {
         && current.port() == url.port()
         && (url.scheme() != "file" || current.path() == url.path())
 }
+
+/// The most response body a page may hold at once (in `Response` objects it hasn't released).
+const MAX_HELD_BODIES: usize = 256 << 20;
 
 /// `navigator.language`. Fixed rather than the system's, so pages can't use it to tell
 /// machines apart beyond what the User-Agent already says.
@@ -328,6 +336,10 @@ pub struct Objects {
     fetched: std::sync::Arc<Mutex<Vec<Fetched>>>,
     /// Fetches started and not yet taken.
     pub(crate) fetching: usize,
+    /// Bytes of response bodies the page holds (live `Response` objects).
+    body_bytes: usize,
+    /// Each response's one `Headers` object, once read.
+    headers_of: HashMap<u32, u32>,
     /// Wakes the page's event loop: a timer is due, or a fetch finished.
     pub waker: std::sync::Arc<Mutex<Option<std::task::Waker>>>,
     /// `history.state` for the page's current entry, as JSON text; None until first read
@@ -356,6 +368,8 @@ impl Default for Objects {
             promises: HashMap::new(),
             fetched: Default::default(),
             fetching: 0,
+            body_bytes: 0,
+            headers_of: HashMap::new(),
             waker: Default::default(),
             history_state: None,
             queued_events: Vec::new(),
@@ -413,12 +427,32 @@ impl Objects {
     }
 
     pub fn release(&mut self, handle: u32) {
-        self.objects.remove(&handle);
+        if let Some(Obj::Response(r)) = self.objects.remove(&handle) {
+            self.body_bytes -= r.body.len().min(self.body_bytes);
+            if let Some(headers) = self.headers_of.remove(&handle) {
+                self.objects.remove(&headers);
+            }
+        }
+        self.promises.remove(&handle);
+        self.headers_of.retain(|_, h| *h != handle);
+    }
+
+    /// Whether the pack may release `handle` when it no longer holds it (`Host::release`):
+    /// values made for it (responses, their headers, parsed data, promises), not the page's
+    /// elements or the singletons.
+    pub fn releasable(&self, handle: u32) -> bool {
+        matches!(self.objects.get(&handle), Some(Obj::Promise | Obj::Response(_) | Obj::Headers(_) | Obj::Json(_)))
     }
 
     #[cfg(test)]
     pub fn live_objects(&self) -> usize {
         self.objects.len()
+    }
+
+    /// How many live objects are of `interface` (`"Response"`, `"Promise"`...).
+    #[cfg(test)]
+    pub fn live_of(&self, interface: &str) -> usize {
+        self.objects.values().filter(|o| o.interface() == interface).count() + if interface == "Promise" { self.promises.len() } else { 0 }
     }
 
     /// A one-line summary for an exception snapshot: what the pack holds.
@@ -513,6 +547,7 @@ impl Objects {
         let Some(state) = self.promises.get_mut(&promise) else { return };
         let Some(outcome) = state.outcome.clone() else { return };
         let reactions = std::mem::take(&mut state.reactions);
+        let had_reactions = !reactions.is_empty();
         for (on_fulfilled, on_rejected) in reactions {
             let (run, unused, value) = match &outcome {
                 Ok(v) => (on_fulfilled, on_rejected, v.clone()),
@@ -527,6 +562,12 @@ impl Objects {
                 self.release_if_unused(callback);
             }
         }
+        // Its callbacks are queued with the value: nothing needs the promise any more (each
+        // pack calls `then` once per promise).
+        if had_reactions {
+            self.promises.remove(&promise);
+            self.objects.remove(&promise);
+        }
     }
 
     /// Fetches that finished since last asked, to settle on the UI thread.
@@ -539,7 +580,14 @@ impl Objects {
     /// Settle `promise` with a finished fetch: a new `Response`, or a TypeError message.
     pub fn deliver_fetch(&mut self, promise: u32, result: Result<FetchResponse, String>) {
         let outcome = match result {
-            Ok(response) => Ok(HostValue::Object(self.add(Obj::Response(Rc::new(response))))),
+            // Bodies the page still holds are host memory, outside the pack's cap: bounded too.
+            Ok(response) if self.body_bytes + response.body.len() > MAX_HELD_BODIES => {
+                Err(HostValue::str(&format!("TypeError: Failed to fetch {}: the page holds over {} MB of responses", response.url, MAX_HELD_BODIES >> 20)))
+            }
+            Ok(response) => {
+                self.body_bytes += response.body.len();
+                Ok(HostValue::Object(self.add(Obj::Response(Rc::new(response)))))
+            }
             Err(message) => Err(HostValue::str(&message)),
         };
         self.settle(promise, outcome);
@@ -985,7 +1033,19 @@ impl PageHost {
                 "redirected" => HostValue::Bool(r.redirected),
                 "type" => HostValue::str(if r.cross_origin { "cors" } else { "basic" }),
                 "bodyUsed" => HostValue::Bool(false),
-                "headers" => HostValue::Object(self.objects.borrow_mut().add(Obj::Headers(Rc::new(r.headers.clone())))),
+                "headers" => {
+                    let HostValue::Object(response) = target else { bail!("not a response") };
+                    let mut objects = self.objects.borrow_mut();
+                    let handle = match objects.headers_of.get(response) {
+                        Some(h) => *h,
+                        None => {
+                            let h = objects.add(Obj::Headers(Rc::new(r.headers.clone())));
+                            objects.headers_of.insert(*response, h);
+                            h
+                        }
+                    };
+                    HostValue::Object(handle)
+                }
                 _ => bail!("Response.{prop} is not supported yet"),
             },
             (Obj::Json(value), _) => {
@@ -1351,6 +1411,17 @@ impl Host for PageHost {
             }
         }
         Ok(HostValue::Object(objects.add(Obj::Json(serde_json::Value::Object(map)))))
+    }
+
+    fn release(&mut self, handle: u32) {
+        let mut objects = self.objects.borrow_mut();
+        if objects.releasable(handle) {
+            objects.release(handle);
+        }
+    }
+
+    fn releasable(&mut self, handle: u32) -> bool {
+        self.objects.borrow().releasable(handle)
     }
 
     fn is_array(&mut self, value: &HostValue) -> bool {

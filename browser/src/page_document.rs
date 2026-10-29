@@ -1404,6 +1404,62 @@ mod tests {
         assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom);
     }
 
+    /// Many fetches don't pile up host objects: promises go once their callbacks are queued,
+    /// and responses, headers and parsed data go when the pack drops them (Python's wrappers
+    /// say so as they're freed; JS's when its garbage collector finalizes them, so only the
+    /// promises are checked for JS).
+    #[tokio::test]
+    async fn many_fetches_dont_pile_up_host_objects() {
+        let base = serve(same_origin_answer);
+        let url = format!("{base}app/page.html");
+        let gate = std::sync::Arc::new(crate::gate::Gate::new(std::sync::Arc::new(blitz_net::Provider::new(None))));
+        let python = "
+count = [0]
+def once():
+    def got(r):
+        def text(t):
+            def data(d):
+                count[0] += 1
+                document.querySelector('#out').textContent = str(count[0])
+                if count[0] < 60:
+                    once()
+            r.json().then(data)
+        r.headers.get('content-type')
+        r.text().then(text)
+    fetch('data.json').then(got)
+once()
+";
+        let js = "
+let count = 0;
+(async () => {
+  while (count < 60) {
+    const r = await fetch('data.json');
+    r.headers.get('content-type');
+    await r.text();
+    count++;
+    document.querySelector('#out').textContent = String(count);
+  }
+})();";
+        for (pack, source) in [("python", python), ("js", js)] {
+            let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+            let env = PageEnv { gate: Some(gate.clone()), ..Default::default() };
+            let scripts = [Script { name: format!("many.{pack}"), source: source.into(), module: false }];
+            let mut page = match pack {
+                "python" => crate::python_pack::start(doc, env, &scripts).unwrap(),
+                _ => crate::js_pack::start(doc, env, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap(),
+            };
+            settle_network(&mut page).await;
+            assert_eq!(output(&page), "60", "{pack}: {:?}", errors_on(&url));
+            let objects = page.pack.objects.borrow();
+            assert_eq!(objects.live_of("Promise"), 0, "{pack}: promises piled up");
+            if pack == "python" {
+                for kind in ["Response", "Headers", "Object"] {
+                    assert!(objects.live_of(kind) <= 1, "{pack}: {kind} objects piled up: {}", objects.live_of(kind));
+                }
+            }
+        }
+    }
+
     // ---- Time-travel replay: record a session, replay it in a fresh pack, same DOM.
 
     /// Record the events scenario on its own URL, plus clicks on `#noise` (random numbers and

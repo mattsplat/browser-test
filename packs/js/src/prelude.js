@@ -60,7 +60,7 @@
   const decode = (v) => {
     if (v === null || typeof v !== 'object') return v;
     if (v.u) return undefined;
-    if (v.o !== undefined) return wrap(v.o);
+    if (v.o !== undefined) return wrap(v.o, METHODS, v.r === 1);
     return v;
   };
   const request = (message) => {
@@ -72,19 +72,25 @@
   // One wrapper per handle, so the same element is `===` itself. Held weakly: once page code
   // drops a wrapper (e.g. an event object after its dispatch), it can be collected.
   const wrappers = new Map();
-  const forget = new FinalizationRegistry((h) => {
-    if (wrappers.get(h)?.deref() === undefined) wrappers.delete(h);
+  // A wrapper collected: forget it, and tell the host to free what it made for the page
+  // (a response, parsed data), marked releasable (`r`).
+  const forget = new FinalizationRegistry(({ h, releasable }) => {
+    if (wrappers.get(h)?.deref() !== undefined) return;
+    wrappers.delete(h);
+    if (releasable) __host(JSON.stringify({ op: 'release', target: h }));
   });
-  const wrap = (h, methods = METHODS) => {
+  const wrap = (h, methods = METHODS, releasable = false) => {
     const existing = wrappers.get(h)?.deref();
     if (existing !== undefined) return existing;
     const proxy = new Proxy({}, {
-      get(_, prop) {
+      // Method closures hold the wrapper (`self`), so it isn't collected, and released, before
+      // they're called.
+      get(_, prop, self) {
         if (prop === HANDLE) return h;
         // Not thenable: resolving a JS promise with a host object mustn't call it.
         if (typeof prop !== 'string' || prop === 'then') return undefined;
         // Response.json() parses in JS, so the page gets ordinary objects and arrays.
-        if (prop === 'json') return () => promised(request({ op: 'call', target: h, name: 'text', args: [] })).then((t) => JSON.parse(t));
+        if (prop === 'json') return () => promised(request({ op: 'call', target: self[HANDLE], name: 'text', args: [] })).then((t) => JSON.parse(t));
         if (STORAGE.has(prop)) {
           // Wrapped with Storage's methods (not by `decode`, which would wrap it generically).
           const reply = JSON.parse(__host(JSON.stringify({ op: 'get', target: h, name: prop })));
@@ -93,7 +99,7 @@
         }
         if (methods.has(prop)) {
           return (...args) => {
-            const result = request({ op: 'call', target: h, name: prop, args: args.map(encode) });
+            const result = request({ op: 'call', target: self[HANDLE], name: prop, args: args.map(encode) });
             return PROMISES.has(prop) ? promised(result) : result;
           };
         }
@@ -105,7 +111,7 @@
       },
     });
     wrappers.set(h, new WeakRef(proxy));
-    forget.register(proxy, h);
+    forget.register(proxy, { h, releasable });
     return proxy;
   };
 

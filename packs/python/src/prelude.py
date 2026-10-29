@@ -58,7 +58,7 @@ def decode(v):
         if 'u' in v:
             return None
         if 'o' in v:
-            return HostObject(v['o'])
+            return HostObject(v['o'], 'r' in v)
     # The host's numbers are doubles; whole ones read as ints, as they print in JS.
     if isinstance(v, float) and v.is_integer() and abs(v) < 2 ** 53:
         return int(v)
@@ -72,13 +72,31 @@ def request(message, error=RuntimeError):
     return decode(reply['ok'])
 
 
+# Live wrappers per handle the host marked releasable (a response, parsed data): when the
+# last goes, the host frees the object.
+held = {}
+
+
 class HostObject:
     """A web platform object (window, document, an element, an event) the host holds."""
-    __slots__ = ('_handle',)
+    __slots__ = ('_handle', '_releasable')
     _methods = METHODS
 
-    def __init__(self, handle):
+    def __init__(self, handle, releasable=False):
         object.__setattr__(self, '_handle', handle)
+        object.__setattr__(self, '_releasable', releasable)
+        if releasable:
+            held[handle] = held.get(handle, 0) + 1
+
+    def __del__(self):
+        if self._releasable:
+            h = self._handle
+            left = held.get(h, 1) - 1
+            if left:
+                held[h] = left
+            else:
+                held.pop(h, None)
+                host_request({'op': 'release', 'target': h})
 
     def __getattr__(self, name):
         # Only called for names the class doesn't have, i.e. the page's members.
@@ -89,7 +107,8 @@ class HostObject:
             return Storage(request({'op': 'get', 'target': h, 'name': name})._handle)
         if name in self._methods:
             def call(*args):
-                result = request({'op': 'call', 'target': h, 'name': name, 'args': [encode(a) for a in args]})
+                # Through `self`, so the object stays alive (unreleased) until the call.
+                result = request({'op': 'call', 'target': self._handle, 'name': name, 'args': [encode(a) for a in args]})
                 return Promise(result) if name in PROMISES else result
             return call
         return request({'op': 'get', 'target': h, 'name': name}, AttributeError)
@@ -119,14 +138,33 @@ class Promise:
     """A host promise (from fetch, Response.text(), Response.json()). `then(on_value, on_error)`
     calls one of them later, from the event loop, never during the call; it returns None, so
     nest calls rather than chaining them. A rejection's reason is a message such as
-    "TypeError: Failed to fetch ..."."""
-    __slots__ = ('_host',)
+    "TypeError: Failed to fetch ...". `then` may be called more than once."""
+    __slots__ = ('_host', '_waiting', '_outcome')
 
     def __init__(self, host):
         self._host = host
+        self._waiting = []
+        self._outcome = None
 
     def then(self, on_value=None, on_error=None):
-        self._host.then(on_value, on_error)
+        if self._outcome is not None:
+            ok, value = self._outcome
+            f = on_value if ok else on_error
+            if f is not None:
+                setTimeout(lambda: f(value), 0)
+            return
+        self._waiting.append((on_value, on_error))
+        # The host's promise takes one `then`; later ones wait here.
+        if len(self._waiting) == 1:
+            self._host.then(lambda v: self._settle(True, v), lambda e: self._settle(False, e))
+
+    def _settle(self, ok, value):
+        self._outcome = (ok, value)
+        waiting, self._waiting = self._waiting, []
+        for on_value, on_error in waiting:
+            f = on_value if ok else on_error
+            if f is not None:
+                f(value)
 
     def __repr__(self):
         return 'Promise'

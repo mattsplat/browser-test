@@ -1022,36 +1022,52 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
 
 **Cookies** (`browser/src/cookies.rs`, `document.cookie`).
 - **One jar per profile**, shared by requests and page code. blitz-net used reqwest's own
-  jar, which nothing else can read; the fork gained `blitz_net::set_cookie_store` (like
-  `set_cache_dir`), and `main` gives it the profile's jar before the provider exists.
+  jar, which nothing else can read; the fork gained `blitz_net::set_cookie_stores` (like
+  `set_cache_dir`), and `main` gives it views of the profile's jar before the provider
+  exists (one per `SameSite` scope, below).
 - **Rules:** `cookie_store` (already in the tree through reqwest) parses and matches (RFC 6265
   domain and path matching, expiry, `Secure` only over https). On top, as browsers do: page
   code never reads, sets or overwrites an `HttpOnly` cookie; `Secure` can only be set from
   https; nothing is set for a public suffix (`Domain=co.uk`, checked with `psl`, which the
-  gate already uses). Order is longest path first, then name (the crate keeps no creation
-  time).
+  gate already uses); from an insecure URL nothing may shadow a `Secure` cookie of the same
+  name (RFC 6265bis), by `Set-Cookie` or page code. Order is longest path first, then name.
+- **Limits:** 4 KB per cookie (name plus value), 180 per domain and 3000 in all; past them
+  the oldest go (the jar keeps the order cookies were set in).
+- **SameSite:** requests carry a `CookieScope` (a field the fork added to blitz's `Request`),
+  and blitz-net keeps a client per scope, each with a view of the jar. A link or form from
+  another site (`BrowserNavProvider`, comparing the current page's site, scheme included)
+  sends no `Strict` cookies, and if it isn't a GET no `Lax` ones either, so a cross-site form
+  can't ride the user's session. A page's subresources to another site send neither (only
+  cookies without `SameSite`, or `None`). What the user types is same-site. Cookies without
+  the attribute are still sent cross-site (browsers' newer Lax-by-default isn't applied).
 - **Persistence:** cookies with `Expires`/`Max-Age` are saved to the profile's
-  `cookies.json`, replaced whole (`write_atomic`) whenever one with an expiry is set or
-  removed; session cookies stay in memory, so they're gone after a restart. A damaged file is
+  `cookies.json`, replaced whole (`write_atomic`), whenever a change adds, replaces or
+  removes one (including replacing it with a session cookie, so an old token can't come
+  back). The profile's jar writes on a thread of its own half a second after changes settle,
+  never on the UI thread, and flushes when the browser exits. Session cookies stay in memory,
+  so they're gone after a restart. A damaged file is
   kept as `cookies.json.bad`, like settings.json.
 - **Replay:** every `document.cookie` read is on the tape (text reads: `Tape::read_text`,
   `Recording::texts`), and a replay never writes to the real jar.
 - **AI:** `debug::holds_secrets` marks host calls whose arguments or results carry secrets
-  (`Document.cookie`, and later storage and fetch); redacted trace views show `(hidden)` for
-  both. What a page itself writes into its DOM or console is the page's output and isn't
+  (`Document.cookie`, storage, fetch, responses and headers, plain objects and arrays,
+  location and history, and `popstate`/`hashchange` details); redacted trace views show
+  `(hidden)` for both, and the redacted console hides the arguments of such a call that
+  failed (a quota error). The cross-pack test checks that secrets the page reads but never
+  shows appear nowhere in the redacted trace or console, in every pack. What a page itself writes into its DOM or console is the page's output and isn't
   hidden: AI access sees the page as the user does.
 - **Site panel → Site data:** the cookie count for the page's site (registrable domain) and
   "Clear cookies".
 - **Limitations:**
   - `file://` and other pages without a host have no cookies (`document.cookie` is empty),
     as in Chrome.
-  - `__Secure-`/`__Host-` prefixes and `SameSite` aren't enforced.
-  - **Third-party cookies:** blitz-net's subresource requests carry the cookie store's
-    cookies for whatever URL they fetch, with no notion of the page that asked. Third-party
-    requests are refused by default, so this only reaches sites the user allowed for a page.
+  - `__Secure-`/`__Host-` prefixes aren't enforced.
+  - **Third-party cookies** without `SameSite` (or with `None`) still go with a page's
+    subresource requests to sites the user allowed for it (third-party requests are refused
+    by default), and responses from them can set cookies; there's no partitioning.
     `fetch` (below) sends cookies only to its own origin.
-  - Saving writes the whole file on each change with an expiry; fine for normal jars, a cost
-    for sites that set many persistent cookies per response.
+  - A crash, or quitting within half a second of a change, can lose that change.
+  - Saving writes the whole file; fine for normal jars.
 
 **fetch** (`Window.fetch`, `gate::fetch_from_page`).
 - **Through the gate, as a request from the page.** `Gate::fetch_from_page` checks every hop
@@ -1068,7 +1084,21 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   before anything is sent. `Set-Cookie` is never exposed. Forbidden request headers
   (`Cookie`, `Host`, `Origin`, `Sec-*`...) set by page code are dropped.
 - **Schemes:** http(s); `data:`; `file:` only from a file page and only in its folder or below
-  it (not anywhere on disk). Anything else rejects.
+  it: the URL is decoded to a path and both it and the folder are resolved on disk
+  (`canonicalize`, so encoded `..` and symlinks can't lead out), and the resolved path is
+  what's read. Anything else rejects. `CONNECT`, `TRACE` and `TRACK` are refused (TRACE would
+  echo HttpOnly cookies back).
+- **Bounded:** a body is read in chunks up to 64 MB (a larger `Content-Length` is refused up
+  front), each hop has a 60 s timeout, a fetch stops when its page goes (the load's abort
+  signal), and fetches share the per-host limit of 6 with other requests. A page holds at
+  most 256 MB of response bodies at once; past that, fetches reject.
+- **DNS rebinding / private network:** a page on a public site (not a file, `localhost`,
+  a private IP, or a `.test`/`.local`/`.localhost`/`.internal`/`.home.arpa` name) can't
+  fetch private or local addresses: IP literals are refused, and names are resolved by a
+  resolver that drops loopback, private, link-local and similar addresses (and fails if none
+  are left), so a name can't be rebound to the local network between check and connect.
+  **Gap:** this covers `fetch` only; a public page's images and CSS can still name a local
+  address if the user allowed that site as a third party.
 - **Rejections** are `TypeError: Failed to fetch <url>: <why>` (blocked, CORS, network
   error). JS gets a real `TypeError`.
 - **Async, in every pack.** The host has a small promise (`Obj::Promise`, `Objects::settle`):
@@ -1092,7 +1122,9 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   with `o[p] = v`) are recognised. Only data crosses (strings, numbers, booleans, null, other
   plain objects), not functions or host objects inside them.
 - **Replay:** a finished fetch is a step (`Step::Fetch`, with the response), and replaying
-  sends nothing: the page's `fetch` makes a promise and the step settles it.
+  sends nothing: the page's `fetch` makes a promise and the step settles it. A bad URL
+  rejects at once in both; "no network" is delivered like a finished fetch, so it's a step
+  too and a replay matches.
 - **AI:** `Window.fetch`, `Response.*`, `Headers.*` and `Promise.*` calls are hidden in
   redacted trace views; bodies are never traced (they reach the pack as callback arguments).
 - **Tested** against a local server (`serve` in `page_document.rs` tests): same-origin GET with
@@ -1101,11 +1133,18 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   refused one, identical in all three packs and replayed.
 - **Limitations and deferred:**
   - Bodies are text only: no `arrayBuffer()`, `blob()`, `formData()`, streams, or binary
-    request bodies; invalid UTF-8 is replaced. At most 64 MB per response.
+    request bodies; invalid UTF-8 is replaced.
   - No `Request`/`Headers` constructors, `AbortController`, or `mode: "no-cors"` (opaque
     responses); `bodyUsed` is always false and a body can be read more than once.
   - No HTTP cache for page fetches; no third-party cookie partitioning (none are sent).
-  - Response and promise handles live until the page goes (like element handles).
+  - **Handles:** a promise's state goes once its callbacks are queued (each pack calls
+    `then` once; Python's `Promise` fans out further `then`s itself). Responses, their one
+    `Headers` object and parsed data are marked releasable on the wire (`{"o": h, "r": 1}`),
+    and the pack sends `release` when it drops them: Python as its wrappers are freed
+    (counted per handle), JS when its garbage collector finalizes them (so later, and not
+    deterministically). **Dart doesn't release them** (dart2wasm gives no hook when a JS
+    value is collected), so a Dart page's responses live until it goes, within the 256 MB
+    bound. `many_fetches_dont_pile_up_host_objects` checks Python and JS.
   - A replayed page that then goes live has no network (it has no gate).
   - **XMLHttpRequest deferred:** it isn't cheap on top of fetch (synchronous mode can't work
     on the UI thread, and its event model is its own); new code uses fetch.
@@ -1150,8 +1189,10 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   goes into the tab's history like a link click (`TabNav::navigate`), so the tab loads it
   through the normal path and the gate. Only http(s), file and about URLs can be navigated to
   (no `javascript:`). `window.location = url` and `document.location` work too.
-- **`history`:** `pushState`/`replaceState` (same origin only: `SecurityError` otherwise;
-  state must be data, as `fetch` init is), `state`, `length`, `back`, `forward`, `go`.
+- **`history`:** `pushState`/`replaceState` (the spec's rewrite rule: same scheme,
+  username, password, host and port, so `https://bank.test@evil.test/` is refused; a file
+  page may change only its query and fragment; `SecurityError` otherwise; state must be data,
+  as `fetch` init is), `state`, `length`, `back`, `forward`, `go`.
 - **How the page reaches its tab:** `PageEnv::nav`, a `host::TabNav` (`history::TabHistory`
   over the tab's history store and reload counter). Tests use a recording stand-in; replays
   and pages outside a tab have none (navigation does nothing).
@@ -1179,6 +1220,9 @@ one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
   changed. Polls follow redraws, so a resize arrives with the next frame.
 - JS gets `innerWidth` etc., `navigator`, `scrollTo` and `scrollBy` as globals too; Python
   reads them from `window` (it has no global getters), plus `navigator`.
+
+**Profile files are private:** `write_atomic` creates its file with mode 0600 and the
+profile folder is 0700, since it holds cookies, storage and history.
 
 **Cross-cutting decisions:**
 - **`PageEnv`** is the one explicit hand-off of what a page reaches beyond its DOM (gate, the
