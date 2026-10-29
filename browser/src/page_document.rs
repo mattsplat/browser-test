@@ -467,6 +467,53 @@ impl RunningPack {
         doc.node_chain(control).into_iter().find(|id| element(id).is_some_and(|el| &*el.name.local == "form"))
     }
 
+    /// Deliver what the page's WebSockets received (`websocket.rs`), each a recorded step.
+    /// Paused or stopped, it waits (the connections stop reading once enough is waiting).
+    fn deliver_sockets(&self) -> bool {
+        if self.idle() {
+            return false;
+        }
+        let events = self.objects.borrow().inbox.take();
+        for (socket, event) in &events {
+            self.objects.borrow_mut().tape.step(|| replay::Step::Socket { socket: *socket, event: event.clone() });
+            self.socket_event(*socket, event);
+        }
+        !events.is_empty()
+    }
+
+    /// One thing that happened on socket `socket`: its state changes, then its event.
+    fn socket_event(&self, socket: u32, event: &crate::websocket::SocketEvent) {
+        let changed = self.objects.borrow_mut().socket_changed(socket, event);
+        if let Some((kind, details)) = changed {
+            self.dispatch_object(socket, kind, details);
+        }
+        if matches!(event, crate::websocket::SocketEvent::Close { .. }) {
+            self.objects.borrow_mut().forget_target(socket);
+        }
+        release_unused(&self.objects, self.runtime.borrow_mut().as_mut());
+    }
+
+    /// Deliver an event to an object that isn't a node (a WebSocket): its `on<type>` handler,
+    /// then its listeners. The caller records the step it comes from.
+    fn dispatch_object(&self, target: u32, kind: &str, details: EventDetails) {
+        let ids = self.objects.borrow().object_listeners(target, kind);
+        if ids.is_empty() || self.idle() {
+            return;
+        }
+        let root = self.doc.borrow().root_node().id;
+        let handle = self.objects.borrow_mut().object_event(kind, target, root, details);
+        let during = format!("{kind} listener");
+        for id in ids {
+            if let Err(e) = self.call(id, &[HostValue::Object(handle)], &during, String::new()) {
+                self.uncaught(&during, String::new(), &e);
+            }
+            if self.objects.borrow_mut().event_mut(handle).is_some_and(|e| e.immediate_propagation_stopped) || self.paused.get() {
+                break;
+            }
+        }
+        self.objects.borrow_mut().release(handle);
+    }
+
     /// Settle the promises of fetches that finished (each one a recorded step), so their
     /// callbacks run with the due timers. Returns whether any did.
     fn deliver_fetches(&self) -> bool {
@@ -562,6 +609,7 @@ impl RunningPack {
             replay::Step::Resume => self.paused.set(false),
             replay::Step::Traverse { url, state } => self.move_to(url, state.clone()),
             replay::Step::Fetch { promise, result } => self.objects.borrow_mut().deliver_fetch(*promise, result.clone()),
+            replay::Step::Socket { socket, event } => self.socket_event(*socket, event),
         }
         Ok(())
     }
@@ -881,7 +929,7 @@ impl Document for PackDocument {
             }
         }
         let resized = self.pack.check_resize();
-        let delivered = self.pack.deliver_fetches();
+        let delivered = self.pack.deliver_fetches() | self.pack.deliver_sockets();
         let queued = self.pack.run_queued_events();
         let ran = self.pack.run_due_timers();
         self.pack.arm_timers();
@@ -1030,14 +1078,14 @@ mod tests {
         assert_eq!(text_of(&doc, "#log"), "Click 1, handled in JS (click)Click 2, handled in JS (click)");
     }
 
-    /// JS sees the web platform through the host and nothing else. (`fetch` exists, but goes
-    /// through the host and the page's gate: see the web API test.)
+    /// JS sees the web platform through the host and nothing else. (`fetch` and `WebSocket`
+    /// exist, but go through the host and the page's gate: see the web API and socket tests.)
     #[test]
     fn js_has_no_side_doors() {
         let page = js_page(
             "<p id=out></p>",
             &[r#"
-                const reachable = ['XMLHttpRequest', 'require', 'process', 'WebSocket', 'Deno', 'Bun']
+                const reachable = ['XMLHttpRequest', 'require', 'process', 'Deno', 'Bun']
                     .filter((name) => typeof globalThis[name] !== 'undefined');
                 const r = Math.random();
                 document.querySelector('#out').textContent = reachable.length + ' ' + (r >= 0 && r < 1);
@@ -1571,6 +1619,136 @@ mod tests {
         // Python frees each NodeList as its wrapper goes.
         let page = python_page("<p></p><p></p>", &["for i in range(200):\n    document.querySelectorAll('p').length"]);
         assert!(page.pack.objects.borrow().live_of("NodeList") <= 1);
+    }
+
+    // ---- Cross-pack: WebSocket (`tests/fixtures/ws.*`), against a local server.
+
+    /// A WebSocket server on 127.0.0.1: greets each connection with the cookie it sent,
+    /// answers "ping" with a secret the page never shows, and closes with 4000 "done" on
+    /// "bye". Returns its port and how many connections it has had.
+    fn serve_sockets() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    let mut cookie = String::from("none");
+                    let callback = |request: &tungstenite::handshake::server::Request, response| {
+                        if let Some(c) = request.headers().get("cookie") {
+                            cookie = c.to_str().unwrap_or_default().to_string();
+                        }
+                        Ok(response)
+                    };
+                    let Ok(mut ws) = tungstenite::accept_hdr(stream, callback) else { return };
+                    let _ = ws.send(tungstenite::Message::text(format!("hello cookie:{cookie}")));
+                    while let Ok(message) = ws.read() {
+                        match message.to_text().unwrap_or_default() {
+                            "ping" => drop(ws.send(tungstenite::Message::text("S3CRET-WS-PONG"))),
+                            "bye" => drop(ws.close(Some(tungstenite::protocol::CloseFrame { code: 4000.into(), reason: "done".into() }))),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        (port, connections)
+    }
+
+    const WS_OUTPUT: &[&str] = &["state:0,true", "open:1,", "message:hello cookie:sock=1", "message:14", "close:4000,done,true,3", "blocked:error", "blocked:close:1006,false"];
+
+    /// One page using a WebSocket (open, send, messages, a close from the server, a blocked
+    /// third party), the same in every pack; the handshake carried the page's SameSite=Strict
+    /// cookie. A replay ends with the same DOM and opens no connection; the message the page
+    /// never shows doesn't reach the AI's views.
+    #[tokio::test]
+    async fn web_sockets_behave_the_same_in_dart_js_and_python() {
+        let (port, connections) = serve_sockets();
+        let url = format!("http://localhost:{port}/app/ws.html");
+        let page_url = blitz_traits::net::Url::parse(&url).unwrap();
+        crate::cookies::jar().set_document_cookie(&page_url, "sock=1; SameSite=Strict; Path=/");
+        let html = include_str!("../tests/fixtures/ws.html").replace("WS_URL", &format!("ws://localhost:{port}/socket"));
+        let gate = Arc::new(crate::gate::Gate::new(Arc::new(blitz_net::Provider::new(None))));
+        let wasm = compile("tests/fixtures/ws.dart").await;
+        let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+        for pack in ["dart", "js", "python"] {
+            replay::arm(&url);
+            let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+            let env = PageEnv { gate: Some(gate.clone()), ..Default::default() };
+            let (page, program) = match pack {
+                "dart" => (crate::dart_pack::start(doc, env, &wasm).unwrap(), replay::Program::Dart(wasm.clone())),
+                "python" => {
+                    let scripts = script("ws.py", include_str!("../tests/fixtures/ws.py"));
+                    (crate::python_pack::start(doc, env, &scripts).unwrap(), replay::Program::Scripts { pack: "python", scripts, imports: Vec::new() })
+                }
+                _ => {
+                    let scripts = script("ws.js", include_str!("../tests/fixtures/ws.js"));
+                    let page = crate::js_pack::start(doc, env, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+                    (page, replay::Program::Scripts { pack: "js", scripts, imports: Vec::new() })
+                }
+            };
+            page.attach_recording(&html, None, program);
+            let until = Instant::now() + Duration::from_secs(5);
+            while output(&page).split('|').count() < WS_OUTPUT.len() && Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                page.pack.deliver_sockets();
+            }
+            assert_eq!(output(&page).split('|').collect::<Vec<_>>(), WS_OUTPUT, "{pack}: {:?}", errors_on(&url));
+
+            let recording = page.pack.stop_recording().unwrap();
+            assert!(recording.steps.iter().any(|s| matches!(s, replay::Step::Socket { .. })), "{pack}: socket events are steps");
+            let before = connections.load(std::sync::atomic::Ordering::Relaxed);
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            assert_eq!(outcome.diverged, None, "{pack}");
+            assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
+            assert_eq!(connections.load(std::sync::atomic::Ordering::Relaxed), before, "{pack}: the replay opened no socket");
+
+            let origin = format!("http://localhost:{port}");
+            let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+            let console = debug::console(&origin, debug::Privacy::Redacted, usize::MAX);
+            assert!(redacted.iter().any(|e| e.call == "Event.data"), "{pack}");
+            let texts = redacted.iter().flat_map(|e| [e.args.clone(), e.result.clone()]).chain(console.iter().flat_map(|c| [c.context.clone(), c.text.clone()]));
+            for text in texts {
+                assert!(!text.contains("S3CRET-WS"), "{pack}: a message reached the AI's view in {text:?}");
+            }
+            assert!(debug::trace(&origin, debug::Privacy::Full, usize::MAX).iter().any(|e| e.result.contains("S3CRET-WS")), "{pack}");
+        }
+    }
+
+    /// A page's sockets close when it goes; a secure page can't open an insecure one.
+    #[test]
+    fn sockets_close_when_the_page_goes() {
+        let (port, connections) = serve_sockets();
+        let url = format!("http://localhost:{port}/");
+        let gate = Arc::new(crate::gate::Gate::new(Arc::new(blitz_net::Provider::new(None))));
+        let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+        let source = format!("const ws = new WebSocket('ws://localhost:{port}/'); ws.onopen = () => {{ document.getElementById('out').textContent = 'open'; }};");
+        let scripts = [Script { name: "s.js".into(), source, module: false }];
+        let page = futures_lite_block_on(crate::js_pack::start(doc, PageEnv { gate: Some(gate), ..Default::default() }, &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while output(&page) != "open" && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+            page.pack.deliver_sockets();
+        }
+        assert_eq!(output(&page), "open");
+        let inbox = page.pack.objects.borrow().inbox.clone();
+        drop(page);
+        // The thread sees the page go and closes: nothing more arrives, and it lets go of the inbox.
+        let until = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&inbox.events) > 1 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(Arc::strong_count(&inbox.events), 1, "the connection's thread ended");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some("https://secure.test/".into()), ..Default::default() }).into_inner();
+        let source = "let r = ''; try { new WebSocket('ws://secure.test/'); } catch (e) { r = e.message.split(':')[0]; } document.getElementById('out').textContent = r;";
+        let scripts = [Script { name: "secure.js".into(), source: source.into(), module: false }];
+        let secure = futures_lite_block_on(crate::js_pack::start(doc, PageEnv::default(), &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        assert_eq!(output(&secure), "SecurityError");
     }
 
     /// Storage over the limit throws, as `QuotaExceededError`; a page with no origin has no

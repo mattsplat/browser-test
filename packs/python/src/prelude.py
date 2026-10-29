@@ -20,6 +20,7 @@ METHODS = {
     'getElementById', 'querySelectorAll', 'createTextNode', 'item', 'insertBefore', 'replaceChild',
     'removeChild', 'cloneNode', 'hasAttribute', 'contains', 'getBoundingClientRect', 'focus', 'blur',
     'add', 'toggle', 'setProperty', 'getPropertyValue', 'removeProperty',
+    'WebSocket', 'send', 'close',
 }
 # Storage's methods. Kept apart because `key` is also a property (of keyboard events).
 STORAGE_METHODS = {'getItem', 'setItem', 'removeItem', 'clear', 'key'}
@@ -239,6 +240,12 @@ def fetch(input, init=None):
     return window.fetch(input, init)
 
 
+def WebSocket(url, protocols=None):
+    """A WebSocket through the page's gate. Set `onopen`, `onmessage`... or use
+    addEventListener; handlers take the event."""
+    return window.WebSocket(url, protocols)
+
+
 def print(*args, sep=' ', end='\n', file=None, flush=False):
     console.log(sep.join(str(a) for a in args))
 
@@ -264,7 +271,7 @@ sys.setrecursionlimit = setrecursionlimit
 
 
 for name in ('window', 'document', 'console', 'Math', 'setTimeout', 'setInterval', 'clearTimeout',
-             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator'):
+             'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'print', 'fetch', 'Promise', 'localStorage', 'sessionStorage', 'location', 'history', 'navigator', 'WebSocket'):
     setattr(builtins, name, globals()[name])
 
 KNOWN = {window: 'Window', document: 'Document', console: 'Console', Math: 'Math'}

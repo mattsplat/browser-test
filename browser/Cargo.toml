@@ -79,3 +79,8 @@ sha2 = "0.10"
 # dependency tree, through reqwest)
 cookie_store = "0.22"
 cookie = "0.18"
+
+# Web platform parity part 2: WebSocket connections (both already in the dependency tree:
+# tungstenite through Dioxus's devtools, native-tls through reqwest)
+tungstenite = "0.29"
+native-tls = "0.2"

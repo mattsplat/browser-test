@@ -71,6 +71,7 @@ mod tab_manager;
 mod tab_strip;
 mod toolbar;
 mod url_suggestions;
+mod websocket;
 
 use about_pages::AboutPage;
 use browser_history::{BrowsingHistory, HistoryService, HistoryStore, MAX_HISTORY_ENTRIES};

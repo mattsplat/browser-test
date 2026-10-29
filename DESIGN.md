@@ -373,7 +373,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 |---|---|---|
 | `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | **Done** | Phase A: host-owned timers, woken by the event loop |
-| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). `XMLHttpRequest` and `WebSocket` deferred |
+| Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Partly | **`fetch` done** (text and JSON bodies, through the gate, basic CORS; see "Web platform parity notes"). **`WebSocket` done** (text messages, through the gate; see "Web platform parity part 2 notes"). `XMLHttpRequest` deferred |
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | Partly | **`localStorage` and `sessionStorage` done** (`storage.rs`; see "Web platform parity notes"). IndexedDB deferred |
 | Events: `removeEventListener`, mouse/keyboard details, `preventDefault`, input/change on form fields | **Done** (part 2) | Listeners, details, `preventDefault`, propagation, `popstate`/`hashchange`/`resize`, and form events: `input`, `change`, `submit` (cancellable), `focus`/`blur`; see "Web platform parity part 2 notes" |
 | DOM breadth: `querySelectorAll`, `classList`, `style`, `innerHTML`, `children`/`parentElement`, form `value` | **Done** (part 2) | Queries, tree walking and editing, `classList`, `dataset`, `style`, `innerHTML`/`outerHTML`, `getBoundingClientRect`, `focus`/`blur`, form `value`/`checked`/`disabled`; see "Web platform parity part 2 notes" |
@@ -1319,6 +1319,56 @@ fixtures `tests/fixtures/dom.*`).
   tests them in JS.
 - **Wire format:** arrays now cross from the interpreters (`{"arr": [...]}`), for data such
   as IndexedDB values.
+
+**WebSocket** (`browser/src/websocket.rs`; cross-pack test `web_sockets_behave_the_same_in_dart_js_and_python`,
+fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
+- `new WebSocket(url, protocols)`, `send`, `close(code, reason)`, `readyState`, `url`,
+  `protocol`, the `CONNECTING`...`CLOSED` constants, and `open`, `message`, `error` and
+  `close` events through `on<event>` handlers or `addEventListener`. Message events have
+  `data`; close events `code`, `reason` and `wasClean`. JS gets a `WebSocket` class (its
+  constructor returns the host object); Python a `WebSocket(url, protocols=None)` function;
+  Dart's `package:web` constructor snippet (`x0 => new WebSocket(x0)`) is recognised as a
+  new shape, `Construct`, which the host has as a method of `window`.
+- **Through the gate:** the URL (`http(s)` becomes `ws(s)`, relative to the page) is checked
+  with the gate's own rule for the page (`Gate::allow`: logged, block-all, third-party
+  default-deny). A refused one fails like a connection that went nowhere: `error`, then
+  `close` with 1006. An https page can't open a `ws:` socket (`SecurityError`, as browsers'
+  mixed-content rule). A public page's sockets connect only to public addresses: IP
+  literals that aren't public are refused, and names resolve to public addresses only, which
+  are the ones connected to (`websocket::addresses`, tested), so DNS can't rebind them.
+- **Handshake:** the page's `Origin`, the browser's User-Agent, and the cookies the jar would
+  send to the matching `http(s)` URL under `SameSite` (all of them same-site; no `Strict` or
+  `Lax` ones cross-site). The test checks a `SameSite=Strict` cookie arrives. `Set-Cookie`
+  on the handshake response is **ignored** (browsers store it), to keep the socket path out
+  of the cookie rules' write side.
+- **How it runs:** each connection is a thread (`websocket::connect`) with tungstenite (sync,
+  already in the tree through Dioxus's devtools) over a `TcpStream`, or native-tls (already
+  in the tree through reqwest) for `wss:`. Reads wait 20 ms at a time so the page's sends
+  get a turn. What arrives goes to the page's `Inbox`, which wakes its event loop;
+  `RunningPack::deliver_sockets` (from `poll`) applies it to the socket's state and
+  dispatches the event, so delivery is async, on the UI thread, like fetch's. A thread
+  per socket was chosen over an async client because tokio-tungstenite isn't in the tree
+  and a page has at most 64 open; the cost is a thread each.
+- **Bounded:** 64 open sockets per page and 16,384 made in all; messages up to 16 MB either
+  way; at most 64 MB received and not yet delivered per page (past that a connection stops
+  reading until the page catches up, so a paused page holds no more). Sockets aren't
+  releasable handles (they get events while the page holds no wrapper); a closed one keeps
+  only its URL, its listeners and handlers released.
+- **When the page goes**, its socket states and their command queues go with it; each
+  thread sees its queue disconnect, sends a close frame and ends
+  (`sockets_close_when_the_page_goes`).
+- **Replay:** each event is a step (`Step::Socket`); a replay makes the page's socket objects
+  but opens nothing (the test counts the server's connections) and the steps deliver what
+  the recording got.
+- **AI:** `WebSocket.*`, `Window.WebSocket` (its URL), `Event.data` and `Event.reason` are
+  hidden in redacted views; the test plants a message the page never shows and checks no
+  redacted view has it.
+- **Limitations:** text messages only (a binary one is dropped and logged; there's no
+  `ArrayBuffer`/`Blob` in the host), so `binaryType` is ignored; `bufferedAmount` is
+  always 0; no extensions (no compression); closing while still connecting waits for the
+  connection and closes it then. Events go to non-node objects through a small generic
+  mechanism (`Objects::target_listeners` and `handlers`, `RunningPack::dispatch_object`),
+  which IndexedDB uses too.
 
 ## Known local setup notes
 

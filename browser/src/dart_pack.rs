@@ -418,6 +418,9 @@ enum Helper {
     Set(String),
     /// `x0 => { globalThis.name = x0 }`
     SetGlobal(String),
+    /// `(x0, ...) => new Name(x0, ...)`: a constructor (`WebSocket`), which the host has as
+    /// a method of `window`.
+    Construct(String),
     Truthy,
     StrictEquals,
     LastIndexOf,
@@ -473,7 +476,7 @@ enum Helper {
 
 fn classify(body: &str) -> Helper {
     // The four shapes package:web's generated bindings compile to.
-    static SHAPES: OnceLock<[(Regex, fn(String) -> Helper); 5]> = OnceLock::new();
+    static SHAPES: OnceLock<[(Regex, fn(String) -> Helper); 6]> = OnceLock::new();
     let shapes = SHAPES.get_or_init(|| {
         [
             (Regex::new(r"^\(\) => globalThis\.(\w+)$").unwrap(), Helper::Global as fn(String) -> Helper),
@@ -481,6 +484,7 @@ fn classify(body: &str) -> Helper {
             (Regex::new(r"^x0 => x0\.(\w+)$").unwrap(), Helper::Get),
             (Regex::new(r"^\(x0,x1\) => \{ x0\.(\w+) = x1 \}$").unwrap(), Helper::Set),
             (Regex::new(r"^x0 => \{ globalThis\.(\w+) = x0 \}$").unwrap(), Helper::SetGlobal),
+            (Regex::new(r"^(?:\(\)|\(?x0(?:,x\d+)*\)?) => new (\w+)\((?:x\d+(?:,x\d+)*)?\)$").unwrap(), Helper::Construct),
         ]
     });
     let b = body.trim().trim_end_matches(',');
@@ -817,6 +821,12 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
             let args = host_args(caller, params)?;
             caller.data_mut().host.call(&args[0], method, &args[1..])?
         }
+        Helper::Construct(name) => {
+            let args = host_args(caller, params)?;
+            let host = &mut caller.data_mut().host;
+            let window = host.global("window")?;
+            host.call(&window, name, &args)?
+        }
         Helper::SetGlobal(name) => match (name.as_str(), to_host(caller, &params[0])?) {
             ("__dartPackDescribeError", HostValue::CallbackId(id)) => {
                 caller.data_mut().describe_error = Some(id);
@@ -988,6 +998,8 @@ mod tests {
         assert!(matches!(classify("(x0,x1) => { x0.textContent = x1 },"), Helper::Set(n) if n == "textContent"));
         assert!(matches!(classify("b => !!b,"), Helper::Truthy));
         assert!(matches!(classify("o => o"), Helper::Identity));
+        assert!(matches!(classify("x0 => new WebSocket(x0),"), Helper::Construct(n) if n == "WebSocket"));
+        assert!(matches!(classify("() => new Error().stack"), Helper::Stack));
         assert!(matches!(classify("x0 => eval(x0)"), Helper::Unsupported(_)));
     }
 

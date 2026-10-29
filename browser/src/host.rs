@@ -151,12 +151,21 @@ pub struct EventDetails {
     /// `hashchange`'s `oldURL` and `newURL`.
     pub old_url: Option<String>,
     pub new_url: Option<String>,
+    /// A WebSocket `message`'s `data`.
+    pub data: Option<String>,
+    /// A WebSocket `close`'s `code`, `reason` and `wasClean`.
+    pub close_code: Option<f64>,
+    pub reason: Option<String>,
+    pub was_clean: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct EventObj {
     pub kind: String,
+    /// The node it's dispatched at; for an object that isn't a node (a WebSocket), the
+    /// document root, with the object in `source`.
     pub target: NodeId,
+    pub source: Option<u32>,
     pub current_target: NodeId,
     pub details: EventDetails,
     pub default_prevented: bool,
@@ -191,9 +200,17 @@ pub enum Obj {
     ClassList(NodeId),
     Style(NodeId),
     Dataset(NodeId),
+    /// A `WebSocket`; its state is in `Objects::sockets`.
+    WebSocket,
 }
 
 impl Obj {
+    /// Objects that get events but aren't nodes: their listeners are in
+    /// `Objects::target_listeners`, their `on<event>` handlers in `Objects::handlers`.
+    fn is_event_target(&self) -> bool {
+        matches!(self, Obj::WebSocket)
+    }
+
     pub(crate) fn interface(&self) -> &'static str {
         match self {
             Obj::Window => "Window",
@@ -215,6 +232,7 @@ impl Obj {
             Obj::ClassList(_) => "DOMTokenList",
             Obj::Style(_) => "CSSStyleDeclaration",
             Obj::Dataset(_) => "DOMStringMap",
+            Obj::WebSocket => "WebSocket",
         }
     }
 }
@@ -367,10 +385,20 @@ pub struct Objects {
     views: HashMap<(NodeId, &'static str), u32>,
     /// Nodes listed in the `NodeList`s the page holds, which are host memory: bounded.
     listed: usize,
+    /// Listeners on objects that aren't nodes (`Obj::is_event_target`), by (handle, type).
+    pub target_listeners: HashMap<(u32, String), Vec<usize>>,
+    /// Their `on<event>` handlers, by (handle, event type).
+    pub handlers: HashMap<(u32, String), usize>,
+    /// The page's WebSockets, by handle, and how many it has made.
+    pub sockets: HashMap<u32, crate::websocket::Socket>,
+    sockets_made: usize,
+    /// What the page's connections received, for the UI thread to deliver.
+    pub inbox: crate::websocket::Inbox,
 }
 
 impl Default for Objects {
     fn default() -> Self {
+        let waker: std::sync::Arc<Mutex<Option<std::task::Waker>>> = Default::default();
         Self {
             objects: HashMap::new(),
             next_handle: 1,
@@ -389,11 +417,16 @@ impl Default for Objects {
             fetching: 0,
             body_bytes: 0,
             headers_of: HashMap::new(),
-            waker: Default::default(),
+            waker: waker.clone(),
             history_state: None,
             queued_events: Vec::new(),
             views: HashMap::new(),
             listed: 0,
+            target_listeners: HashMap::new(),
+            handlers: HashMap::new(),
+            sockets: HashMap::new(),
+            sockets_made: 0,
+            inbox: crate::websocket::Inbox { waker, ..Default::default() },
         }
     }
 }
@@ -432,12 +465,67 @@ impl Objects {
         self.add(Obj::Event(EventObj {
             kind: kind.to_string(),
             target,
+            source: None,
             current_target: target,
             details,
             default_prevented: false,
             propagation_stopped: false,
             immediate_propagation_stopped: false,
         }))
+    }
+
+    /// An event object for an object that isn't a node (`source`), dispatched with `root`.
+    pub fn object_event(&mut self, kind: &str, source: u32, root: NodeId, details: EventDetails) -> u32 {
+        let handle = self.event(kind, root, details);
+        if let Some(e) = self.event_mut(handle) {
+            e.source = Some(source);
+        }
+        handle
+    }
+
+    /// What runs for event `kind` on object `target`: its `on<kind>` handler, then its
+    /// listeners in order.
+    pub fn object_listeners(&self, target: u32, kind: &str) -> Vec<usize> {
+        let handler = self.handlers.get(&(target, kind.to_string())).copied();
+        handler.into_iter().chain(self.target_listeners.get(&(target, kind.to_string())).cloned().unwrap_or_default()).collect()
+    }
+
+    /// Object `target` gets no more events (a closed socket): its listeners and handlers go.
+    pub fn forget_target(&mut self, target: u32) {
+        let ids: Vec<usize> = self.handlers.iter().filter(|((h, _), _)| *h == target).map(|(_, id)| *id).collect();
+        self.handlers.retain(|(h, _), _| *h != target);
+        let listed: Vec<usize> = self.target_listeners.iter().filter(|((h, _), _)| *h == target).flat_map(|(_, ids)| ids.clone()).collect();
+        self.target_listeners.retain(|(h, _), _| *h != target);
+        for id in ids.into_iter().chain(listed) {
+            self.release_if_unused(id);
+        }
+    }
+
+    /// Apply what happened on socket `handle` to its state. Returns the event to dispatch
+    /// (type and details), if any: an `open` for a socket the page has already closed isn't.
+    pub fn socket_changed(&mut self, handle: u32, event: &crate::websocket::SocketEvent) -> Option<(&'static str, EventDetails)> {
+        use crate::websocket::SocketEvent;
+        let socket = self.sockets.get_mut(&handle)?;
+        if socket.state == 3 {
+            return None;
+        }
+        Some(match event {
+            SocketEvent::Open { protocol } => {
+                if socket.state != 0 {
+                    return None;
+                }
+                socket.state = 1;
+                socket.protocol = protocol.clone();
+                ("open", EventDetails::default())
+            }
+            SocketEvent::Message(text) => ("message", EventDetails { data: Some(text.clone()), ..Default::default() }),
+            SocketEvent::Error => ("error", EventDetails::default()),
+            SocketEvent::Close { code, reason, clean } => {
+                socket.state = 3;
+                socket.commands = None;
+                ("close", EventDetails { close_code: Some(*code as f64), reason: Some(reason.clone()), was_clean: Some(*clean), ..Default::default() })
+            }
+        })
     }
 
     pub fn event_mut(&mut self, handle: u32) -> Option<&mut EventObj> {
@@ -560,7 +648,8 @@ impl Objects {
         let in_listeners = self.listeners.values().any(|ids| ids.contains(&callback));
         let in_timers = self.timers.values().any(|t| t.callback == callback);
         let in_promises = self.promises.values().flat_map(|p| &p.reactions).any(|(f, r)| *f == Some(callback) || *r == Some(callback));
-        if !in_listeners && !in_timers && !in_promises {
+        let on_objects = self.target_listeners.values().any(|ids| ids.contains(&callback)) || self.handlers.values().any(|id| *id == callback);
+        if !in_listeners && !in_timers && !in_promises && !on_objects {
             self.released_callbacks.push(callback);
         }
     }
@@ -940,6 +1029,60 @@ impl PageHost {
         Ok(HostValue::Object(promise))
     }
 
+    /// `new WebSocket(url, protocols)`: a socket that connects through the gate on a thread of
+    /// its own (`websocket.rs`); what happens arrives as events (`deliver_sockets`). Replaying,
+    /// nothing connects: the recorded events arrive as steps.
+    fn web_socket(&mut self, args: &[HostValue]) -> Result<HostValue> {
+        use crate::websocket::{self, Socket, SocketEvent};
+        let page = self.doc.borrow().url().clone();
+        let input = args.first().context("WebSocket: missing argument 0")?.display();
+        let mut url = page.join(&input).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {input:?} ({e})"))?;
+        let scheme = match url.scheme() {
+            "ws" | "http" => "ws",
+            "wss" | "https" => "wss",
+            other => bail!("SyntaxError: a WebSocket URL can't be {other}:"),
+        };
+        let _ = url.set_scheme(scheme);
+        if url.fragment().is_some() {
+            bail!("SyntaxError: a WebSocket URL can't have a fragment");
+        }
+        // Mixed content: a secure page's sockets are secure too.
+        if page.scheme() == "https" && scheme == "ws" {
+            bail!("SecurityError: an https page can't open an insecure WebSocket ({url})");
+        }
+        let protocols: Vec<String> = match args.get(1) {
+            Some(v @ HostValue::Object(_)) => match self.objects.borrow().to_json(v)? {
+                Some(serde_json::Value::Array(items)) => items.iter().map(|i| i.as_str().map(str::to_string).unwrap_or_else(|| i.to_string())).collect(),
+                _ => Vec::new(),
+            },
+            Some(HostValue::Str(_)) => vec![args[1].display()],
+            _ => Vec::new(),
+        };
+        let mut objects = self.objects.borrow_mut();
+        if objects.sockets.values().filter(|s| s.state < 3).count() >= websocket::MAX_OPEN || objects.sockets_made >= websocket::MAX_SOCKETS {
+            bail!("the page has too many WebSockets");
+        }
+        objects.sockets_made += 1;
+        let handle = objects.add(Obj::WebSocket);
+        let inbox = objects.inbox.clone();
+        let commands = match (&self.env.gate, objects.tape.replaying()) {
+            (_, true) => None,
+            (Some(gate), false) => match gate.allow(&url, Some(&page)) {
+                Ok(()) => Some(websocket::connect(handle, url.clone(), &page, protocols, inbox.clone())),
+                Err(_) => None,
+            },
+            (None, false) => None,
+        };
+        // Refused or no network: it fails like a connection that went nowhere, delivered (and
+        // recorded) as any other outcome is.
+        if commands.is_none() && !objects.tape.replaying() {
+            inbox.push(handle, SocketEvent::Error);
+            inbox.push(handle, SocketEvent::Close { code: 1006, reason: String::new(), clean: false });
+        }
+        objects.sockets.insert(handle, Socket { url: url.to_string(), state: 0, protocol: String::new(), commands });
+        Ok(HostValue::Object(handle))
+    }
+
     /// xorshift64: fast, and good enough for a page's Math.random.
     fn next_random(&mut self) -> u64 {
         self.rng ^= self.rng << 13;
@@ -1104,8 +1247,13 @@ impl PageHost {
         let d = &e.details;
         Some(match prop {
             "type" => HostValue::str(&e.kind),
+            "target" | "currentTarget" if e.source.is_some() => HostValue::Object(e.source.unwrap_or_default()),
             "target" => self.objects.borrow_mut().element(e.target),
             "currentTarget" => self.objects.borrow_mut().element(e.current_target),
+            "data" if d.data.is_some() => HostValue::str(d.data.as_deref().unwrap_or_default()),
+            "code" if d.close_code.is_some() => num(d.close_code),
+            "reason" if d.reason.is_some() => HostValue::str(d.reason.as_deref().unwrap_or_default()),
+            "wasClean" if d.was_clean.is_some() => HostValue::Bool(d.was_clean.unwrap_or_default()),
             "defaultPrevented" => HostValue::Bool(e.default_prevented),
             "clientX" | "x" => num(d.client_x),
             "clientY" | "y" => num(d.client_y),
@@ -1303,6 +1451,25 @@ impl PageHost {
                     _ => HostValue::str(&style_value(&declarations, &kebab(prop))),
                 }
             }
+            (Obj::WebSocket, _) => {
+                let HostValue::Object(handle) = target else { bail!("not a socket") };
+                let objects = self.objects.borrow();
+                let socket = objects.sockets.get(handle).context("this socket is no longer available")?;
+                match prop {
+                    "url" => HostValue::str(&socket.url),
+                    "readyState" => HostValue::Num(socket.state as f64),
+                    "protocol" => HostValue::str(&socket.protocol),
+                    "extensions" => HostValue::str(""),
+                    "bufferedAmount" => HostValue::Num(0.0),
+                    "binaryType" => HostValue::str("blob"),
+                    "CONNECTING" => HostValue::Num(0.0),
+                    "OPEN" => HostValue::Num(1.0),
+                    "CLOSING" => HostValue::Num(2.0),
+                    "CLOSED" => HostValue::Num(3.0),
+                    p if p.starts_with("on") => HostValue::Null,
+                    _ => bail!("WebSocket.{prop} is not supported yet"),
+                }
+            }
             (Obj::Element(id), "textContent") => HostValue::str(&self.doc.borrow().get_node(*id).context("removed")?.text_content()),
             (Obj::Element(id), "tagName") => {
                 let doc = self.doc.borrow();
@@ -1374,6 +1541,21 @@ impl PageHost {
                 self.go_to(&target, false)?;
                 return Ok(());
             }
+            // `socket.onmessage = f`: one handler per event type, run before the listeners.
+            (o, p) if o.is_event_target() && p.starts_with("on") => {
+                let HostValue::Object(handle) = target else { bail!("not an object") };
+                let key = (*handle, p["on".len()..].to_string());
+                let mut objects = self.objects.borrow_mut();
+                let old = match value {
+                    HostValue::CallbackId(id) => objects.handlers.insert(key, *id),
+                    _ => objects.handlers.remove(&key),
+                };
+                if let Some(old) = old.filter(|old| Some(old) != match value { HostValue::CallbackId(id) => Some(id), _ => None }) {
+                    objects.release_if_unused(old);
+                }
+                return Ok(());
+            }
+            (Obj::WebSocket, "binaryType") => return Ok(()),
             (Obj::Dataset(id), _) => {
                 self.set_attr(*id, &data_attribute(prop), Some(&value.display()));
                 return Ok(());
@@ -1486,6 +1668,57 @@ impl PageHost {
                 // Adding the same listener twice has no effect (DOM spec).
                 if !ids.contains(&id) {
                     ids.push(id);
+                }
+                HostValue::Undefined
+            }
+            (o, "addEventListener" | "removeEventListener") if o.is_event_target() => {
+                let HostValue::Object(handle) = target else { bail!("not an object") };
+                let (kind, id) = (text(0)?, callback(1)?);
+                let mut objects = self.objects.borrow_mut();
+                let ids = objects.target_listeners.entry((*handle, kind)).or_default();
+                match method {
+                    "addEventListener" if !ids.contains(&id) => ids.push(id),
+                    "addEventListener" => {}
+                    _ => {
+                        ids.retain(|l| *l != id);
+                        objects.release_if_unused(id);
+                    }
+                }
+                HostValue::Undefined
+            }
+            (Obj::Window, "WebSocket") => self.web_socket(args)?,
+            (Obj::WebSocket, "send" | "close") => {
+                let HostValue::Object(handle) = target else { bail!("not a socket") };
+                let mut objects = self.objects.borrow_mut();
+                let socket = objects.sockets.get_mut(handle).context("this socket is no longer available")?;
+                match (method, socket.state) {
+                    ("send", 0) => bail!("InvalidStateError: the WebSocket is still connecting"),
+                    ("send", 1) => {
+                        let data = text(0)?;
+                        if data.len() > crate::websocket::MAX_MESSAGE {
+                            bail!("the message is over {} MB", crate::websocket::MAX_MESSAGE >> 20);
+                        }
+                        if let Some(commands) = &socket.commands {
+                            let _ = commands.send(crate::websocket::Command::Send(data));
+                        }
+                    }
+                    // Closing or closed: sends are dropped, as in browsers.
+                    ("send", _) | ("close", 2 | 3) => {}
+                    _ => {
+                        let code = match args.first() {
+                            Some(HostValue::Num(code)) if *code == 1000.0 || (3000.0..5000.0).contains(code) => *code as u16,
+                            None | Some(HostValue::Undefined) => 1000,
+                            Some(other) => bail!("InvalidAccessError: {} isn't a close code a page may use", other.display()),
+                        };
+                        let reason = args.get(1).filter(|v| !matches!(v, HostValue::Undefined)).map(HostValue::display).unwrap_or_default();
+                        if reason.len() > 123 {
+                            bail!("SyntaxError: the close reason is over 123 bytes");
+                        }
+                        socket.state = 2;
+                        if let Some(commands) = &socket.commands {
+                            let _ = commands.send(crate::websocket::Command::Close { code, reason });
+                        }
+                    }
                 }
                 HostValue::Undefined
             }

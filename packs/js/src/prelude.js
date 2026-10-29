@@ -23,6 +23,7 @@
     'getElementById', 'querySelectorAll', 'createTextNode', 'item', 'insertBefore', 'replaceChild',
     'removeChild', 'cloneNode', 'hasAttribute', 'contains', 'getBoundingClientRect', 'focus', 'blur',
     'add', 'toggle', 'setProperty', 'getPropertyValue', 'removeProperty',
+    'WebSocket', 'send', 'close',
   ]);
   // Storage's methods. Kept apart because `key` is also a property (of keyboard events).
   const STORAGE_METHODS = new Set(['getItem', 'setItem', 'removeItem', 'clear', 'key']);
@@ -158,6 +159,13 @@
   globalThis.scrollTo = (...args) => window.scrollTo(...args);
   globalThis.scrollBy = (...args) => window.scrollBy(...args);
   globalThis.history = window.history;
+  // `new WebSocket(url, protocols)` makes a host socket (the constructor returns it).
+  globalThis.WebSocket = class WebSocket {
+    constructor(url, protocols) {
+      return window.WebSocket(String(url), protocols);
+    }
+  };
+  Object.assign(globalThis.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   globalThis.localStorage = window.localStorage;
   globalThis.sessionStorage = window.sessionStorage;
 

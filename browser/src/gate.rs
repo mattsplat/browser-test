@@ -135,7 +135,7 @@ impl Gate {
 
     /// Decide whether `url` may be fetched for `page` (None: a navigation or browser UI),
     /// and record the decision.
-    fn allow(&self, url: &Url, page: Option<&Url>) -> Result<(), String> {
+    pub(crate) fn allow(&self, url: &Url, page: Option<&Url>) -> Result<(), String> {
         // Settings only matter for page-initiated requests; don't read them otherwise.
         let verdict = match page {
             Some(_) => decide(&settings::get(), self.block_all(), url, page),

@@ -106,7 +106,8 @@ Ok(startup.finish(Box::new(runtime)))
 
 - **Dart:** only what dart2wasm emits:
   - `dart2wasm` helpers, recognised by their snippet in the embedded import table and
-    routed to the host by shape (global, get, set, call);
+    routed to the host by shape (global, get, set, call, and `new Name(...)`, which calls
+    `window.Name(...)`);
   - `wasm:js-string` builtins;
   - string constants;
   - the exception tag.
@@ -321,9 +322,9 @@ not read time or randomness any other way.
 - Each page has its own `Store`, `PageHost` and `Objects`. Two pages, even in the same
   language, share nothing but compiled code. `each_page_gets_a_fresh_instance` checks this.
 - A page runs one pack, so packs on one page can't see each other.
-- No pack reaches the network except through the host: `fetch` is a host call that goes
-  through the page's gate (third-party rules, logging, block-all). There is no
-  `XMLHttpRequest` or socket. Requests a page causes (scripts, imports, Dart programs) go
+- No pack reaches the network except through the host: `fetch` and `WebSocket` are host
+  calls that go through the page's gate (third-party rules, logging, block-all). There is
+  no `XMLHttpRequest`, and WASI gives the interpreters no sockets. Requests a page causes (scripts, imports, Dart programs) go
   through the gate too.
 - No pack can reach files, the environment or processes. `js_has_no_side_doors` and
   `python_has_no_side_doors` check this.
@@ -384,7 +385,7 @@ packed JSON reply.
   - The globals are `window`, `document`, `console`, `Math`, `setTimeout`, `setInterval`,
     `clearTimeout`, `clearInterval`, `requestAnimationFrame`, `cancelAnimationFrame`,
     `fetch` (callbacks: `fetch(url).then(on_value, on_error)`), `localStorage`,
-    `sessionStorage`, `location`, `history` and `navigator`. `print` goes to the console.
+    `sessionStorage`, `location`, `history`, `navigator` and `WebSocket`. `print` goes to the console.
   - Members use Web IDL's camelCase names (`document.querySelector`, `el.textContent`).
   - Numbers from the host that are whole come back as `int`, so `e.clientX` prints `10`,
     not `10.0`.

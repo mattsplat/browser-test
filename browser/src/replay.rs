@@ -79,6 +79,8 @@ pub enum Step {
     Traverse { url: String, state: Option<String> },
     /// A `fetch` finished: its promise (a handle) and what it resolved with.
     Fetch { promise: u32, result: Result<crate::gate::FetchResponse, String> },
+    /// Something happened on a WebSocket (by handle): opened, a message, an error, closed.
+    Socket { socket: u32, event: crate::websocket::SocketEvent },
 }
 
 impl Step {
@@ -92,6 +94,12 @@ impl Step {
             Step::Traverse { url, .. } => format!("moved to {url}"),
             Step::Fetch { result: Ok(r), .. } => format!("fetch answered ({})", r.status),
             Step::Fetch { result: Err(_), .. } => "fetch failed".into(),
+            Step::Socket { event, .. } => format!("WebSocket {}", match event {
+                crate::websocket::SocketEvent::Open { .. } => "opened",
+                crate::websocket::SocketEvent::Message(_) => "message",
+                crate::websocket::SocketEvent::Error => "error",
+                crate::websocket::SocketEvent::Close { .. } => "closed",
+            }),
         }
     }
 }
@@ -123,6 +131,12 @@ impl Step {
             Step::Fetch { result, .. } => match result {
                 Ok(r) => r.url.len() + r.body.len() + r.headers.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>(),
                 Err(e) => e.len(),
+            },
+            Step::Socket { event, .. } => match event {
+                crate::websocket::SocketEvent::Message(text) => text.len(),
+                crate::websocket::SocketEvent::Open { protocol } => protocol.len(),
+                crate::websocket::SocketEvent::Close { reason, .. } => reason.len(),
+                crate::websocket::SocketEvent::Error => 0,
             },
         }
     }
