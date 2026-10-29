@@ -77,7 +77,8 @@ pub fn init(name: &str) -> Result<(), String> {
     if !valid_name(name) {
         return Err(format!("\"{name}\" isn't a valid profile name (letters, digits, spaces, - and _)"));
     }
-    let dirs = app_dirs().ok_or("no app data folder")?;
+    // No app folder (some mobile targets): run with everything in memory, as before.
+    let Some(dirs) = app_dirs() else { return Ok(()) };
     let dir = dirs.data_dir().join("profiles").join(name);
     let made = if name == DEFAULT {
         migrate_legacy(dirs.config_dir(), dirs.data_dir(), &dir)
