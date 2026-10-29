@@ -8,7 +8,9 @@ browser): the gate, the Dart pack (with dev mode and source maps), the JS pack, 
 per-site policy screen. Phase A is done, Phase B is done apart from breakpoints and DAP
 (the Inspector, AI access and AI control; see "Step 7 notes"), and Phase C is done apart
 from bookmarks (see "Phase C notes"). Phase D is done: the pack contract is written down in
-`docs/packs.md` and Python is a third pack (see "Phase D notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
+`docs/packs.md` and Python is a third pack (see "Phase D notes"). Phase E is done: per-site
+CSS, Split View, hot reload with state restoration, the Handles and Profiler views, a Dart
+compiled-code cache and time-travel replay (see "Phase E notes"). Run it with `cd browser && cargo run --release -- <url>`. Dart demo:
 `packs/dart/build.sh examples/counter/main.dart`, then open
 `file://<repo>/examples/counter/index.html`.
 
@@ -307,6 +309,8 @@ handle inspector and profiler, shared compiled-runtime cache, time-travel replay
   not just user input (principle 4 already routes all of these through the host).
 - Shared cache: share compiled modules and immutable assets only, never mutable state across
   origins. (Already the JS engine's model: one compiled module, a fresh instance per page.)
+**Done**, see "Phase E notes". Not done: a draggable split divider, reload by replay, and
+saving recordings to share.
 
 ### JS permission
 
@@ -350,9 +354,9 @@ each relates to what's built.
 | Vertical tabs | High | Low–medium | **Done** (Phase C): Settings → Tab layout; `tab_strip.rs` |
 | Spaces and profiles | Very high | Medium–high | **Done** (Phase C): spaces in `tab_manager.rs`; a profile is its own data folder and process (`profile.rs`) |
 | Command palette | High | Low | **Done** (Phase C): `command_palette.rs`, Cmd+K / Cmd+Shift+P |
-| Split View | High | Medium–high | Two page documents side by side in one window; each already gets its own gate view and pack |
+| Split View | High | Medium–high | **Done** (Phase E): palette "Split with tab"; fixed 50/50 (`tab_manager.rs`) |
 | Automatic tab management | High | Low–medium | **Done** (Phase C): pinned tabs, closing idle tabs, reopen closed, session restore (`tab_manager.rs`) |
-| Website CSS customization | Medium | Medium | Per-site user stylesheets; would sit alongside the Site panel's per-site settings |
+| Website CSS customization | Medium | Medium | **Done** (Phase E): Site panel → Custom CSS (`site_css.rs`) |
 | Rust/WASM scripting | Specialized | Very high | Partly built: the Dart pack already runs Wasm on the host dispatcher. A Rust pack would need its own way to describe host calls (Rust has no dart2wasm-style import table) |
 | `document.cookie` for Wasm and JS | High | Low–medium | See "Web platform parity": expose the existing cookie jar per origin, hiding `HttpOnly` cookies |
 | Replaceable scripting engine | Specialized | Extremely high | Largely built: language packs (Dart, JS, Python) behind one `Host` interface and `PackRuntime` trait. Adding Python changed no core behaviour (see "Phase D notes") |
