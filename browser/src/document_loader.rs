@@ -17,6 +17,7 @@ use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
 use crate::host::{self, TraceEntry};
+use crate::js_permission;
 use crate::prompt;
 use crate::settings::{self, Grant};
 use crate::history::{BrowserNavProvider, History, SyncStore};
@@ -220,9 +221,15 @@ async fn build_page_document(
         if scripts.is_empty() {
             return (SubDocumentAttr::new(document), title, favicon_url);
         }
-        if !settings::get().js_sites.contains(&origin) {
-            trace_pack_load("js", document.url(), format!("skipped {} script(s): JS is off for {origin}", scripts.len()));
-            return (SubDocumentAttr::new(document), title, favicon_url);
+        match js_permission::decide(&settings::get(), js_permission::allowed_this_visit(&origin), &origin) {
+            js_permission::JsDecision::Run => {}
+            js_permission::JsDecision::Skip { reason, offer } => {
+                trace_pack_load("js", document.url(), format!("skipped {} script(s): {reason}", scripts.len()));
+                if offer {
+                    js_permission::offer(&origin, scripts.len());
+                }
+                return (SubDocumentAttr::new(document), title, favicon_url);
+            }
         }
         let sources = fetch_js_sources(&scripts, &page_url, net_provider, signal).await;
         // Module imports come through the gate too, as requests from this page.

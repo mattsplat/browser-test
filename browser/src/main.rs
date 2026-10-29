@@ -34,6 +34,7 @@ mod dev_compile;
 mod gate;
 mod host;
 mod js_pack;
+mod js_permission;
 mod page_document;
 mod prompt;
 mod request_panel;
@@ -223,6 +224,7 @@ fn app() -> Element {
                 open_panel,
             }
             prompt::PromptBar {}
+            js_permission::JsBar { tabs, active_tab_id }
             for tab in tabs.iter() {
                 TabWebView {
                     key: "{tab.tab_id()}",

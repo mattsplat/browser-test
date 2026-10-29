@@ -533,3 +533,9 @@ body,
   border-color: #2E7D32;
   color: white;
 }
+
+/* JS permission bar: same shape as the dev prompt, quieter colour (it never blocks) */
+.js-bar {
+  background: #F3F6FB;
+  border-bottom-color: #C9D6EA;
+}

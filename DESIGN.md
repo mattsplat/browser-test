@@ -238,6 +238,12 @@ runs the same page in Dart and JS and expects identical output):
   evaluates it, each module once. Not supported yet: import maps (bare specifiers like
   `import "lodash"` error clearly), `import()` from classic scripts. Demo:
   `examples/js-modules`.
+- JS permission (`js_permission.rs`, rules tested in `decide`): a global default (**Ask**, Off
+  or Allow; shipped as Ask), per-site "Always allow" and "Keep off" (saved), and "Allow this
+  visit" (until the browser quits). With Ask, a page with scripts renders without JS at once
+  and a non-blocking bar offers Allow this visit / Always allow / Keep off / ×; Keep off and ×
+  stop it reappearing. The Site panel shows the site's state (cycle: default → always allowed
+  → kept off) and the global default.
 - Timers: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` (plus
   `requestAnimationFrame`), host-owned so time comes from the host (principle 4).
 - `removeEventListener` with correct listener identity and cleanup.
@@ -283,8 +289,7 @@ handle inspector and profiler, shared compiled-runtime cache, time-travel replay
   (Unlike the dev-mode prompt, it never holds up the page.) Choices persist and are editable
   in the Site panel.
 - A global default JS policy.
-  **Decision needed:** the shipped default. Off (principle 1 as written), Ask (the bar), or
-  Allow (compatibility). "Ask" on every site with scripts would interrupt constantly, since
+  **Decided:** ships as **Ask** (configurable: Off, Ask, Allow). "Ask" on every site with scripts would interrupt constantly, since
   almost every site has scripts, so the bar must be quiet and dismissible.
 - **Correction (third-party):** JS permission is per *page* origin. Scripts from other sites
   are already governed by the third-party request rule, so allowing JS for a page never

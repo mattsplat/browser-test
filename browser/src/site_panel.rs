@@ -5,6 +5,7 @@ use std::time::Duration;
 use dioxus_native::prelude::*;
 
 use crate::gate::Gate;
+use crate::js_permission;
 use crate::settings::{self, Grant};
 use crate::tab::{Tab, TabId, TabStoreImplExt, active_tab};
 use crate::history::HistoryNav;
@@ -64,7 +65,18 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
     let _ = changes();
     let current = settings::get();
     let dart_on = !current.dart_blocked.contains(&origin);
-    let js_on = current.js_sites.contains(&origin);
+    // This site's JavaScript state: its own choice, or the global default.
+    let this_visit = js_permission::allowed_this_visit(&origin);
+    let (js_text, js_class) = if current.js_blocked.contains(&origin) {
+        ("Kept off".to_string(), "request-toggle on")
+    } else if current.js_sites.contains(&origin) {
+        ("Always allowed".to_string(), "request-toggle allowed")
+    } else if this_visit {
+        ("Allowed this visit".to_string(), "request-toggle allowed")
+    } else {
+        (format!("Default ({})", current.js_default.label()), "request-toggle")
+    };
+    let js_default = current.js_default;
     let grant = current.dev_grants.get(&origin).copied();
     let allowed_sites = current.allowed_third_party.get(&origin).cloned().unwrap_or_default();
 
@@ -78,14 +90,20 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
         }))
     };
     let o = origin.clone();
-    let toggle_js = move |_| {
+    // Cycles: default → always allowed → kept off → default.
+    let cycle_js = move |_| {
         let o = o.clone();
+        js_permission::revoke_this_visit(&o);
+        js_permission::clear_offer(&o);
         apply(changes, Box::new(move |s| {
-            if !s.js_sites.remove(&o) {
+            if s.js_sites.remove(&o) {
+                s.js_blocked.insert(o);
+            } else if !s.js_blocked.remove(&o) {
                 s.js_sites.insert(o);
             }
         }))
     };
+    let cycle_default = move |_| apply(changes, Box::new(|s| s.js_default = s.js_default.next()));
     let o = origin.clone();
     let reset_grant = move |_| {
         let o = o.clone();
@@ -118,10 +136,12 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
                     }
                 }
                 div { class: "site-row",
-                    span { "JavaScript (off by default)" }
-                    div { class: if js_on { "request-toggle allowed" } else { "request-toggle" }, onclick: toggle_js,
-                        if js_on { "Allowed" } else { "Off" }
-                    }
+                    span { "JavaScript" }
+                    div { class: js_class, onclick: cycle_js, "{js_text}" }
+                }
+                div { class: "site-row",
+                    span { "JavaScript default (all sites)" }
+                    div { class: "request-toggle", onclick: cycle_default, "{js_default.label()}" }
                 }
                 div { class: "site-row",
                     span { "Dev mode: compile Dart source ({grant_text})" }

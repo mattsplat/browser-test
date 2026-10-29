@@ -7,6 +7,36 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+/// What happens on a site with scripts when the user hasn't chosen for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JsDefault {
+    /// Run without JS and offer to enable it (a non-blocking bar).
+    #[default]
+    Ask,
+    /// Run without JS, silently. Enable per site in the Site panel.
+    Off,
+    /// Run JS (compatibility).
+    Allow,
+}
+
+impl JsDefault {
+    pub fn label(self) -> &'static str {
+        match self {
+            JsDefault::Ask => "Ask",
+            JsDefault::Off => "Off",
+            JsDefault::Allow => "Allow",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            JsDefault::Ask => JsDefault::Off,
+            JsDefault::Off => JsDefault::Allow,
+            JsDefault::Allow => JsDefault::Ask,
+        }
+    }
+}
+
 /// A per-site answer to "compile and run Dart source?".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Grant {
@@ -21,8 +51,12 @@ pub struct Settings {
     pub dev_mode: bool,
     /// Dev-mode compile grants, by origin (e.g. "https://myapp.test", "file://").
     pub dev_grants: BTreeMap<String, Grant>,
-    /// Origins where the JS pack may run. JS is off everywhere else (principle 1).
+    /// What sites with scripts get when the user hasn't chosen for them.
+    pub js_default: JsDefault,
+    /// Origins where JS always runs ("Always allow").
     pub js_sites: BTreeSet<String>,
+    /// Origins where JS never runs and isn't offered ("Keep off").
+    pub js_blocked: BTreeSet<String>,
     /// Origins where the Dart pack may not run. Dart is on everywhere else.
     pub dart_blocked: BTreeSet<String>,
     /// Refuse requests a page makes to other sites, unless allowed for that page's origin.
@@ -36,7 +70,9 @@ impl Default for Settings {
         Self {
             dev_mode: false,
             dev_grants: BTreeMap::new(),
+            js_default: JsDefault::Ask,
             js_sites: BTreeSet::new(),
+            js_blocked: BTreeSet::new(),
             dart_blocked: BTreeSet::new(),
             // Default-deny for third-party requests, as the design says.
             block_third_party: true,
