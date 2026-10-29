@@ -351,6 +351,9 @@ pub fn console(origin: &str, privacy: Privacy, limit: usize) -> Vec<ConsoleEntry
             // A failed call that carries secrets (a quota error from `Storage.setItem(k, v)`).
             if privacy == Privacy::Redacted && e.kind == TraceKind::Error && holds_secrets(&e.call) {
                 entry.context = format!("{}({HIDDEN})", e.call);
+                // Its message may echo them too; keep only the error's name.
+                let name = entry.text.split(':').next().filter(|n| n.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("Error");
+                entry.text = format!("{name}: {HIDDEN}");
             }
             Some(entry)
         })
@@ -380,14 +383,14 @@ pub const HIDDEN: &str = "(hidden)";
 
 /// Host calls whose arguments or results carry what AI access must never see: cookie values,
 /// stored values, request and response bodies and headers, the page's full URLs and history
-/// state (AI sees URLs only redacted), WebSocket URLs and messages, IndexedDB values, and form fields' values: `value` and `checked`, and
+/// state (AI sees URLs only redacted), WebSocket URLs and messages, IndexedDB values, keys typed into form fields (`FieldKeyEvent.key`/`code`), and form fields' values: `value` and `checked`, and
 /// HTML read or written with `innerHTML`/`outerHTML` (which can hold a field's value, so
 /// they're hidden on every element rather than only on forms).
 pub fn holds_secrets(call: &str) -> bool {
     let member = call.trim_end_matches(" =");
     // Plain objects and arrays hold parsed responses, history states and fetch inits.
-    const INTERFACES: [&str; 15] = [
-        "Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array.", "WebSocket.", "XMLHttpRequest.",
+    const INTERFACES: [&str; 16] = [
+        "Storage.", "Response.", "Headers.", "Promise.", "Location.", "History.", "Object.", "Array.", "WebSocket.", "XMLHttpRequest.", "FieldKeyEvent.",
         "IDBFactory.", "IDBRequest.", "IDBDatabase.", "IDBTransaction.", "IDBObjectStore.",
     ];
     INTERFACES.iter().any(|p| member.starts_with(p))

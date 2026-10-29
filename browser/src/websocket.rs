@@ -34,10 +34,18 @@ use tungstenite::{Message, WebSocket};
 pub const MAX_OPEN: usize = 64;
 /// Sockets a page may make in all (each closed one leaves a small object behind).
 pub const MAX_SOCKETS: usize = 16 * 1024;
-/// The largest message, in bytes, either way.
-pub const MAX_MESSAGE: usize = 16 << 20;
-/// Bytes a page may have received and not yet had delivered.
+/// The largest message, in bytes, either way. Small enough that the page's open sockets,
+/// each reading one more message after checking `MAX_PENDING`, add at most 64 MB over it.
+pub const MAX_MESSAGE: usize = 1 << 20;
+/// Bytes a page may have received and not yet had delivered (each event also counts
+/// `EVENT_BYTES`, so empty messages are bounded too).
 const MAX_PENDING: usize = 64 << 20;
+const EVENT_BYTES: usize = 64;
+/// Bytes one socket may have queued to send (`bufferedAmount`); past that, `send` throws.
+pub const MAX_BUFFERED: usize = 16 << 20;
+/// Connections the whole browser (every tab of the profile) may have open at once.
+const MAX_CONNECTIONS: usize = 512;
+static CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 /// How long connecting and the handshake may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often an open connection checks for something to send while waiting to read.
@@ -68,6 +76,8 @@ pub struct Socket {
     pub protocol: String,
     /// To the connection's thread; None once closed (or for a socket that never connected).
     pub commands: Option<Sender<Command>>,
+    /// Bytes queued to send and not yet sent (`bufferedAmount`), shared with the thread.
+    pub buffered: Arc<AtomicUsize>,
 }
 
 /// Events from every connection of one page, with the bytes waiting in them.
@@ -80,9 +90,7 @@ pub struct Inbox {
 
 impl Inbox {
     pub fn push(&self, socket: u32, event: SocketEvent) {
-        if let SocketEvent::Message(text) = &event {
-            self.pending.fetch_add(text.len(), Ordering::Relaxed);
-        }
+        self.pending.fetch_add(event_bytes(&event), Ordering::Relaxed);
         self.events.lock().unwrap().push((socket, event));
         if let Some(w) = self.waker.lock().unwrap().as_ref() {
             w.wake_by_ref();
@@ -92,10 +100,14 @@ impl Inbox {
     /// Events not yet delivered, oldest first.
     pub fn take(&self) -> Vec<(u32, SocketEvent)> {
         let events = std::mem::take(&mut *self.events.lock().unwrap());
-        let bytes: usize = events.iter().map(|(_, e)| if let SocketEvent::Message(t) = e { t.len() } else { 0 }).sum();
+        let bytes: usize = events.iter().map(|(_, e)| event_bytes(e)).sum();
         self.pending.fetch_sub(bytes.min(self.pending.load(Ordering::Relaxed)), Ordering::Relaxed);
         events
     }
+}
+
+fn event_bytes(event: &SocketEvent) -> usize {
+    EVENT_BYTES + if let SocketEvent::Message(t) = event { t.len() } else { 0 }
 }
 
 /// The `http(s)` URL whose cookies a `ws(s)` URL gets.
@@ -123,7 +135,7 @@ pub fn addresses(host: &str, port: u16, public_only: bool) -> Result<Vec<SocketA
 
 /// Connect socket `id` to `url` for `page` on a thread of its own, reporting to `inbox`. The
 /// gate has already allowed it. Returns the queue for the page's commands.
-pub fn connect(id: u32, url: Url, page: &Url, protocols: Vec<String>, inbox: Inbox) -> Sender<Command> {
+pub fn connect(id: u32, url: Url, page: &Url, protocols: Vec<String>, inbox: Inbox, buffered: Arc<AtomicUsize>) -> Sender<Command> {
     let (tx, rx) = std::sync::mpsc::channel();
     let origin = page.origin().ascii_serialization();
     let scope = if crate::gate::cross_site(page, &cookie_url(&url)) { CookieScope::CrossSite } else { CookieScope::SameSite };
@@ -132,12 +144,22 @@ pub fn connect(id: u32, url: Url, page: &Url, protocols: Vec<String>, inbox: Inb
     let reporter = inbox.clone();
     let spawned = std::thread::Builder::new().name("websocket".into()).spawn(move || {
         let request = Handshake { url, origin, cookies, protocols };
-        match open(&request, public_only) {
+        if CONNECTIONS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+            CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+            tracing::info!("WebSocket refused: the browser has {MAX_CONNECTIONS} open");
+            inbox.push(id, SocketEvent::Error);
+            inbox.push(id, SocketEvent::Close { code: 1006, reason: String::new(), clean: false });
+            return;
+        }
+        let opened = open(&request, public_only);
+        match opened {
             Ok((socket, protocol)) => {
                 inbox.push(id, SocketEvent::Open { protocol });
-                run(id, socket, rx, &inbox);
+                run(id, socket, rx, &inbox, &buffered);
+                CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
             }
             Err(why) => {
+                CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                 tracing::info!("WebSocket {} failed: {why}", request.url);
                 inbox.push(id, SocketEvent::Error);
                 inbox.push(id, SocketEvent::Close { code: 1006, reason: String::new(), clean: false });
@@ -257,12 +279,15 @@ fn open(request: &Handshake, public_only: bool) -> Result<(WebSocket<Stream>, St
 
 /// An open connection: send what the page asks, deliver what arrives, until either side
 /// closes it or the page goes (its command queue disconnects).
-fn run(id: u32, mut socket: WebSocket<Stream>, commands: Receiver<Command>, inbox: &Inbox) {
+fn run(id: u32, mut socket: WebSocket<Stream>, commands: Receiver<Command>, inbox: &Inbox, buffered: &AtomicUsize) {
     let mut closing = false;
     loop {
         match commands.try_recv() {
             Ok(Command::Send(text)) => {
-                if socket.send(Message::text(text)).is_err() {
+                let length = text.len();
+                let sent = socket.send(Message::text(text));
+                buffered.fetch_sub(length.min(buffered.load(Ordering::Relaxed)), Ordering::Relaxed);
+                if sent.is_err() {
                     break;
                 }
                 continue;
@@ -319,5 +344,18 @@ mod tests {
         assert!(addresses("10.0.0.1", 80, true).is_err());
         assert_eq!(addresses("127.0.0.1", 80, false).unwrap(), ["127.0.0.1:80".parse().unwrap()]);
         assert_eq!(cookie_url(&Url::parse("wss://a.test/x").unwrap()).as_str(), "https://a.test/x");
+    }
+
+    /// Every waiting event counts against the page's bound, empty messages included.
+    #[test]
+    fn waiting_events_count_against_the_bound() {
+        let inbox = Inbox::default();
+        for _ in 0..10 {
+            inbox.push(1, SocketEvent::Message(String::new()));
+        }
+        inbox.push(1, SocketEvent::Message("abc".into()));
+        assert_eq!(inbox.pending.load(Ordering::Relaxed), 11 * EVENT_BYTES + 3);
+        assert_eq!(inbox.take().len(), 11);
+        assert_eq!(inbox.pending.load(Ordering::Relaxed), 0);
     }
 }

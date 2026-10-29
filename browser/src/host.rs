@@ -226,10 +226,16 @@ pub struct Xhr {
     /// whole).
     state: u8,
     response: Option<Rc<FetchResponse>>,
-    /// Sent, and its events not yet delivered: a release waits for them.
+    /// Sent and not yet answered: a release waits, and `open` is refused.
     in_flight: bool,
+    /// Its events are being dispatched: a release waits for them.
+    delivering: bool,
     release_when_done: bool,
 }
+
+/// The most canvases with a 2D context a page may have, and their pixels in all (256 MB).
+const MAX_CANVASES: usize = 256;
+const MAX_CANVAS_PIXELS: u64 = 64 << 20;
 
 /// The most XMLHttpRequests a page may hold at once.
 const MAX_XHRS: usize = 64 * 1024;
@@ -449,7 +455,7 @@ pub struct Objects {
     /// Fetches started and not yet taken.
     pub(crate) fetching: usize,
     /// Bytes of response bodies the page holds (live `Response` objects).
-    body_bytes: usize,
+    pub(crate) body_bytes: usize,
     /// Each response's one `Headers` object, once read.
     headers_of: HashMap<u32, u32>,
     /// Wakes the page's event loop: a timer is due, or a fetch finished.
@@ -630,6 +636,33 @@ impl Objects {
         }
     }
 
+    /// A replay stopped part way and the page goes live: what the recording had in flight
+    /// would otherwise wait forever, since a replayed page has no network. Sockets that look
+    /// open fail (`error`, `close`), fetches and XMLHttpRequests fail, and IndexedDB requests
+    /// and transactions get the events their recorded outcomes call for.
+    pub fn settle_after_replay(&mut self) {
+        let open: Vec<u32> = self.sockets.iter().filter(|(_, s)| s.state < 3).map(|(h, _)| *h).collect();
+        for socket in open {
+            self.inbox.push(socket, crate::websocket::SocketEvent::Error);
+            self.inbox.push(socket, crate::websocket::SocketEvent::Close { code: 1006, reason: String::new(), clean: false });
+        }
+        let waiting: Vec<u32> = self.promises.iter().filter(|(_, p)| p.outcome.is_none()).map(|(h, _)| *h).collect();
+        for promise in waiting {
+            self.fetched.lock().unwrap().push((promise, Err("TypeError: Failed to fetch: the replay ended, and a replayed page has no network".into())));
+            self.fetching += 1;
+        }
+        let mut requests: Vec<(u32, bool)> = self.idb.requests.iter().filter(|(_, r)| !r.done).map(|(h, r)| (*h, r.error.is_some())).collect();
+        requests.sort();
+        for (request, failed) in requests {
+            self.queue_object_event(request, if failed { "error" } else { "success" });
+        }
+        let mut transactions: Vec<u32> = self.idb.transactions.iter().filter(|(_, t)| !t.done).map(|(h, _)| *h).collect();
+        transactions.sort();
+        for tx in transactions {
+            self.queue_object_event(tx, "complete");
+        }
+    }
+
     /// Whether a queued `complete` for transaction `target` must wait for its requests.
     pub fn transaction_waiting(&self, target: u32, kind: &str) -> bool {
         kind == "complete" && self.idb.transactions.get(&target).is_some_and(|t| t.pending > 0)
@@ -691,12 +724,13 @@ impl Objects {
             t.release_when_done = true;
             return;
         }
-        if let Some(x) = self.xhrs.get_mut(&handle).filter(|x| x.in_flight) {
+        if let Some(x) = self.xhrs.get_mut(&handle).filter(|x| x.in_flight || x.delivering) {
             x.release_when_done = true;
             return;
         }
-        if let Some(body) = self.xhrs.remove(&handle).and_then(|x| x.response) {
-            self.body_bytes -= body.body.len().min(self.body_bytes);
+        if let Some(x) = self.xhrs.remove(&handle) {
+            self.body_bytes -= x.response.map_or(0, |r| r.body.len()).min(self.body_bytes);
+            self.forget_target(handle);
         }
         self.idb.requests.remove(&handle);
         self.idb.transactions.remove(&handle);
@@ -909,32 +943,34 @@ impl Objects {
 
     /// A finished fetch an XMLHttpRequest sent: keep its response (bounded, as fetch's are)
     /// and say which events to dispatch: `readystatechange`, then `load` or `error`, then
-    /// `loadend`. None if the fetch wasn't an XMLHttpRequest's.
-    pub fn xhr_finished(&mut self, promise: u32, result: &Result<FetchResponse, String>) -> Option<(u32, [&'static str; 3])> {
+    /// `loadend`. None if the fetch wasn't an XMLHttpRequest's; `Some(None)` if it was, but
+    /// that request is gone.
+    pub fn xhr_finished(&mut self, promise: u32, result: &Result<FetchResponse, String>) -> Option<Option<(u32, [&'static str; 3])>> {
         let xhr = self.xhr_of.remove(&promise)?;
         self.promises.remove(&promise);
         self.objects.remove(&promise);
+        let Some(held) = self.xhrs.get(&xhr).map(|x| x.response.as_ref().map_or(0, |r| r.body.len())) else { return Some(None) };
         let response = match result {
-            Ok(r) if self.body_bytes + r.body.len() <= MAX_HELD_BODIES => {
-                self.body_bytes += r.body.len();
-                Some(Rc::new(r.clone()))
-            }
+            Ok(r) if self.body_bytes - held.min(self.body_bytes) + r.body.len() <= MAX_HELD_BODIES => Some(Rc::new(r.clone())),
             _ => None,
         };
+        self.body_bytes -= held.min(self.body_bytes);
+        self.body_bytes += response.as_ref().map_or(0, |r| r.body.len());
         let x = self.xhrs.get_mut(&xhr)?;
         x.state = 4;
+        x.in_flight = false;
+        x.delivering = true;
         let outcome = if response.is_some() { "load" } else { "error" };
         x.response = response;
-        Some((xhr, ["readystatechange", outcome, "loadend"]))
+        Some(Some((xhr, ["readystatechange", outcome, "loadend"])))
     }
 
-    /// After an XMLHttpRequest's events: its listeners go, and if the pack let go of it, so
-    /// does it.
+    /// After an XMLHttpRequest's events: if the pack let go of it (and didn't send it again
+    /// meanwhile), it goes. Its handlers stay, for the next `send`.
     pub fn xhr_delivered(&mut self, xhr: u32) {
-        self.forget_target(xhr);
         let Some(x) = self.xhrs.get_mut(&xhr) else { return };
-        x.in_flight = false;
-        if x.release_when_done {
+        x.delivering = false;
+        if x.release_when_done && !x.in_flight {
             self.release(xhr);
         }
     }
@@ -944,7 +980,7 @@ impl Objects {
         let outcome = match result {
             // Bodies the page still holds are host memory, outside the pack's cap: bounded too.
             Ok(response) if self.body_bytes + response.body.len() > MAX_HELD_BODIES => {
-                Err(HostValue::str(&format!("TypeError: Failed to fetch {}: the page holds over {} MB of responses", response.url, MAX_HELD_BODIES >> 20)))
+                Err(HostValue::str(&format!("TypeError: Failed to fetch {}: the page holds over {} MB of responses", crate::debug::redact(&response.url), MAX_HELD_BODIES >> 20)))
             }
             Ok(response) => {
                 self.body_bytes += response.body.len();
@@ -1098,7 +1134,7 @@ impl PageHost {
     /// a navigation the tab loads through the gate, like a link. A replay doesn't navigate.
     fn go_to(&mut self, target: &str, replace: bool) -> Result<()> {
         let current = self.doc.borrow().url().clone();
-        let url = current.join(target).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {target:?} ({e})"))?;
+        let url = current.join(target).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL ({e})"))?;
         if !matches!(url.scheme(), "http" | "https" | "file" | "about") {
             bail!("{}: URLs can't be navigated to from a page", url.scheme());
         }
@@ -1132,7 +1168,7 @@ impl PageHost {
         let doc = self.doc.borrow();
         let url = doc.url();
         if url.scheme() != "file" && !url.origin().is_tuple() {
-            bail!("SecurityError: storage isn't available on {url}");
+            bail!("SecurityError: storage isn't available on a page with no origin ({})", url.scheme());
         }
         Ok(crate::settings::origin_of(url))
     }
@@ -1172,7 +1208,7 @@ impl PageHost {
         let page = self.doc.borrow().url().clone();
         let promise = self.objects.borrow_mut().promise();
         let request = (|| -> Result<PageFetch> {
-            let url = page.join(&input).map_err(|e| anyhow::anyhow!("TypeError: Failed to fetch: bad URL {input:?} ({e})"))?;
+            let url = page.join(&input).map_err(|e| anyhow::anyhow!("TypeError: Failed to fetch: bad URL ({e})"))?;
             let mut request = PageFetch::new(url);
             let init = match args.get(1) {
                 Some(v @ HostValue::Object(_)) => self.objects.borrow().to_json(v)?,
@@ -1289,7 +1325,7 @@ impl PageHost {
         use crate::websocket::{self, Socket, SocketEvent};
         let page = self.doc.borrow().url().clone();
         let input = args.first().context("WebSocket: missing argument 0")?.display();
-        let mut url = page.join(&input).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {input:?} ({e})"))?;
+        let mut url = page.join(&input).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL ({e})"))?;
         let scheme = match url.scheme() {
             "ws" | "http" => "ws",
             "wss" | "https" => "wss",
@@ -1301,7 +1337,7 @@ impl PageHost {
         }
         // Mixed content: a secure page's sockets are secure too.
         if page.scheme() == "https" && scheme == "ws" {
-            bail!("SecurityError: an https page can't open an insecure WebSocket ({url})");
+            bail!("SecurityError: an https page can't open an insecure (ws:) WebSocket");
         }
         let protocols: Vec<String> = match args.get(1) {
             Some(v @ HostValue::Object(_)) => match self.objects.borrow().to_json(v)? {
@@ -1318,10 +1354,11 @@ impl PageHost {
         objects.sockets_made += 1;
         let handle = objects.add(Obj::WebSocket);
         let inbox = objects.inbox.clone();
+        let buffered: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
         let commands = match (&self.env.gate, objects.tape.replaying()) {
             (_, true) => None,
             (Some(gate), false) => match gate.allow(&url, Some(&page)) {
-                Ok(()) => Some(websocket::connect(handle, url.clone(), &page, protocols, inbox.clone())),
+                Ok(()) => Some(websocket::connect(handle, url.clone(), &page, protocols, inbox.clone(), buffered.clone())),
                 Err(_) => None,
             },
             (None, false) => None,
@@ -1332,7 +1369,7 @@ impl PageHost {
             inbox.push(handle, SocketEvent::Error);
             inbox.push(handle, SocketEvent::Close { code: 1006, reason: String::new(), clean: false });
         }
-        objects.sockets.insert(handle, Socket { url: url.to_string(), state: 0, protocol: String::new(), commands });
+        objects.sockets.insert(handle, Socket { url: url.to_string(), state: 0, protocol: String::new(), commands, buffered });
         Ok(HostValue::Object(handle))
     }
 
@@ -1367,6 +1404,9 @@ impl PageHost {
 
     fn label(&self, target: &HostValue, member: &str) -> String {
         match self.objects.borrow().get(target) {
+            // Keys typed into a form field (a password among them) are labelled apart, so the
+            // AI's views can hide them (`debug::holds_secrets`).
+            Ok(Obj::Event(e)) if matches!(member, "key" | "code") && self.is_field(e.target) => format!("FieldKeyEvent.{member}"),
             Ok(obj) => format!("{}.{member}", obj.interface()),
             Err(_) => format!("?.{member}"),
         }
@@ -1380,6 +1420,11 @@ impl PageHost {
         }
     }
 
+    /// Whether node `id` is a form field the user types into (`input`, `textarea`).
+    fn is_field(&self, id: NodeId) -> bool {
+        self.doc.borrow().get_node(id).and_then(|n| n.element_data()).is_some_and(|el| matches!(&*el.name.local, "input" | "textarea"))
+    }
+
     fn is_canvas(&self, id: NodeId) -> bool {
         self.doc.borrow().get_node(id).and_then(|n| n.element_data()).is_some_and(|el| &*el.name.local == "canvas")
     }
@@ -1391,7 +1436,20 @@ impl PageHost {
             return Some((c.width, c.height));
         }
         let size = |name: &str, default: u32| self.attr(id, name).trim().parse::<u32>().unwrap_or(default);
-        Some((size("width", 300), size("height", 150)))
+        // Sizes from the HTML get the same limit as ones set from code; past it, the default.
+        Some(crate::canvas::Canvas::check_size(size("width", 300) as f64, size("height", 150) as f64).unwrap_or((300, 150)))
+    }
+
+    /// Whether a canvas of `width` × `height` fits the page's budget, with canvas `id` (if it
+    /// has one) replaced by it: at most `MAX_CANVASES` canvases and `MAX_CANVAS_PIXELS` pixels.
+    fn canvas_fits(&self, id: NodeId, width: u32, height: u32) -> Result<()> {
+        let objects = self.objects.borrow();
+        let others = objects.canvases.iter().filter(|(c, _)| **c != id);
+        let pixels: u64 = others.clone().map(|(_, c)| c.width as u64 * c.height as u64).sum::<u64>() + width as u64 * height as u64;
+        if others.count() >= MAX_CANVASES || pixels > MAX_CANVAS_PIXELS {
+            bail!("RangeError: the page's canvases would be over {MAX_CANVASES} or {} million pixels", MAX_CANVAS_PIXELS >> 20);
+        }
+        Ok(())
     }
 
     /// A node as the page sees it, or null.
@@ -1812,7 +1870,7 @@ impl PageHost {
                     "readyState" => HostValue::Num(socket.state as f64),
                     "protocol" => HostValue::str(&socket.protocol),
                     "extensions" => HostValue::str(""),
-                    "bufferedAmount" => HostValue::Num(0.0),
+                    "bufferedAmount" => HostValue::Num(socket.buffered.load(std::sync::atomic::Ordering::Relaxed) as f64),
                     "binaryType" => HostValue::str("blob"),
                     "CONNECTING" => HostValue::Num(0.0),
                     "OPEN" => HostValue::Num(1.0),
@@ -1881,6 +1939,9 @@ impl PageHost {
                 let n = value.as_num().unwrap_or(f64::NAN).trunc();
                 let (w, h) = if prop == "width" { (n, h as f64) } else { (w as f64, n) };
                 let (w, h) = crate::canvas::Canvas::check_size(w, h).map_err(|e| anyhow::anyhow!(e))?;
+                if self.objects.borrow().canvases.contains_key(id) {
+                    self.canvas_fits(*id, w, h)?;
+                }
                 self.set_attr(*id, prop, Some(&format_number(n)));
                 if let Some(canvas) = self.objects.borrow_mut().canvases.get_mut(id) {
                     canvas.resize(w, h);
@@ -2031,7 +2092,7 @@ impl PageHost {
             (Obj::Document | Obj::Element(_), "querySelector") => {
                 let scope = self.scope(&obj).context("no scope")?;
                 let selector = text(0)?;
-                let found = self.doc.borrow().query_selector_in(scope, &selector).map_err(|e| anyhow::anyhow!("bad selector {selector:?}: {e:?}"))?;
+                let found = self.doc.borrow().query_selector_in(scope, &selector).map_err(|e| anyhow::anyhow!("SyntaxError: bad selector ({e:?})"))?;
                 match found {
                     Some(id) => self.objects.borrow_mut().element(id),
                     None => HostValue::Null,
@@ -2081,10 +2142,15 @@ impl PageHost {
                         if args.get(2).is_some_and(|a| !matches!(a, HostValue::Undefined) && !a.truthy()) {
                             bail!("InvalidAccessError: synchronous XMLHttpRequest isn't supported (it would block the page)");
                         }
+                        if in_flight {
+                            bail!("InvalidStateError: this request is still being sent (abort() isn't supported)");
+                        }
                         let (method, url) = (text(0)?.to_ascii_uppercase(), text(1)?);
                         let mut objects = self.objects.borrow_mut();
                         let x = objects.xhrs.get_mut(handle).context("gone")?;
-                        *x = Xhr { method, url, state: 1, ..Default::default() };
+                        let held = x.response.as_ref().map_or(0, |r| r.body.len());
+                        *x = Xhr { method, url, state: 1, delivering: x.delivering, release_when_done: x.release_when_done, ..Default::default() };
+                        objects.body_bytes -= held.min(objects.body_bytes);
                         HostValue::Undefined
                     }
                     "setRequestHeader" => {
@@ -2148,6 +2214,9 @@ impl PageHost {
             (Obj::Element(id), "getContext") => match (self.is_canvas(*id), text(0)?.as_str()) {
                 (true, "2d") => {
                     let (w, h) = self.canvas_size(*id).unwrap_or((300, 150));
+                    if !self.objects.borrow().canvases.contains_key(id) {
+                        self.canvas_fits(*id, w, h)?;
+                    }
                     let mut objects = self.objects.borrow_mut();
                     objects.canvases.entry(*id).or_insert_with(|| crate::canvas::Canvas::new(w, h));
                     objects.view(*id, "2d")
@@ -2312,19 +2381,21 @@ impl PageHost {
                     }
                 };
                 let (first, second) = (data(0)?, data(1)?);
+                // The result as `[value]`, or `[]` for undefined (a missing record), which JSON
+                // can't say on its own.
+                let some = |v: serde_json::Value| serde_json::json!([v]);
                 let outcome = self.idb_op(write, |o| match method {
-                    "put" | "add" => o.put(db, store, first.unwrap_or_default(), second, method == "add"),
-                    "get" => o.get(db, store, &first.unwrap_or_default()).map(|v| v.unwrap_or(serde_json::json!({"u": 1}))),
-                    "delete" => o.delete(db, store, &first.unwrap_or_default()).map(|_| serde_json::json!({"u": 1})),
-                    "getAll" => o.get_all(db, store).map(serde_json::Value::from),
-                    "count" => o.count(db, store).map(serde_json::Value::from),
-                    _ => o.clear(db, store).map(|_| serde_json::json!({"u": 1})),
+                    "put" | "add" => o.put(db, store, first.unwrap_or_default(), second, method == "add").map(some),
+                    "get" => o.get(db, store, &first.unwrap_or_default()).map(|v| v.map_or(serde_json::json!([]), some)),
+                    "delete" => o.delete(db, store, &first.unwrap_or_default()).map(|_| serde_json::json!([])),
+                    "getAll" => o.get_all(db, store).map(|v| some(v.into())),
+                    "count" => o.count(db, store).map(|n| some(n.into())),
+                    _ => o.clear(db, store).map(|_| serde_json::json!([])),
                 })?;
-                // `{"u": 1}` stands for undefined (a missing record), which JSON can't say.
-                let result = outcome.map(|v| match v {
-                    serde_json::Value::Object(ref o) if o.len() == 1 && o.get("u") == Some(&serde_json::json!(1)) => Ok(HostValue::Undefined),
-                    v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_)) => Err(v),
-                    v => Ok(self.objects.borrow_mut().from_json(v)),
+                let result = outcome.map(|v| match v.get(0).cloned() {
+                    None => Ok(HostValue::Undefined),
+                    Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => Err(v),
+                    Some(v) => Ok(self.objects.borrow_mut().from_json(v)),
                 });
                 self.idb_request(*tx, result, None, false)?
             }
@@ -2339,7 +2410,12 @@ impl PageHost {
                         if data.len() > crate::websocket::MAX_MESSAGE {
                             bail!("the message is over {} MB", crate::websocket::MAX_MESSAGE >> 20);
                         }
+                        let queued = socket.buffered.load(std::sync::atomic::Ordering::Relaxed);
+                        if queued + data.len() > crate::websocket::MAX_BUFFERED {
+                            bail!("the WebSocket has over {} MB waiting to be sent", crate::websocket::MAX_BUFFERED >> 20);
+                        }
                         if let Some(commands) = &socket.commands {
+                            socket.buffered.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
                             let _ = commands.send(crate::websocket::Command::Send(data));
                         }
                     }
@@ -2393,7 +2469,7 @@ impl PageHost {
             (Obj::Document | Obj::Element(_), "querySelectorAll") => {
                 let scope = self.scope(&obj).context("no scope")?;
                 let selector = text(0)?;
-                let found = self.doc.borrow().query_selector_all_in(scope, &selector).map_err(|e| anyhow::anyhow!("SyntaxError: bad selector {selector:?}: {e:?}"))?;
+                let found = self.doc.borrow().query_selector_all_in(scope, &selector).map_err(|e| anyhow::anyhow!("SyntaxError: bad selector ({e:?})"))?;
                 self.objects.borrow_mut().node_list(found.into_iter().collect())?
             }
             (Obj::Document, "createTextNode") => {
@@ -2515,7 +2591,7 @@ impl PageHost {
                     _ => {
                         for token in args.iter().map(HostValue::display) {
                             if token.is_empty() || token.contains(char::is_whitespace) {
-                                bail!("SyntaxError: {token:?} isn't a valid class name");
+                                bail!("SyntaxError: a class name can't be empty or have spaces");
                             }
                             match method {
                                 "add" if !classes.contains(&token) => classes.push(token),
@@ -2643,10 +2719,10 @@ impl PageHost {
                 let current = self.doc.borrow().url().clone();
                 let url = match args.get(2) {
                     Some(HostValue::Undefined | HostValue::Null) | None => current.clone(),
-                    Some(v) => current.join(&v.display()).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL {:?} ({e})", v.display()))?,
+                    Some(v) => current.join(&v.display()).map_err(|e| anyhow::anyhow!("SyntaxError: bad URL ({e})"))?,
                 };
                 if !can_rewrite(&current, &url) {
-                    bail!("SecurityError: {method} can't change the page's origin (to {url})");
+                    bail!("SecurityError: {method} can't change the page's origin");
                 }
                 self.doc.borrow_mut().set_base_url(url.as_str());
                 self.objects.borrow_mut().history_state = Some(state.clone());

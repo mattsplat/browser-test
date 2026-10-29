@@ -179,7 +179,9 @@ impl Gate {
     /// everything else, every redirect hop included (each is checked and logged). Rejections
     /// are `TypeError: ...` messages, as `fetch` rejects. See `PageFetch` for the rules.
     pub async fn fetch_from_page(&self, mut request: PageFetch, page: &Url) -> Result<FetchResponse, String> {
-        let failed = |url: &Url, why: String| format!("TypeError: Failed to fetch {url}: {why}");
+        // The URL is redacted (no credentials, query values or fragment): the message can reach
+        // the trace, which AI access reads.
+        let failed = |url: &Url, why: String| format!("TypeError: Failed to fetch {}: {why}", crate::debug::redact(url.as_str()));
         // Forbidden methods: TRACE and TRACK echo the request back, HttpOnly cookies included.
         if matches!(request.method.as_str(), "CONNECT" | "TRACE" | "TRACK") {
             return Err(failed(&request.url, format!("{} requests can't be made by a page", request.method)));

@@ -13,8 +13,13 @@ use anyrender::{Glyph, PaintScene};
 use peniko::kurbo::{Affine, Arc, BezPath, Point, Rect, Shape, Stroke};
 use peniko::{BlendMode, Color, Compose, Fill, FontData, Mix};
 
-/// The most commands a canvas keeps (and path elements a path holds) before refusing more.
-const MAX_COMMANDS: usize = 1 << 20;
+/// The most a canvas keeps before refusing more: path elements and glyphs, across its
+/// commands and its current path. It bounds both the memory a canvas holds and the work of
+/// rendering it each frame.
+const MAX_ELEMENTS: usize = 1 << 20;
+/// Arcs bigger than this are drawn at this radius: far outside any canvas, and flattening a
+/// huge one would never end.
+const MAX_RADIUS: f64 = 1.0e6;
 /// The biggest canvas, in pixels (64 MB of RGBA), and side.
 const MAX_PIXELS: u64 = 16 << 20;
 const MAX_SIDE: u32 = 16384;
@@ -49,6 +54,8 @@ pub struct Canvas {
     state: State,
     saved: Vec<State>,
     path: BezPath,
+    /// Elements in `commands` (see `MAX_ELEMENTS`).
+    elements: usize,
     /// Drawn on since last shown.
     pub dirty: bool,
 }
@@ -69,7 +76,7 @@ fn serialize(color: Color) -> String {
 
 impl Canvas {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, commands: Vec::new(), state: State::default(), saved: Vec::new(), path: BezPath::new(), dirty: true }
+        Self { width, height, commands: Vec::new(), state: State::default(), saved: Vec::new(), path: BezPath::new(), elements: 0, dirty: true }
     }
 
     /// The size the page asked for, if a canvas may be that big.
@@ -87,9 +94,15 @@ impl Canvas {
     }
 
     fn push(&mut self, command: Command) -> Result<(), String> {
-        if self.commands.len() >= MAX_COMMANDS {
+        let size = match &command {
+            Command::Fill(path, _) | Command::Stroke(path, _, _) => path.elements().len(),
+            Command::Text { glyphs, .. } => glyphs.len(),
+            Command::Clear(_) => 0,
+        } + 1;
+        if self.elements + size > MAX_ELEMENTS {
             return Err("the canvas has too many drawing commands; clear it first".into());
         }
+        self.elements += size;
         self.commands.push(command);
         self.dirty = true;
         Ok(())
@@ -166,6 +179,7 @@ impl Canvas {
         // Clearing everything: what came before can't show any more.
         if rect.contains_rect(Rect::new(0.0, 0.0, self.width as f64, self.height as f64)) {
             self.commands.clear();
+            self.elements = 0;
             self.dirty = true;
             return Ok(());
         }
@@ -175,7 +189,7 @@ impl Canvas {
     // ---- Paths
 
     fn path_element(&mut self) -> Result<(), String> {
-        if self.path.elements().len() >= MAX_COMMANDS {
+        if self.path.elements().len() >= MAX_ELEMENTS {
             return Err("the path is too long".into());
         }
         Ok(())
@@ -220,6 +234,7 @@ impl Canvas {
             return Err(format!("IndexSizeError: the radius {radius} is negative"));
         }
         self.path_element()?;
+        let radius = radius.min(MAX_RADIUS);
         let tau = std::f64::consts::TAU;
         let mut sweep = end - start;
         sweep = match counterclockwise {
@@ -229,7 +244,8 @@ impl Canvas {
             true => -((-sweep).rem_euclid(tau)),
         };
         let arc = Arc::new(Point::new(x, y), (radius, radius), start, sweep, 0.0);
-        let mut elements = arc.path_elements(0.1);
+        // A tolerance in proportion to the radius keeps the number of segments small.
+        let mut elements = arc.path_elements((radius * 1e-4).max(0.1));
         let first = elements.next();
         if let Some(peniko::kurbo::PathEl::MoveTo(p)) = first {
             match self.path.elements().is_empty() {
@@ -238,7 +254,7 @@ impl Canvas {
             }
         }
         self.path.extend(elements);
-        Ok(())
+        self.path_element()
     }
 
     pub fn fill(&mut self) -> Result<(), String> {
@@ -327,7 +343,7 @@ impl Canvas {
         let mut encoder = png::Encoder::new(&mut png, self.width.max(1), self.height.max(1));
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        let pixels = match self.width * self.height {
+        let pixels = match self.width as u64 * self.height as u64 {
             0 => vec![0; 4],
             _ => self.render(),
         };
@@ -383,5 +399,16 @@ mod tests {
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"Ma"), "TWE=");
         assert!(Canvas::check_size(100000.0, 1.0).is_err());
+
+        // A huge arc is drawn at a bounded size, quickly; repeated fills hit the budget.
+        let mut c = Canvas::new(10, 10);
+        c.arc(5.0, 5.0, 1e300, 0.0, 6.0, false).unwrap();
+        assert!(c.path.elements().len() < 100);
+        c.begin_path();
+        for i in 0..1000 {
+            c.line_to(i as f64, 0.0).unwrap();
+        }
+        let fills = (0..2000).map(|_| c.fill()).position(|r| r.is_err());
+        assert!(fills.is_some_and(|n| n < 1100), "the element budget stops repeated fills");
     }
 }

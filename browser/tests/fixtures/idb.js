@@ -24,15 +24,19 @@ request.onsuccess = () => {
   items.put({ id: 10, name: 'pear', n: 2.5, ok: true, none: null });
   items.add({ id: 10, name: 'dup' }).onerror = (e) => add(`add:${e.target.error.name}`);
   tx.objectStore('notes').put('hello', 'greeting');
+  tx.objectStore('notes').put({ u: 1 }, 'odd');
   tx.oncomplete = () => {
     add('complete');
-    const store = db.transaction('items').objectStore('items');
+    const read = db.transaction(['items', 'notes']);
+    const store = read.objectStore('items');
     add(`store:${store.keyPath},${store.autoIncrement}`);
     store.get(1).onsuccess = (e) => {
       const v = e.target.result;
       add(`get:${v.name},${v.tags.length},${v.tags[1]},${v.secret.length}`);
     };
     store.get(99).onsuccess = (e) => add(`missing:${e.target.result === undefined}`);
+    // A stored object that looks like the wire's undefined marker reads back as itself.
+    read.objectStore('notes').get('odd').onsuccess = (e) => add(`odd:${e.target.result.u}`);
     store.getAll().onsuccess = (e) => add(`all:${[...e.target.result].map((v) => v.name).join('+')}`);
     const counted = store.count();
     counted.onsuccess = () => {

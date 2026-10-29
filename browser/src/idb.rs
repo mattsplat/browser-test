@@ -60,7 +60,7 @@ fn valid_key(key: &Value) -> Result<Value, String> {
     match key {
         Value::Number(n) if n.as_f64().is_some_and(f64::is_finite) => Ok(key.clone()),
         Value::String(_) => Ok(key.clone()),
-        other => Err(format!("DataError: {other} isn't a valid key (keys are numbers or strings here)")),
+        _ => Err("DataError: that isn't a valid key (keys are numbers or strings here)".into()),
     }
 }
 
@@ -160,7 +160,7 @@ impl Origin {
             }
         }
         match s.records.binary_search_by(|(k, _)| compare(k, &key)) {
-            Ok(_) if no_overwrite => return Err(format!("ConstraintError: there's already a record with the key {key}")),
+            Ok(_) if no_overwrite => return Err("ConstraintError: there's already a record with that key".into()),
             Ok(i) => s.records[i].1 = value,
             Err(i) => s.records.insert(i, (key.clone(), value)),
         }

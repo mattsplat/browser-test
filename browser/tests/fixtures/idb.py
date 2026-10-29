@@ -33,10 +33,12 @@ def on_open(e):
     items.put({'id': 10, 'name': 'pear', 'n': 2.5, 'ok': True, 'none': None})
     items.add({'id': 10, 'name': 'dup'}).onerror = lambda e: add(f'add:{e.target.error.name}')
     tx.objectStore('notes').put('hello', 'greeting')
+    tx.objectStore('notes').put({'u': 1}, 'odd')
 
     def on_complete(e):
         add('complete')
-        store = db.transaction('items').objectStore('items')
+        read = db.transaction(['items', 'notes'])
+        store = read.objectStore('items')
         add(f'store:{store.keyPath},{js(store.autoIncrement)}')
 
         def on_get(e):
@@ -44,6 +46,8 @@ def on_open(e):
             add(f'get:{v.name},{len(v.tags)},{v.tags[1]},{len(v.secret)}')
         store.get(1).onsuccess = on_get
         store.get(99).onsuccess = lambda e: add(f'missing:{js(e.target.result is None)}')
+        # A stored object that looks like the wire's undefined marker reads back as itself.
+        read.objectStore('notes').get('odd').onsuccess = lambda e: add(f'odd:{e.target.result.u}')
         store.getAll().onsuccess = lambda e: add(f"all:{'+'.join(v.name for v in e.target.result)}")
         counted = store.count()
 

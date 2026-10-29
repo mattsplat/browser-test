@@ -1272,10 +1272,10 @@ fixtures `tests/fixtures/dom.*`).
   the host's own (void elements, escaping, raw-text elements), since Blitz's writes empty
   elements as `<p />`.
 - **Dropped nodes:** replacing an element's `textContent` or `innerHTML` drops its old
-  children for good. Blitz reuses node ids, so their handles, views and listeners are now
-  forgotten (`Objects::forget_nodes`): a stale handle fails ("this object is no longer
-  available") instead of reaching whatever new node gets the id. (Before, `textContent`
-  could alias a stale handle onto a new node.)
+  children for good. Their handles, views, canvases and listeners are forgotten with them
+  (`Objects::forget_nodes`), so they don't pile up as host memory, and a stale handle fails
+  plainly ("this object is no longer available"). (Blitz's `NodeId`s carry a generation, so
+  a dropped node's id doesn't alias a new node; this is about memory and a clear error.)
 - **Form fields:** `value` (text fields' text; other inputs' `value` attribute), `checked`,
   `disabled`. Setting `value` changes the field's text, not its attribute, and puts the
   caret at the end. Blitz makes a field's editing state when it first lays the field out;
@@ -1312,7 +1312,11 @@ fixtures `tests/fixtures/dom.*`).
   cross-pack test plants a password field's value, reads it in every pack, and checks it
   never reaches the redacted trace or console.
 - **Handles:** NodeLists are releasable (JS and Python free them as their wrappers go) and
-  bounded: a page holds at most 4 Mi listed nodes (Dart never releases). `classList`,
+  bounded: a page holds at most 4 Mi listed nodes. **Dart never releases** (dart2wasm gives
+  no hook when a JS value is collected), so a Dart page that keeps calling
+  `querySelectorAll` reaches the cap for good, and further calls throw until reload. A cap
+  per call wouldn't bound memory, so the cumulative one stays; giving Dart a release path
+  would need dart2wasm finalization support. `classList`,
   `style` and `dataset` objects are one per element, like elements.
 - **Dart:** `package:web`'s `operator []` and `operator []=` (`dataset`) compile to
   `(x0,x1) => x0[x1]` and `(x0,x1,x2) => { x0[x1] = x2 }`, now recognised. Dart can't
@@ -1350,9 +1354,12 @@ fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
   dispatches the event, so delivery is async, on the UI thread, like fetch's. A thread
   per socket was chosen over an async client because tokio-tungstenite isn't in the tree
   and a page has at most 64 open; the cost is a thread each.
-- **Bounded:** 64 open sockets per page and 16,384 made in all; messages up to 16 MB either
-  way; at most 64 MB received and not yet delivered per page (past that a connection stops
-  reading until the page catches up, so a paused page holds no more). Sockets aren't
+- **Bounded:** 64 open sockets per page, 16,384 made in all, and 512 open across the whole
+  browser; messages up to 1 MB either way; at most 16 MB queued to send per socket
+  (`bufferedAmount` reports it; past it `send` throws); at most 64 MB received and not yet
+  delivered per page, each event counting 64 bytes besides its text so empty messages are
+  bounded too (past it a connection stops reading until the page catches up; with every
+  socket reading one more message after the check, that's at most 64 MB more). Sockets aren't
   releasable handles (they get events while the page holds no wrapper); a closed one keeps
   only its URL, its listeners and handlers released.
 - **When the page goes**, its socket states and their command queues go with it; each
@@ -1366,7 +1373,7 @@ fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
   redacted view has it.
 - **Limitations:** text messages only (a binary one is dropped and logged; there's no
   `ArrayBuffer`/`Blob` in the host), so `binaryType` is ignored; `bufferedAmount` is
-  always 0; no extensions (no compression); closing while still connecting waits for the
+  what's queued to send; no extensions (no compression); closing while still connecting waits for the
   connection and closes it then. Events go to non-node objects through a small generic
   mechanism (`Objects::target_listeners` and `handlers`, `RunningPack::dispatch
 **IndexedDB, a useful subset** (`browser/src/idb.rs`; cross-pack test
@@ -1451,8 +1458,14 @@ fixtures `tests/fixtures/ws.*`, against a tungstenite server on 127.0.0.1).
   and checks pixels for each shape. A replay draws the same (it re-runs the same calls);
   `toDataURL`'s result is on the tape (`Read::Pixels`), since text depends on the system's
   fonts.
-- **Bounded:** a canvas is at most 16,384 pixels a side and 16 million pixels; it keeps at
-  most a million commands (and a path a million elements); past that a call throws.
+- **Bounded:** a canvas is at most 16,384 pixels a side and 16 million pixels, whether
+  sized by its HTML attributes (larger ones fall back to 300 × 150) or by code (which
+  throws); a page has at most 256 canvases with a context and 64 million canvas pixels in
+  all. A canvas keeps at most a million path elements and glyphs across its commands
+  (each `fill` or `stroke` counts its whole path), which bounds both its memory and the work
+  of rendering it each frame; past that a call throws, and clearing the whole canvas resets
+  it. Arcs flatten with a tolerance in proportion to their radius, which is capped at a
+  million pixels, so a huge one is quick.
 - **Not supported:** transforms (`translate`, `rotate`, `scale`, `setTransform`),
   gradients and patterns, `globalAlpha` and compositing modes, line caps, joins and dashes,
   `strokeText`, curves (`quadraticCurveTo`, `bezierCurveTo`, `arcTo`, `ellipse`), clipping,
@@ -1478,8 +1491,28 @@ fixtures `tests/fixtures/xhr.*`).
   `withCredentials` and `overrideMimeType` aren't supported.
 - **AI:** `XMLHttpRequest.*` calls are hidden in redacted views (the test plants a secret in
   a response body).
-- **Handles:** releasable, but one in flight stays until its events are delivered; its body
-  counts against fetch's 256 MB bound while held.
+- **Handles:** releasable, but one in flight or delivering its events stays until they're
+  done; its body counts against fetch's 256 MB bound while held. **Reuse:** `open` again
+  (even from `onload`) keeps the handlers and frees the old response; `open` while a request
+  is still being sent throws `InvalidStateError` (there's no `abort`).
+
+**Review fixes (part 2):**
+- **Error messages don't carry what the page passed:** host errors no longer echo URLs or
+  values (WebSocket and fetch URLs, `location`/`pushState` targets, selectors, IndexedDB
+  keys); fetch's rejections name the URL redacted (`debug::redact`). An uncaught error's
+  message goes into the trace, which AI access reads, so a secret in a URL could otherwise
+  leak through it. The redacted console also shows only the error's name for a failed
+  call that `holds_secrets`. `error_messages_dont_carry_secrets_to_ai` throws each kind
+  uncaught and checks.
+- **Keys typed into form fields:** `key` and `code` read from an event whose target is an
+  `input` or `textarea` are traced as `FieldKeyEvent.key`/`code` and hidden from AI, so a
+  listener reading password keystrokes doesn't expose them; other keys still show.
+- **A replay that goes live part way** (replay to step N) settles what the recording had in
+  flight, since a replayed page has no network: open sockets get `error` and `close`
+  (1006), fetches and XMLHttpRequests fail, and IndexedDB requests and transactions get the
+  events their recorded outcomes call for (`Objects::settle_after_replay`).
+- **IndexedDB results** travel on the tape as `[value]`, or `[]` for undefined, so a stored
+  object can't be mistaken for "undefined" (an `{"u": 1}` value read back as undefined).
 
 **Not done (part 2's optional items):**
 - **`await` for Python's fetch:** a coroutine driver in the prelude (stepping a coroutine

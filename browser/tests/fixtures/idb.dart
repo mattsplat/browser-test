@@ -34,9 +34,11 @@ void main() {
     items.put({'id': 10, 'name': 'pear', 'n': 2.5, 'ok': true, 'none': null}.jsify());
     items.add({'id': 10, 'name': 'dup'}.jsify()).onerror = ((Event e) => add('add:${(e.target as IDBRequest).error!.name}')).toJS;
     tx.objectStore('notes').put('hello'.toJS, 'greeting'.toJS);
+    tx.objectStore('notes').put({'u': 1}.jsify(), 'odd'.toJS);
     tx.oncomplete = ((Event e) {
       add('complete');
-      final store = db.transaction('items'.toJS).objectStore('items');
+      final read = db.transaction(['items'.toJS, 'notes'.toJS].toJS);
+      final store = read.objectStore('items');
       add('store:${(store.keyPath as JSString).toDart},${store.autoIncrement}');
       store.get(1.toJS).onsuccess = ((Event e) {
         final v = result(e);
@@ -44,6 +46,8 @@ void main() {
         add('get:${field(v, 'name')},${tags.length},${tags[1].toDart},${field(v, 'secret').length}');
       }).toJS;
       store.get(99.toJS).onsuccess = ((Event e) => add('missing:${result(e) == null}')).toJS;
+      // A stored object that looks like the wire's undefined marker reads back as itself.
+      read.objectStore('notes').get('odd'.toJS).onsuccess = ((Event e) => add('odd:${number((result(e) as JSObject).getProperty('u'.toJS))}')).toJS;
       store.getAll().onsuccess = ((Event e) {
         final all = (result(e) as JSArray<JSObject>).toDart;
         add('all:${all.map((v) => field(v, 'name')).join('+')}');

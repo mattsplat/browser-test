@@ -383,7 +383,7 @@ impl RunningPack {
         for (id, width, height, pixels) in drawn {
             if let Some(node) = doc.get_node_mut(id) {
                 if let Some(el) = node.element_data_mut() {
-                    el.special_data = match width * height {
+                    el.special_data = match width as u64 * height as u64 {
                         0 => SpecialElementData::None,
                         _ => SpecialElementData::Image(Box::new(ImageData::Raster(RasterImageData::new(width, height, Arc::new(pixels))))),
                     };
@@ -581,7 +581,8 @@ impl RunningPack {
     fn fetch_finished(&self, promise: u32, result: &Result<crate::gate::FetchResponse, String>) {
         let xhr = self.objects.borrow_mut().xhr_finished(promise, result);
         match xhr {
-            Some((xhr, events)) => {
+            Some(None) => {}
+            Some(Some((xhr, events))) => {
                 for kind in events {
                     self.dispatch_object(xhr, kind, EventDetails::default());
                 }
@@ -821,10 +822,12 @@ impl PackDocument {
     /// End a replay: the page reads live values from now on. Returns why its reads stopped
     /// matching the tape, if they did.
     pub(crate) fn end_replay(&self) -> Option<String> {
-        match std::mem::take(&mut self.pack.objects.borrow_mut().tape) {
+        let diverged = match std::mem::take(&mut self.pack.objects.borrow_mut().tape) {
             replay::Tape::Replay { diverged, .. } => diverged,
             _ => None,
-        }
+        };
+        self.pack.objects.borrow_mut().settle_after_replay();
+        diverged
     }
 
     #[cfg(test)]
@@ -1777,6 +1780,12 @@ mod tests {
             assert_eq!(outcome.diverged, None, "{pack}");
             assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
             assert_eq!(connections.load(std::sync::atomic::Ordering::Relaxed), before, "{pack}: the replay opened no socket");
+            // Replayed to just after it opened, then live: the socket can't go on (there's no
+            // network), so it closes rather than hanging open.
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (partial, _) = replay::replay(&recording, config, Some(1)).await.unwrap();
+            partial.pack().deliver_sockets();
+            assert!(output(&partial).contains("close:1006,,false,3"), "{pack}: {}", output(&partial));
 
             let origin = format!("http://localhost:{port}");
             let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
@@ -1834,6 +1843,7 @@ mod tests {
         "store:id,true",
         "get:apple,2,fruit,10",
         "missing:true",
+        "odd:1",
         "all:apple+pear",
         "count:2",
         "after-delete:1",
@@ -1998,6 +2008,112 @@ mod tests {
             assert_eq!(canvas_pixels(&replayed).1, pixels, "{pack}: the replay draws the same");
         }
         assert!(drawn.windows(2).all(|w| w[0] == w[1]), "the same pixels in every pack");
+    }
+
+    /// One XMLHttpRequest reused from its own `load` handler sends again, keeps its handlers,
+    /// and holds one response's bytes at a time.
+    #[tokio::test]
+    async fn an_xhr_can_be_reused() {
+        let base = serve(xhr_answer);
+        let url = format!("{base}app/page.html");
+        let gate = Arc::new(crate::gate::Gate::new(Arc::new(blitz_net::Provider::new(None))));
+        let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+        let script = r#"
+            const x = new XMLHttpRequest();
+            let loads = 0, refused = '';
+            x.onload = () => {
+                loads++;
+                document.getElementById('out').textContent = `${loads},${x.status},${refused}`;
+                if (loads < 3) {
+                    x.open('GET', 'data.json');
+                    x.send();
+                    try { x.open('GET', 'data.json'); } catch (e) { refused = e.message.split(':')[0]; }
+                }
+            };
+            x.open('GET', 'data.json');
+            x.send();
+        "#;
+        let scripts = [Script { name: "reuse.js".into(), source: script.into(), module: false }];
+        let mut page = crate::js_pack::start(doc, PageEnv { gate: Some(gate), ..Default::default() }, &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+        settle_network(&mut page).await;
+        assert_eq!(output(&page), "3,200,InvalidStateError");
+        let body = r#"{"name":"web","n":3,"token":"S3CRET-BODY"}"#.len();
+        assert_eq!(page.pack.objects.borrow().body_bytes, body, "one response held");
+    }
+
+    /// Keys typed into a form field (a password) never reach the AI's views, even when a
+    /// listener reads them; keys on other elements still do.
+    #[test]
+    fn keys_typed_into_fields_stay_out_of_ai_views() {
+        let url = "https://keys.test/";
+        let html = "<input id=pw type=password><button id=b>b</button><p id=out></p>";
+        let doc = HtmlDocument::from_html(html, DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let script = "let n = 0; const count = (e) => { e.key; e.code; document.getElementById('out').textContent = ++n; };
+            document.getElementById('pw').addEventListener('keydown', count);
+            document.getElementById('b').addEventListener('keydown', count);";
+        let scripts = [Script { name: "keys.js".into(), source: script.into(), module: false }];
+        let mut page = futures_lite_block_on(crate::js_pack::start(doc, Default::default(), &scripts, |_| async { anyhow::bail!("no imports") })).unwrap();
+        dispatch(&mut page, "#pw", key_down("Q", Code::KeyQ, false));
+        dispatch(&mut page, "#b", key_down("Z", Code::KeyZ, false));
+        assert_eq!(output(&page), "2");
+        let redacted = debug::trace("https://keys.test", debug::Privacy::Redacted, usize::MAX);
+        assert!(redacted.iter().any(|e| e.call == "FieldKeyEvent.key" && e.result == debug::HIDDEN));
+        assert!(!redacted.iter().any(|e| e.result == "Q" || e.result == "KeyQ"), "a password key reached the AI's view");
+        assert!(redacted.iter().any(|e| e.call == "Event.key" && e.result == "Z"), "other keys still show");
+    }
+
+    /// Host errors don't echo the URLs and values pages pass them, so a secret in one can't
+    /// reach the AI's views through an error message: uncaught, or a failed call's.
+    #[tokio::test]
+    async fn error_messages_dont_carry_secrets_to_ai() {
+        let url = "https://err-secrets.test/";
+        let doc = HtmlDocument::from_html("<p id=out></p>", DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let script = r#"
+            const rethrow = (f) => { try { f(); } catch (e) { setTimeout(() => { throw e; }, 0); } };
+            rethrow(() => new WebSocket('ws://x.test/?token=S3CRET-ERR'));
+            rethrow(() => new WebSocket('http://[bad?token=S3CRET-ERR'));
+            rethrow(() => history.pushState(null, '', 'https://other.test/?token=S3CRET-ERR'));
+            rethrow(() => location.assign('http://[bad?token=S3CRET-ERR'));
+            fetch('http://[bad?token=S3CRET-ERR').catch((e) => { throw e; });
+            fetch('/missing?token=S3CRET-ERR').catch((e) => { throw e; });
+            try { localStorage.setItem('k', 'S3CRET-ERR'.repeat(1 << 20)); } catch (e) { setTimeout(() => { throw e; }, 0); }
+        "#;
+        let scripts = [Script { name: "err.js".into(), source: script.into(), module: false }];
+        let mut page = crate::js_pack::start(doc, PageEnv::default(), &scripts, |_| async { anyhow::bail!("no imports") }).await.unwrap();
+        settle_network(&mut page).await;
+        let origin = "https://err-secrets.test";
+        let errors = debug::trace(origin, debug::Privacy::Full, usize::MAX).into_iter().filter(|e| e.kind == TraceKind::Error).count();
+        assert!(errors >= 6, "the errors happened: {errors}");
+        let redacted = debug::trace(origin, debug::Privacy::Redacted, usize::MAX);
+        let console = debug::console(origin, debug::Privacy::Redacted, usize::MAX);
+        let texts = redacted.iter().flat_map(|e| [e.call.clone(), e.args.clone(), e.result.clone()]).chain(console.iter().flat_map(|c| [c.context.clone(), c.text.clone()]));
+        for text in texts {
+            assert!(!text.contains("S3CRET-ERR"), "a secret reached the AI's view in {text:?}");
+        }
+    }
+
+    /// A canvas's size from its HTML gets the same limit as one set from code, and a page's
+    /// canvases are bounded in number and pixels.
+    #[test]
+    fn canvases_are_bounded() {
+        let script = r#"
+            const c = document.getElementById('c');
+            c.getContext('2d').fillRect(0, 0, 10, 10);
+            const r = [c.width, c.height, c.toDataURL().length > 0];
+            let made = 0;
+            try {
+                for (let i = 0; i < 300; i++) {
+                    const extra = document.createElement('canvas');
+                    document.body.appendChild(extra);
+                    extra.getContext('2d');
+                    made++;
+                }
+            } catch (e) { r.push(e.message.split(':')[0]); }
+            r.push(made);
+            document.getElementById('out').textContent = r.join(',');
+        "#;
+        let page = js_page("<canvas id=c width=65535 height=65535></canvas><p id=out></p>", &[script]);
+        assert_eq!(output(&page), "300,150,true,RangeError,255");
     }
 
     /// Blitz paints the canvas's pixels where the canvas is laid out, as the window would.
