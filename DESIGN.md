@@ -871,6 +871,28 @@ are generalisations:
 - Panes keep tab-store order (left is the tab opened first), so sides don't swap when focus
   moves. Closing either tab ends the split. The split isn't saved with the session.
 
+**Hot reload with state restoration** (`browser/src/hot_reload.rs`, dev mode only).
+- **When:** dev mode on, a `file://` page, and a dev-mode Allow grant for its origin
+  (`watching`, tested). Anything else is never watched. Every 500 ms the browser polls the
+  modification times of the page's folder (not subfolders) for `.html .js .mjs .py .dart
+  .css .wasm` files, plus the whole tree when the folder is a Dart project (has a
+  `pubspec.yaml`; the same walk `dev_compile` uses to decide a recompile). No watcher crate:
+  polling is a few `stat`s per granted tab and needs no new dependency.
+- **What happens:** a newer file reloads the tab (traced as `hot reload` under pack "dev").
+  Dart source recompiles because `dev_compile`'s cache is now stale; JS and Python refetch.
+  Per the correction, there's no hot module replacement for any pack: it's a restart with
+  a fresh pack instance, and the page's in-memory state is lost.
+- **What's restored:** the viewport scroll position, and text inputs, textareas and
+  checkboxes, matched by tag, id and name (repeats by order). Passwords and hidden inputs
+  are never captured. The URL and its hash are kept because it's a reload of the same URL.
+  Restoration happens when the new page is committed, after its scripts ran, as a
+  browser's form restoration would.
+- **Limitations:** http(s) pages aren't watched, even with a grant (there are no local files
+  to poll; a Herd site would need a dev-server signal). Scripts outside the page's folder
+  aren't watched. A compile error page keeps being watched (it's the same URL), so fixing
+  the error reloads it. Reload by replay (DESIGN "Hot reload" step 2) would restore the
+  page's own state too; see time-travel replay below for what that needs.
+
 ## Known local setup notes
 
 - Building cloned repos under `vendor/` needs your approval each time (auto mode blocks it).

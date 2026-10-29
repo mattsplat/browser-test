@@ -59,6 +59,7 @@ mod document_loader;
 mod favicon;
 mod fps_overlay;
 mod history;
+mod hot_reload;
 mod icons;
 mod nav;
 mod status_bar;
@@ -185,6 +186,7 @@ fn app() -> Element {
         TabManager::restore(net_provider.clone(), cli_initial_url.clone(), home_url.clone())
     });
     tab_manager::use_tab_upkeep(manager);
+    hot_reload::use_hot_reload(manager.tabs);
     let tabs: Store<Vec<Tab>> = manager.tabs;
     let active_tab_id: Signal<TabId> = manager.active_tab_id;
 

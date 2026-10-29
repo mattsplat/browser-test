@@ -168,6 +168,12 @@ fn commit_loaded_document<Lens>(
     *tab.html_source().write_unchecked() = loaded.html_source;
     *tab.title().write_unchecked() = loaded.title;
     *tab.favicon_url().write_unchecked() = None;
+    // A hot reload saved the page's scroll and form values for its new page.
+    if let Some(state) = crate::hot_reload::take_pending(tab.tab_id()) {
+        if let Some(doc) = loaded.page.as_ref().and_then(|p| p.doc()) {
+            state.restore(&mut doc.borrow_mut());
+        }
+    }
     *tab.document().write_unchecked() = Some(loaded.document);
     *tab.page().write_unchecked() = loaded.page;
 

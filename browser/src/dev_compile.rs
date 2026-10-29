@@ -81,7 +81,7 @@ fn is_fresh(source: &Path, out: &Path) -> bool {
     newest_source(folder).is_some_and(|newest| newest <= built) && newest_tooling.is_none_or(|t| t <= built)
 }
 
-fn newest_source(dir: &Path) -> Option<SystemTime> {
+pub(crate) fn newest_source(dir: &Path) -> Option<SystemTime> {
     let mut newest = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
