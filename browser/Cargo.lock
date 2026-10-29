@@ -706,6 +706,7 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "browser-persistence",
+ "cookie_store",
  "dioxus-native",
  "directories",
  "image",

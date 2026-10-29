@@ -524,6 +524,12 @@ impl PageHost {
                 Some(id) => self.objects.borrow_mut().element(id),
                 None => HostValue::Null,
             },
+            // The page's cookies (never HttpOnly ones), from the profile's jar; on the tape, as
+            // another tab or a response may change them at any time.
+            (Obj::Document, "cookie") => {
+                let live = crate::cookies::jar().document_cookie(self.doc.borrow().url());
+                HostValue::str(&self.objects.borrow_mut().tape.read_text(Read::Cookie, live))
+            }
             (Obj::Element(id), "textContent") => HostValue::str(&self.doc.borrow().get_node(*id).context("removed")?.text_content()),
             (Obj::Element(id), "tagName") => {
                 let doc = self.doc.borrow();
@@ -540,6 +546,18 @@ impl PageHost {
     }
 
     fn do_set(&mut self, target: &HostValue, prop: &str, value: &HostValue) -> Result<()> {
+        let obj = self.objects.borrow().get(target)?;
+        match (&obj, prop) {
+            (Obj::Element(_), _) => {}
+            (Obj::Document, "cookie") => {
+                // A replay reads cookies from its tape; it mustn't change the real jar.
+                if !self.objects.borrow().tape.replaying() {
+                    crate::cookies::jar().set_document_cookie(self.doc.borrow().url(), &value.display());
+                }
+                return Ok(());
+            }
+            _ => bail!("{}.{prop} = ... is not supported yet", obj.interface()),
+        }
         let id = self.element(target).with_context(|| format!("setting {prop}"))?;
         let mut doc = self.doc.borrow_mut();
         let mut m = doc.mutate();

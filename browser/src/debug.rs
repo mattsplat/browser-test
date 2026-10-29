@@ -358,7 +358,26 @@ pub fn trace(origin: &str, privacy: Privacy, limit: usize) -> Vec<TraceEntry> {
         .into_iter()
         .filter(|e| same_site(&e.page, origin) && e.pack != "ai" && !(privacy == Privacy::Redacted && e.pack == CONSOLE_PACK))
         .take(limit)
+        .map(|mut e| {
+            if privacy == Privacy::Redacted && holds_secrets(&e.call) {
+                e.args = HIDDEN.into();
+                e.result = HIDDEN.into();
+            }
+            e
+        })
         .collect()
+}
+
+/// What a redacted view shows in place of a secret.
+pub const HIDDEN: &str = "(hidden)";
+
+/// Host calls whose arguments or results carry what AI access must never see: cookie values,
+/// stored values, and request and response bodies and headers.
+pub fn holds_secrets(call: &str) -> bool {
+    let member = call.trim_end_matches(" =");
+    member == "Document.cookie"
+        || ["Storage.", "Response.", "Headers.", "Promise."].iter().any(|p| member.starts_with(p))
+        || member == "Window.fetch"
 }
 
 /// Requests pages on site `origin` made, newest first.

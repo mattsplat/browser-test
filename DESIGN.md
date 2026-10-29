@@ -368,7 +368,7 @@ implemented once in the host (`browser/src/host.rs`), so every pack gets it toge
 
 | Capability | Status | Notes |
 |---|---|---|
-| `document.cookie` (read and write) | Missing | The network layer already keeps a cookie jar; expose it per page origin, hiding `HttpOnly` cookies from page code as browsers do, and applying third-party rules |
+| `document.cookie` (read and write) | **Done** | One jar per profile, shared with the network stack and saved in the profile (`cookies.rs`); see "Web platform parity notes" |
 | Timers: `setTimeout`, `setInterval`, `requestAnimationFrame` | Missing | Needs the event loop to wake the pack; time comes from the host (principle 4) |
 | Network from page code: `fetch`, `XMLHttpRequest`, `WebSocket` | Missing | Must go through the gate with the page's URL (`fetch_for_page`), so third-party rules apply |
 | Storage: `localStorage`, `sessionStorage`, IndexedDB | Missing | Per origin, and per profile: keep it under `profile::dir()` |
@@ -1010,6 +1010,46 @@ are generalisations:
   - "Reload by replay" for hot reload (replaying a session into recompiled code) isn't
     built: a code change usually changes which values are read, so the tape diverges; it
     would need a rule for when to fall back to a plain reload.
+
+## Web platform parity notes
+
+Part 1 of principle 6: cookies, `fetch`, storage, location and history, and window basics,
+the same in Dart, JS and Python. Each is a host member under its Web IDL name, so every pack
+gets it at once; the cross-pack test `web_apis_behave_the_same_in_dart_js_and_python` runs
+one page (`tests/fixtures/web_api.*`) in all three and expects identical output.
+
+**Cookies** (`browser/src/cookies.rs`, `document.cookie`).
+- **One jar per profile**, shared by requests and page code. blitz-net used reqwest's own
+  jar, which nothing else can read; the fork gained `blitz_net::set_cookie_store` (like
+  `set_cache_dir`), and `main` gives it the profile's jar before the provider exists.
+- **Rules:** `cookie_store` (already in the tree through reqwest) parses and matches (RFC 6265
+  domain and path matching, expiry, `Secure` only over https). On top, as browsers do: page
+  code never reads, sets or overwrites an `HttpOnly` cookie; `Secure` can only be set from
+  https; nothing is set for a public suffix (`Domain=co.uk`, checked with `psl`, which the
+  gate already uses). Order is longest path first, then name (the crate keeps no creation
+  time).
+- **Persistence:** cookies with `Expires`/`Max-Age` are saved to the profile's
+  `cookies.json`, replaced whole (`write_atomic`) whenever one with an expiry is set or
+  removed; session cookies stay in memory, so they're gone after a restart. A damaged file is
+  kept as `cookies.json.bad`, like settings.json.
+- **Replay:** every `document.cookie` read is on the tape (text reads: `Tape::read_text`,
+  `Recording::texts`), and a replay never writes to the real jar.
+- **AI:** `debug::holds_secrets` marks host calls whose arguments or results carry secrets
+  (`Document.cookie`, and later storage and fetch); redacted trace views show `(hidden)` for
+  both. What a page itself writes into its DOM or console is the page's output and isn't
+  hidden: AI access sees the page as the user does.
+- **Site panel → Site data:** the cookie count for the page's site (registrable domain) and
+  "Clear cookies".
+- **Limitations:**
+  - `file://` and other pages without a host have no cookies (`document.cookie` is empty),
+    as in Chrome.
+  - `__Secure-`/`__Host-` prefixes and `SameSite` aren't enforced.
+  - **Third-party cookies:** blitz-net's subresource requests carry the cookie store's
+    cookies for whatever URL they fetch, with no notion of the page that asked. Third-party
+    requests are refused by default, so this only reaches sites the user allowed for a page.
+    `fetch` (below) sends cookies only to its own origin.
+  - Saving writes the whole file on each change with an expiry; fine for normal jars, a cost
+    for sites that set many persistent cookies per response.
 
 ## Known local setup notes
 

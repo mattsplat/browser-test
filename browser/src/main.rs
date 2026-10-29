@@ -32,6 +32,7 @@ macro_rules! local_asset {
 
 mod about_pages;
 mod ai_access;
+mod cookies;
 mod dart_pack;
 mod debug;
 mod dev_compile;
@@ -130,6 +131,8 @@ fn main() {
     if let Some(dir) = profile::dir() {
         blitz_net::set_cache_dir(dir.join("http-cache"));
     }
+    // One cookie jar for requests and `document.cookie`, saved in the profile's folder.
+    cookies::install();
     let cli_url = args.iter().find_map(|a| parse_cli_url(a));
 
     let window_attributes = WindowAttributes::default();

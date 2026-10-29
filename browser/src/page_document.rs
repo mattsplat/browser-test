@@ -1024,6 +1024,74 @@ mod tests {
         }
     }
 
+    // ---- Cross-pack: the web platform beyond the DOM (cookies, ...), the same page in each pack.
+
+    const WEB_API_HTML: &str = include_str!("../tests/fixtures/web_api.html");
+
+    async fn web_api_page(pack: &str, url: &str) -> PackDocument {
+        let doc = HtmlDocument::from_html(WEB_API_HTML, DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let script = |name: &str, source: &str| vec![Script { name: name.into(), source: source.into(), module: false }];
+        match pack {
+            "dart" => crate::dart_pack::start(doc, &compile("tests/fixtures/web_api.dart").await).unwrap(),
+            "python" => crate::python_pack::start(doc, &script("web_api.py", include_str!("../tests/fixtures/web_api.py"))).unwrap(),
+            _ => crate::js_pack::start(doc, &script("web_api.js", include_str!("../tests/fixtures/web_api.js")), |_| async { anyhow::bail!("no imports") }).await.unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_apis_behave_the_same_in_dart_js_and_python() {
+        use blitz_net::CookieStore as _;
+        for pack in ["dart", "js", "python"] {
+            // Each pack on its own site: the profile's cookie jar is shared by every test.
+            let url = blitz_traits::net::Url::parse(&format!("http://web-api-{pack}.test/app/page.html")).unwrap();
+            // A cookie the server set, HttpOnly: page code must never see it.
+            let server = blitz_net::HeaderValue::from_static("server=secret; HttpOnly; Path=/");
+            crate::cookies::jar().set_cookies(&mut [server].iter(), &url);
+            let mut page = web_api_page(pack, url.as_str()).await;
+            settle_timers(&mut page);
+            assert_eq!(output(&page), "cookie:a=1; b=2|cookie:b=2", "{pack}: {:?}", errors_on(url.as_str()));
+        }
+    }
+
+    /// The web API page, recorded: a replay ends with the same DOM even after the cookies
+    /// it read have changed, because the reads are on the tape; and the AI's redacted trace
+    /// never shows a cookie value, though the user's own trace does.
+    #[tokio::test]
+    async fn web_api_reads_replay_from_the_tape_and_stay_out_of_ai_views() {
+        for pack in ["dart", "js", "python"] {
+            let url = format!("http://web-api-replay-{pack}.test/app/page.html");
+            replay::arm(&url);
+            let page = web_api_page(pack, &url).await;
+            let program = match pack {
+                "dart" => replay::Program::Dart(compile("tests/fixtures/web_api.dart").await),
+                "python" => replay::Program::Scripts { pack: "python", scripts: vec![Script { name: "web_api.py".into(), source: include_str!("../tests/fixtures/web_api.py").into(), module: false }], imports: Vec::new() },
+                _ => replay::Program::Scripts { pack: "js", scripts: vec![Script { name: "web_api.js".into(), source: include_str!("../tests/fixtures/web_api.js").into(), module: false }], imports: Vec::new() },
+            };
+            page.attach_recording(WEB_API_HTML, None, program);
+            let recording = page.pack.stop_recording().unwrap();
+            assert!(recording.tape.iter().any(|(k, _)| *k == replay::Read::Cookie), "{pack}: cookie reads are on the tape");
+
+            // The jar changes afterwards; the replay still reads what the recording did, and
+            // doesn't write to the real jar.
+            let parsed = blitz_traits::net::Url::parse(&url).unwrap();
+            crate::cookies::jar().set_document_cookie(&parsed, "b=changed; Path=/");
+            let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
+            let (replayed, outcome) = replay::replay(&recording, config, None).await.unwrap();
+            assert_eq!(outcome.diverged, None, "{pack}");
+            assert_eq!(replay::dom_text(&replayed.pack().doc.borrow()), recording.final_dom, "{pack}");
+            assert_eq!(crate::cookies::jar().document_cookie(&parsed), "b=changed", "{pack}: the replay left the jar alone");
+
+            let origin = crate::settings::origin_of(&parsed);
+            let full = debug::trace(&origin, debug::Privacy::Full, usize::MAX);
+            assert!(full.iter().any(|e| e.call == "Document.cookie" && e.result.contains("b=2")), "{pack}: the user's trace shows it");
+            let redacted = debug::trace(&origin, debug::Privacy::Redacted, usize::MAX);
+            assert!(redacted.iter().any(|e| e.call == "Document.cookie"), "{pack}");
+            // (What the page itself writes into its DOM is the page's output, and isn't hidden.)
+            let secret = |e: &&TraceEntry| debug::holds_secrets(&e.call);
+            assert!(redacted.iter().filter(secret).all(|e| e.args == debug::HIDDEN && e.result == debug::HIDDEN), "{pack}: a cookie value reached the AI's view");
+        }
+    }
+
     // ---- Time-travel replay: record a session, replay it in a fresh pack, same DOM.
 
     /// Record the events scenario on its own URL, plus clicks on `#noise` (random numbers and

@@ -199,6 +199,10 @@ impl DartRuntime {
 
     /// Run everything Dart queued with `queueMicrotask`, including work queued meanwhile.
     fn run_microtasks(&mut self) -> Result<()> {
+        // A program that never queues one may not export `$invokeCallback` at all.
+        if self.store.data().microtasks.is_empty() {
+            return Ok(());
+        }
         let invoke = self
             .instance
             .get_func(&mut self.store, "$invokeCallback")

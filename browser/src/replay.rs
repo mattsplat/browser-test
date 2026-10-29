@@ -39,6 +39,15 @@ pub enum Read {
     Bits,
     /// Whether an uncaught error paused the page (pause on exceptions).
     Pause,
+    /// `document.cookie` (text: the value is an index into `Recording::texts`).
+    Cookie,
+}
+
+impl Read {
+    /// Whether the tape value is an index into the recording's texts.
+    fn is_text(self) -> bool {
+        matches!(self, Read::Cookie)
+    }
 }
 
 /// One input to the page, in the order it arrived.
@@ -106,6 +115,8 @@ pub struct Recording {
     pub program: Option<Program>,
     pub steps: Vec<Step>,
     pub tape: Vec<(Read, u64)>,
+    /// Text the pack read (cookies), indexed by tape values of text reads.
+    pub texts: Vec<String>,
     /// Hit the size limit; steps from the one that went over weren't kept.
     pub full: bool,
     /// Bytes counted against `MAX_BYTES`.
@@ -124,7 +135,7 @@ pub enum Tape {
     #[default]
     Off,
     Record(Box<Recording>),
-    Replay { values: VecDeque<(Read, u64)>, diverged: Option<String> },
+    Replay { values: VecDeque<(Read, u64)>, texts: Vec<String>, diverged: Option<String> },
 }
 
 impl Tape {
@@ -143,13 +154,38 @@ impl Tape {
                 }
                 live
             }
-            Tape::Replay { values, diverged } => match values.pop_front() {
+            Tape::Replay { values, diverged, .. } => match values.pop_front() {
                 Some((k, v)) if k == kind && diverged.is_none() => v,
                 other => {
                     diverged.get_or_insert_with(|| format!("the page read {kind:?} where the recording has {:?}", other.map(|(k, _)| k)));
                     live
                 }
             },
+        }
+    }
+
+    /// A nondeterministic read of text (a cookie, a stored value), like `read`.
+    pub fn read_text(&mut self, kind: Read, live: String) -> String {
+        match self {
+            Tape::Off => live,
+            Tape::Record(r) => {
+                if !r.full {
+                    r.bytes += VALUE_BYTES + live.len();
+                    r.tape.push((kind, r.texts.len() as u64));
+                    r.texts.push(live.clone());
+                    if r.bytes > MAX_BYTES {
+                        r.truncate_current_step();
+                    }
+                }
+                live
+            }
+            Tape::Replay { .. } => {
+                let at = self.read(kind, u64::MAX);
+                match self {
+                    Tape::Replay { texts, diverged: None, .. } => texts.get(at as usize).cloned().unwrap_or(live),
+                    _ => live,
+                }
+            }
         }
     }
 
@@ -190,6 +226,9 @@ impl Recording {
         // Reads after `step_starts_at` are the last step's.
         self.steps.pop();
         self.tape.truncate(self.step_starts_at);
+        // Texts the dropped reads pointed at go too.
+        let kept = self.tape.iter().filter(|(k, _)| k.is_text()).count();
+        self.texts.truncate(kept);
     }
 }
 
@@ -210,6 +249,7 @@ pub fn arm(url: &str) {
         program: None,
         steps: Vec::new(),
         tape: Vec::new(),
+        texts: Vec::new(),
         full: false,
         bytes: 0,
         step_starts_at: 0,
@@ -325,7 +365,7 @@ pub async fn replay(recording: &Recording, config: DocumentConfig, upto: Option<
     {
         let mut armed = ARMED.lock().unwrap();
         armed.retain(|(u, _)| *u != recording.url);
-        armed.push((recording.url.clone(), Tape::Replay { values, diverged: None }));
+        armed.push((recording.url.clone(), Tape::Replay { values, texts: recording.texts.clone(), diverged: None }));
     }
     let started = match program {
         Program::Dart(wasm) => crate::dart_pack::start(doc, wasm),

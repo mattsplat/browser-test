@@ -115,6 +115,19 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
             s.dev_grants.remove(&o);
         }))
     };
+    // Cookies are kept per site (registrable domain), like the third-party rule.
+    let site = crate::gate::site_of(&page);
+    let cookie_count = site.as_deref().map(|s| crate::cookies::jar().count(s)).unwrap_or(0);
+    let clear_cookies = {
+        let site = site.clone();
+        move |_| {
+            if let Some(site) = &site {
+                crate::cookies::jar().clear_site(site);
+            }
+            let mut changes = changes;
+            changes += 1;
+        }
+    };
     let toggle_third_party = move |_| apply(changes, Box::new(|s| s.block_third_party = !s.block_third_party));
     let reload = move |_| active_tab(tabs, active_tab_id()).reload();
 
@@ -180,6 +193,15 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
                         blocked: info.blocked,
                         allowed: allowed_sites.contains(site),
                         changes,
+                    }
+                }
+            }
+            div { class: "site-section",
+                div { class: "site-heading", "Site data" }
+                div { class: "site-row",
+                    span { "Cookies for {site.as_deref().unwrap_or(\"this page\")}: {cookie_count}" }
+                    if cookie_count > 0 {
+                        div { class: "request-clear", onclick: clear_cookies, "Clear cookies" }
                     }
                 }
             }

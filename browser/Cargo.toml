@@ -36,7 +36,7 @@ dioxus-native = { path = "../vendor/blitz/packages/dioxus-native", default-featu
 ] }
 blitz-traits = { path = "../vendor/blitz/packages/blitz-traits", default-features = false }
 blitz-dom = { path = "../vendor/blitz/packages/blitz-dom", features = ["woff", "parallel-construct", "floats", "text-transform-icu"] }
-blitz-net = { path = "../vendor/blitz/packages/blitz-net", default-features = false, features = ["http2"] }
+blitz-net = { path = "../vendor/blitz/packages/blitz-net", default-features = false, features = ["http2", "cookies"] }
 blitz-html = { path = "../vendor/blitz/packages/blitz-html", default-features = false }
 blitz-paint = { path = "../vendor/blitz/packages/blitz-paint", default-features = false, optional = true }
 browser-persistence = { path = "persistence" }
@@ -74,3 +74,7 @@ keyboard-types = "0.8"
 
 # Phase E: compiled-code cache keys (already in the dependency tree)
 sha2 = "0.10"
+
+# Web platform parity: the cookie jar shared with the network stack (already in the
+# dependency tree, through reqwest)
+cookie_store = "0.22"
