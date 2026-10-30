@@ -88,3 +88,9 @@ tungstenite = "0.29"
 native-tls = "0.2"
 # Canvas text (already in the dependency tree, through Blitz)
 parley = "0.12"
+
+# Blitz's GPU renderer never frees cached images, so a canvas animation (a new image every
+# frame) fills its atlas and panics within seconds. Our copy frees images a frame didn't
+# draw; see vendor/anyrender_vello_hybrid (search "browser-test").
+[patch.crates-io]
+anyrender_vello_hybrid = { path = "../vendor/anyrender_vello_hybrid" }
