@@ -1,0 +1,26 @@
+--- a/Zend/zend_fibers.c
++++ b/Zend/zend_fibers.c
+@@ -333,6 +333,12 @@
+ 
+ ZEND_API bool zend_fiber_init_context(zend_fiber_context *context, void *kind, zend_fiber_coroutine coroutine, size_t stack_size)
+ {
++#ifdef __wasi__
++	/* No stack switching in WASI: fibers are unavailable in the browser's PHP pack. (8.2's
++	 * init_context returns bool, where 8.4's returns zend_result.) */
++	zend_throw_error(NULL, "Fibers are not supported in this browser");
++	return false;
++#endif
+ 	context->stack = zend_fiber_stack_allocate(stack_size);
+ 
+ 	if (UNEXPECTED(!context->stack)) {
+--- a/ext/random/random.c
++++ b/ext/random/random.c
+@@ -506,7 +506,7 @@
+ 		}
+ 		return FAILURE;
+ 	}
+-#elif HAVE_DECL_ARC4RANDOM_BUF && ((defined(__OpenBSD__) && OpenBSD >= 201405) || (defined(__NetBSD__) && __NetBSD_Version__ >= 700000001) || defined(__APPLE__))
++#elif HAVE_DECL_ARC4RANDOM_BUF && ((defined(__OpenBSD__) && OpenBSD >= 201405) || (defined(__NetBSD__) && __NetBSD_Version__ >= 700000001) || defined(__APPLE__) || defined(__wasi__))
+ 	arc4random_buf(bytes, size);
+ #else
+ 	size_t read_bytes = 0;

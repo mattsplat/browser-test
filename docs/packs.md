@@ -418,6 +418,13 @@ packed JSON reply.
 into `packs/php/target/php_pack.wasm` (about 4.7 MB). The PHP side of the bridge is
 `src/prelude.php`.
 
+- **PHP versions:** each PHP minor version is its own line, built from its own source with its own
+  patches (`packs/php/patches/<line>/`), because php-src's internals move between minors (8.2's
+  secure-random code is in `ext/random/random.c`, 8.4's in `csprng.c`; 8.2's
+  `zend_fiber_init_context` returns `bool`, 8.4's `zend_result`). `packs/php/build.sh` builds
+  8.4 (the line the browser ships, also `target/php_pack.wasm`); `PHP_VERSION=8.2.35
+  packs/php/build.sh` builds another into `target/php-8.2/`. The bridge (`pack.c`, the
+  prelude) is shared and must stay within what the oldest line supports.
 - **Porting:** WASI has no users, processes, sockets, DNS, syslog or dynamic loading.
   `shim/posix_stubs.h` (force-included into every file) declares them and
   `shim/posix_stubs.c` makes each fail. PHP's bailout (`zend_try`) uses `setjmp`/`longjmp`,

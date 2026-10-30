@@ -123,7 +123,9 @@ Tests: `cd browser && cargo test --release`. They need the JS, Python and PHP pa
 | [`examples/repos`](examples/repos) | PHP: `fetch` from the GitHub API, as a sortable table |
 
 These pages only come alive in this browser. Other browsers ignore `text/python` and
-`text/php` scripts and show the static HTML.
+`text/php` scripts and show the static HTML, unless the page also loads
+[unscripted-js](https://github.com/mattsplat/unscripted-js), which runs the packs in any
+browser.
 
 ## Layout
 
