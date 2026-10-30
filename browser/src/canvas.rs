@@ -164,9 +164,23 @@ impl Canvas {
 
     // ---- Rectangles
 
+    /// How many drawing commands it keeps (each is replayed every time it's shown).
+    #[cfg(test)]
+    pub fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
     pub fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {
         let rect = Rect::new(x, y, x + w, y + h);
-        self.push(Command::Fill(rect.to_path(0.1), self.state.fill.0))
+        // An opaque fill over everything hides what came before, as a clear does: drop it.
+        // Animations often start each frame this way, and the list would otherwise grow every
+        // frame (each one re-rendering it all) until the element budget refused more.
+        let color = self.state.fill.0;
+        if color.components[3] >= 1.0 && rect.abs().contains_rect(Rect::new(0.0, 0.0, self.width as f64, self.height as f64)) {
+            self.commands.clear();
+            self.elements = 0;
+        }
+        self.push(Command::Fill(rect.to_path(0.1), color))
     }
 
     pub fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {
@@ -395,6 +409,17 @@ mod tests {
         assert_eq!(c.fill_style(), "#0000ff");
         c.clear_rect(0.0, 0.0, 20.0, 20.0).unwrap();
         assert!(c.commands.is_empty(), "a full clear drops what came before");
+        // So does an opaque fill over everything; a translucent one, or a partial one, doesn't.
+        c.fill_rect(5.0, 5.0, 2.0, 2.0).unwrap();
+        c.set_style(true, "rgba(0, 0, 0, 0.5)");
+        c.fill_rect(0.0, 0.0, 20.0, 20.0).unwrap();
+        assert_eq!(c.commands.len(), 2, "a translucent fill keeps what shows through");
+        c.set_style(true, "#ffffff");
+        c.fill_rect(0.0, 0.0, 19.0, 20.0).unwrap();
+        assert_eq!(c.commands.len(), 3, "a partial fill keeps the rest");
+        c.fill_rect(-5.0, -5.0, 30.0, 30.0).unwrap();
+        assert_eq!(c.commands.len(), 1, "an opaque fill over everything drops what came before");
+        assert_eq!(pixel(&c.render(), 20, 1, 1), [255, 255, 255, 255]);
         assert!(c.to_data_url().starts_with("data:image/png;base64,iVBORw0KGgo"));
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"Ma"), "TWE=");
