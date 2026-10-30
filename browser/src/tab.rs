@@ -206,28 +206,49 @@ fn commit_loaded_document<Lens>(
 
 #[component]
 pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<TabId>) -> Element {
+    // This tab, looked up by id each time: a lens from `tabs.iter()` is a position in the list,
+    // and the closures below outlive renders, so one kept from the first render points at
+    // another tab (or past the end) once a tab before it closes. None once this one has closed.
+    let current = move || tabs.iter().find(|tab| tab.tab_id() == tab_id);
     #[allow(clippy::expect_used)]
-    let tab = tabs
-        .iter()
-        .find(|tab| tab.tab_id() == tab_id)
-        .expect("tab exists while mounted");
-    let about = use_memo(move || AboutPage::from_url(&tab.nav_history().current_url().read().url));
+    let tab = current().expect("tab exists while mounted");
+    let about = use_memo(move || current().and_then(|tab| AboutPage::from_url(&tab.nav_history().current_url().read().url)));
+
+    // Split view shows the active tab's partner too.
+    let manager = try_use_context::<crate::tab_manager::TabManager>();
+    let shown = use_memo(move || manager.map_or(active_tab_id() == tab_id, |m| m.is_shown(tab_id)));
+    // A tab loads its page when it's first shown: restored tabs in the background wait until
+    // they're picked, as in other browsers, instead of all starting at once.
+    let mut ever_shown = use_signal(|| *shown.peek());
+    use_effect(move || {
+        if shown() && !*ever_shown.peek() {
+            ever_shown.set(true);
+        }
+    });
+    // A hidden tab's page gets no animation frames, and its timers run at most once a second.
+    use_effect(move || {
+        let hidden = !shown();
+        let Some(tab) = current() else { return };
+        if let Some(pack) = tab.page().read().as_ref().and_then(|p| p.pack()) {
+            pack.set_hidden(hidden);
+        }
+    });
 
     let loader = tab.loader_rc();
     // Loads follow the current entry's document, not its URL: moving between entries of one
     // document (pushState, a fragment) doesn't reload; the page is told instead (below).
-    let current_doc = use_memo(move || tab.nav_history().current_doc());
+    let current_doc = use_memo(move || current().map(|tab| tab.nav_history().current_doc()));
     let loaded_document = use_resource(move || {
-        let doc = current_doc();
-        let req = (*tab.nav_history().current_url().peek()).clone();
+        let waiting = !ever_shown() || current().is_none();
+        let doc = current_doc().unwrap_or_default();
+        let req = current().map(|tab| (*tab.nav_history().current_url().peek()).clone());
         let _reload_generation = loader.reload_generation();
         let loader = loader.clone();
         let is_about = about.peek().is_some();
         async move {
-            if is_about {
-                None
-            } else {
-                Some((doc, loader.load_document(req).await))
+            match req {
+                Some(req) if !is_about && !waiting => Some((doc, loader.load_document(req).await)),
+                _ => None,
             }
         }
     });
@@ -235,6 +256,7 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     // Back, forward or a fragment link within the loaded document: the page takes the entry's
     // URL and state and gets `popstate` (and `hashchange`), as browsers do.
     use_effect(move || {
+        let Some(tab) = current() else { return };
         let history = tab.nav_history();
         let (doc, url, state) = (history.current_doc(), history.current_url().read().url.clone(), history.current_state());
         if tab.loader_rc().committed_doc.get() != doc {
@@ -256,6 +278,7 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     });
 
     use_effect(move || {
+        let Some(tab) = current() else { return };
         let loader = tab.loader_rc();
         let mut status = loader.status;
         match loaded_document.state().cloned() {
@@ -271,6 +294,7 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     use_effect(move || {
         if loaded_document.read().is_some() {
             if let Some((doc, loaded)) = loaded_document.write_unchecked().take().flatten() {
+                let Some(tab) = current() else { return };
                 tab.loader_rc().committed_doc.set(doc);
                 commit_loaded_document(tab, history.clone(), loaded);
             }
@@ -278,7 +302,7 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     });
 
     use_effect(move || {
-        if let Some(page) = about() {
+        if let (Some(page), Some(tab)) = (about(), current()) {
             tab.commit_about_chrome(page);
         }
     });
@@ -287,10 +311,8 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     let document = tab.document().cloned();
     let mut node_handle_lens = tab.node_handle();
     // Split view shows the active tab's partner too; the active side is marked.
-    let manager = try_use_context::<crate::tab_manager::TabManager>();
     let split = manager.is_some_and(|m| m.split_shown());
-    let shown = manager.map_or(id == active_tab_id(), |m| m.is_shown(id));
-    let visibility = if shown { "display: block" } else { "display: none" };
+    let visibility = if shown() { "display: block" } else { "display: none" };
     let class = match (split, id == active_tab_id()) {
         (false, _) => "tab-content",
         (true, true) => "tab-content split-pane focused",
@@ -306,7 +328,9 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
     };
 
     let on_navigate = use_callback(move |req: Request| {
-        tab.navigate(req);
+        if let Some(tab) = current() {
+            tab.navigate(req);
+        }
     });
 
     rsx!(

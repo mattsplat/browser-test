@@ -427,6 +427,8 @@ enum Helper {
     QueueMicrotask,
     Print,
     NumToString,
+    /// `(d, digits) => d.toFixed(digits)`: Dart's `toStringAsFixed`.
+    ToFixed,
     IndexOf,
     /// `new Error().stack`: the current stack, used for Dart's `StackTrace.current`.
     Stack,
@@ -480,6 +482,25 @@ enum Helper {
     Unsupported(String),
 }
 
+/// JavaScript's `Number.prototype.toFixed`. Rust's formatting is the same apart from two
+/// cases: an exact half rounds away from zero in JS (`2.5` to `"3"`, Rust says `"2"`), and
+/// negative zero prints without its sign. Numbers of 1e21 and up print as `toString` does.
+fn to_fixed(n: f64, digits: usize) -> String {
+    let digits = digits.min(100);
+    if !n.is_finite() || n.abs() >= 1e21 {
+        return format_number(n);
+    }
+    let n = if n == 0.0 { 0.0 } else { n };
+    let scaled = n.abs() * 10f64.powi(digits as i32);
+    if scaled.fract() == 0.5 && scaled < 9_007_199_254_740_992.0 {
+        let whole = format!("{:0>width$}", scaled.ceil() as u64, width = digits + 1);
+        let (int, frac) = whole.split_at(whole.len() - digits);
+        let sign = if n < 0.0 { "-" } else { "" };
+        return if digits == 0 { format!("{sign}{int}") } else { format!("{sign}{int}.{frac}") };
+    }
+    format!("{n:.digits$}")
+}
+
 fn classify(body: &str) -> Helper {
     // The four shapes package:web's generated bindings compile to.
     static SHAPES: OnceLock<[(Regex, fn(String) -> Helper); 6]> = OnceLock::new();
@@ -526,6 +547,7 @@ fn classify(body: &str) -> Helper {
         "Function.prototype.call.bind(Number.prototype.toString)"
         | "Function.prototype.call.bind(BigInt.prototype.toString)" => Helper::NumToString,
         "Function.prototype.call.bind(String.prototype.indexOf)" => Helper::IndexOf,
+        "(d, digits) => d.toFixed(digits)" => Helper::ToFixed,
         "() => new Error().stack" => Helper::Stack,
         "o => o === undefined" => Helper::IsUndefined,
         "o => String(o)" => Helper::ToStr,
@@ -642,6 +664,17 @@ fn to_host(store: &mut impl AsContextMut, val: &Val) -> Result<HostValue> {
     })
 }
 
+/// `f` on a host string's code units where they are, or None if `val` isn't a host string.
+/// `to_host` copies the string, so per-character reads through it made walking a string
+/// quadratic.
+fn read_str<T>(store: &mut impl AsContextMut, val: &Val, f: impl FnOnce(&[u16]) -> T) -> Result<Option<T>> {
+    let Val::ExternRef(Some(r)) = val else { return Ok(None) };
+    Ok(match r.data(&mut *store)?.and_then(|d| d.downcast_ref::<HostValue>()) {
+        Some(HostValue::Str(s)) => Some(f(s)),
+        _ => None,
+    })
+}
+
 /// A wasm GC reference as the host sees it. Small ints arrive as i31refs, which a JS engine
 /// turns into Numbers; anything else stays an opaque Dart object.
 fn any_to_host(store: &mut impl AsContextMut, any: &Rooted<AnyRef>) -> Result<HostValue> {
@@ -705,10 +738,17 @@ fn js_string(name: &str, caller: &mut Caller<'_, State>, params: &[Val], results
         }
     };
     let value = match name {
-        "length" => HostValue::Num(s(caller, &params[0])?.len() as f64),
+        "length" => match read_str(caller, &params[0], |st| st.len())? {
+            Some(n) => HostValue::Num(n as f64),
+            None => HostValue::Num(s(caller, &params[0])?.len() as f64),
+        },
         "charCodeAt" => {
-            let st = s(caller, &params[0])?;
-            HostValue::Num(st.get(params[1].unwrap_i32() as usize).copied().unwrap_or(0) as f64)
+            let i = params[1].unwrap_i32() as usize;
+            let unit = match read_str(caller, &params[0], |st| st.get(i).copied())? {
+                Some(unit) => unit,
+                None => s(caller, &params[0])?.get(i).copied(),
+            };
+            HostValue::Num(unit.unwrap_or(0) as f64)
         }
         "concat" => {
             let mut a = s(caller, &params[0])?;
@@ -919,6 +959,11 @@ fn call_helper(h: &Helper, caller: &mut Caller<'_, State>, params: &[Val], resul
                 _ => HostValue::str(&format_number(n)),
             }
         }
+        Helper::ToFixed => {
+            let n = to_host(caller, &params[0])?.as_num().context("toFixed on a non-number")?;
+            let digits = to_host(caller, &params[1])?.as_num().unwrap_or(0.0);
+            HostValue::str(&to_fixed(n, digits as usize))
+        }
         Helper::IndexOf => {
             let hay = to_host(caller, &params[0])?.display();
             let needle = to_host(caller, &params[1])?.display();
@@ -977,6 +1022,18 @@ fn to_radix(mut n: i64, radix: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dart's `toStringAsFixed` gives what JS's `toFixed` would.
+    #[test]
+    fn to_fixed_matches_javascript() {
+        for (n, digits, js) in [
+            (1.0, 2, "1.00"), (2.5, 0, "3"), (-2.5, 0, "-3"), (0.125, 2, "0.13"), (1.005, 2, "1.00"),
+            (12.3456, 1, "12.3"), (-0.0, 1, "0.0"), (-0.04, 1, "-0.0"), (75025.0, 0, "75025"),
+            (f64::NAN, 2, "NaN"), (f64::INFINITY, 1, "Infinity"),
+        ] {
+            assert_eq!(to_fixed(n, digits), js, "{n}.toFixed({digits})");
+        }
+    }
 
     /// A site's compiled program is saved once and loaded after; another site gets its own
     /// entry, never the first one's; old entries are pruned.

@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>JS paint</title>
+  <style>
+    body { font-family: sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; color: #222; }
+    .bar { display: flex; align-items: center; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+    .swatch { width: 26px; height: 26px; border-radius: 13px; border: 2px solid #fff; }
+    .swatch.on { border-color: #222; }
+    button { font-size: 14px; padding: 5px 12px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    button.on { background: #222; color: #fff; }
+    #pad { border: 1px solid #ccc; border-radius: 8px; display: block; }
+    #saved { margin-top: 12px; max-width: 320px; border: 1px solid #ddd; }
+    #status { color: #1565C0; }
+  </style>
+</head>
+<body>
+  <h1>JS paint</h1>
+  <p>Draw with the mouse. Mouse events and a 2D canvas, in plain JavaScript (allow JS for this
+  page when the browser asks). The code is <code>paint.js</code>.</p>
+  <p id="status">JavaScript is off for this site.</p>
+  <div class="bar" id="colors"></div>
+  <div class="bar">
+    <button class="size" data-size="2">Fine</button>
+    <button class="size on" data-size="6">Medium</button>
+    <button class="size" data-size="16">Thick</button>
+    <button id="clear">Clear</button>
+    <button id="save">Snapshot</button>
+  </div>
+  <canvas id="pad" width="640" height="400"></canvas>
+  <img id="saved" alt="">
+  <script src="paint.js"></script>
+</body>
+</html>

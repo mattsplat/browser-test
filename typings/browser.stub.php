@@ -4,14 +4,9 @@
 // packs/php/src/prelude.php, where every host object is a HostObject). It lists only what
 // the browser supports: docs/api.md is the reference, and browser/src/host.rs is the truth.
 //
-// The page's globals are superglobals at runtime, but IDEs don't know that. Name their types
-// at the top of a page's file:
-//
-//   /** @var Document $document */
-//   /** @var Console $console */
-//
-// The globals are $window, $document, $console, $location, $history, $navigator,
-// $performance, $localStorage and $sessionStorage. The functions (setTimeout, fetch, ...) are in the prelude.
+// Page code reaches the browser through the `Unscripted` class, declared in that prelude:
+// its static methods (`Unscripted::document()`, `::fetch()`, ...) name these classes as their
+// return types, so completion works without declaring anything.
 
 /** A host promise: `then` calls one callback later. */
 class Promise {

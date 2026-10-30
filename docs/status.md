@@ -18,6 +18,9 @@ cd browser && cargo build --release && ./target/release/unscripted [--profile <n
 ```
 
 `vendor/blitz` is a submodule on the fork `mattsplat/blitz`, branch `browser-test`.
+`vendor/anyrender_vello_hybrid` is a patched copy of Blitz's GPU renderer (0.11.0, used
+through `[patch.crates-io]`): the original never frees cached images, so a canvas animation
+filled its atlas and crashed the app within seconds. The changes are marked `browser-test`.
 
 **First launch of this build:** existing `settings.json` and history move into
 `profiles/Default`, and the JS and Python engines recompile once (cache keys changed).
@@ -55,6 +58,9 @@ its own tests (`php_*` in `page_document.rs`) but isn't in the cross-pack ones y
 - **Cookies:** no Lax-by-default for cookies without SameSite; third-party cookies aren't partitioned; the DNS-rebinding check covers `fetch` and WebSocket, not images or CSS.
 - **Not started:** WebGL, audio/video, a draggable Split View divider, hot reload for http(s) pages, saving recordings to disk.
 - **Python:** no stdlib (`json`, `math`, `re`), no importing page files.
+- **PHP:** integers are 32-bit (wasm32 pointers), so big products silently become floats.
+- **Dart:** string concatenation copies the whole string each time, so building a long one
+  (`StringBuffer`, `join`) is quadratic; the benchmark's 20,000-string task takes ~0.6 s.
 
 ## Hand checks (not yet done; the agents couldn't drive the GUI)
 
@@ -63,7 +69,7 @@ its own tests (`php_*` in `page_document.rs`) but isn't in the cross-pack ones y
 - [ ] **AI access:** turn on, connect Claude Code (command below); cookies, storage and form values show `(hidden)`; AI control appears only while access is on.
 - [ ] **Tabs and profiles:** Cmd+K; vertical tabs layout (traffic lights, panel offset); restart restores tabs; Cmd+Shift+T; new profile opens a second window; existing history appears under Default.
 - [ ] **Python:** `examples/python-counter`; a `while True: pass` handler stops after ~5 s.
-- [ ] **PHP:** `examples/php-counter`; Console eval (`$document->querySelector('h1')->textContent`); block PHP in the Site panel and reload.
+- [ ] **PHP:** `examples/php-counter`; Console eval (`Unscripted::document()->querySelector('h1')->textContent`); block PHP in the Site panel and reload.
 - [ ] **Phase E:** site CSS (`body{background:yellow}`) applies at once; Split View; hot reload by editing `main.dart`; Record → Verify → replay to a step.
 - [ ] **Real sites:** cookies survive restart; `pushState` on an SPA; `localStorage`; a WebSocket echo; a canvas animation (watch memory for a minute).
 

@@ -129,9 +129,6 @@ static void ini_defaults(HashTable *ini) {
 static bool started;
 static zend_string *prelude_error;
 
-/* Page globals, reachable from any function or closure without `global` or `use`. */
-static const char *const SUPERGLOBALS[] = {"document", "window", "console", "localStorage", "sessionStorage", "location", "history", "navigator", "performance"};
-
 static void start(void) {
 	if (started) {
 		return;
@@ -144,9 +141,6 @@ static void start(void) {
 	zend_register_functions(NULL, pack_functions, NULL, MODULE_PERSISTENT);
 	php_error_cb_orig = zend_error_cb;
 	zend_error_cb = error_cb;
-	for (size_t i = 0; i < sizeof(SUPERGLOBALS) / sizeof(*SUPERGLOBALS); i++) {
-		zend_register_auto_global(zend_string_init_interned(SUPERGLOBALS[i], strlen(SUPERGLOBALS[i]), 1), 0, NULL);
-	}
 	zend_try {
 		zend_eval_stringl_ex((const char *)prelude_php, prelude_php_len, NULL, "<prelude>", 1);
 	} zend_end_try();

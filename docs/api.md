@@ -41,8 +41,10 @@ document.querySelector('#go').addEventListener('click', on_click)
 
 ```php
 <?php // PHP: <script type="text/php"> (inline, or src="main.php")
-$document->querySelector('#go')->addEventListener('click', function ($event) {
-    $document->querySelector('#out')->textContent = "clicked at {$event->clientX}";
+use Unscripted as U;
+
+U::document()->querySelector('#go')->addEventListener('click', function ($event) {
+    U::document()->querySelector('#out')->textContent = "clicked at {$event->clientX}";
 });
 ```
 
@@ -61,7 +63,7 @@ How each language sees the API:
 
 | | JavaScript | Python | PHP | Dart |
 |---|---|---|---|---|
-| Globals | `document`, `window`, ... | `document`, `window`, ... | `$document`, `$window`, ... (superglobals: no `global` needed) | `package:web`'s `document`, `window` |
+| Globals | `document`, `window`, ... | `document`, `window`, ... | static methods: `Unscripted::document()`, `Unscripted::fetch(...)`, ... (`use Unscripted as U;` to shorten); nothing else takes a name | `package:web`'s `document`, `window` |
 | Members | `el.textContent`, `el.focus()` | `el.textContent`, `el.focus()` | `$el->textContent`, `$el->focus()` | `el.textContent`, `el.focus()` |
 | Lists | `for...of`, spread, `forEach`, `[i]` | `for`, `len()`, `[i]` | `foreach`, `[$i]`, `->length` | `.item(i)`, `.length` |
 | Promises (`fetch`, `text()`, `json()`) | real `Promise`: `await` or `.then` | `.then(on_value, on_error)`; nest, don't chain; no `await` | `->then($ok, $err)` | `.toDart` and `await` |
@@ -85,11 +87,10 @@ open the repo root in the editor.
   `fetch` and the rest are known without imports. Annotate a handler's parameter with a
   string (`def on_click(event: 'Event')`): the type exists only for the editor.
   `querySelector` returns `Element | None`, so strict checking asks you to handle `None`.
-- **PHP:** Intelephense and PhpStorm index `typings/browser.stub.php`. Name the globals'
-  types at the top of a file (`/** @var Document $document */`), as
-  `examples/php-counter/main.php` does. Inside a closure an editor may still call
-  `$document` undefined, since it doesn't know it's a superglobal. `use ($document)` silences
-  that and works the same at runtime.
+- **PHP:** Intelephense and PhpStorm index `typings/browser.stub.php` (the web interfaces) and
+  the PHP pack's prelude (the `Unscripted` class, whose methods name those interfaces as
+  their return types). So `Unscripted::document()->` completes anywhere, closures included,
+  with nothing to declare.
 
 The stubs list only what's in this reference, so a typo or an unsupported member shows in
 the editor instead of at runtime.
@@ -103,11 +104,11 @@ the editor instead of at runtime.
 | `console` | `log`, `info`, `warn`, `error`, `debug` |
 | `location`, `history`, `navigator`, `performance` | also on `window` |
 | `localStorage`, `sessionStorage` | also on `window` |
-| `indexedDB` | JS and Python; PHP uses `$window->indexedDB` |
+| `indexedDB` | |
 | `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `requestAnimationFrame` | extra `setTimeout`/`setInterval` arguments are passed to the callback |
-| `cancelAnimationFrame` | JS and Python; PHP uses `$window->cancelAnimationFrame($id)` |
+| `cancelAnimationFrame` | |
 | `fetch(url, options)` | see [Network](#network) |
-| `WebSocket`, `XMLHttpRequest` | JS `new WebSocket(url)`; Python `WebSocket(url)`; PHP `$window->WebSocket($url)`, `$window->XMLHttpRequest()` |
+| `WebSocket`, `XMLHttpRequest` | JS `new WebSocket(url)`; Python `WebSocket(url)`; PHP `Unscripted::WebSocket($url)`, `Unscripted::XMLHttpRequest()` |
 | `Math` | JS's own `Math` (with `random` from the host); Python's `Math.random()` |
 | `scrollTo`, `scrollBy` | JS; elsewhere on `window` |
 
@@ -212,8 +213,10 @@ fetch('https://api.github.com/repos/mattsplat/unscripted').then(lambda r: r.json
 
 ```php
 <?php
-fetch('https://api.github.com/repos/mattsplat/unscripted')->then(function ($r) {
-    $r->json()->then(fn($data) => $document->querySelector('#out')->textContent = $data->name);
+use Unscripted as U;
+
+U::fetch('https://api.github.com/repos/mattsplat/unscripted')->then(function ($r) {
+    $r->json()->then(fn($data) => U::document()->querySelector('#out')->textContent = $data->name);
 });
 ```
 
@@ -322,6 +325,10 @@ Each of these errors with "... is not supported yet":
   - Python has no stdlib (`json`, `re`, `math`, `datetime`), no `await` on fetch, and can't
     import other page files.
   - PHP has no Fibers, no `sleep`, no `exec` family, and no files or sockets of its own.
+    Its integers are 32-bit (`PHP_INT_MAX` is 2147483647): php-src sizes them by pointer, and
+    WebAssembly's are 32-bit. A result past that becomes a float and loses precision.
+  - Dart strings built by repeated concatenation (a growing `StringBuffer`, a big
+    `join`) slow down with their length: each step copies the string so far.
   - Dart can't release host objects, so very long-running Dart pages can hit the limits
     below until reload.
 

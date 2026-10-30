@@ -112,6 +112,11 @@ Tests: `cd browser && cargo test --release`. They need the JS, Python and PHP pa
 | [`examples/js-modules`](examples/js-modules) | JavaScript, ES modules |
 | [`examples/python-counter`](examples/python-counter) | Python |
 | [`examples/php-counter`](examples/php-counter) | PHP, from a separate `main.php` |
+| [`examples/benchmark`](examples/benchmark) | One page per language (`js.html`, `python.html`, `php.html`, `dart.html`): the same five timed tasks, and a chart comparing every language you've run. Build the Dart one first: `packs/dart/build.sh examples/benchmark/bench.dart` |
+| [`examples/particles`](examples/particles) | PHP: a canvas animation on `requestAnimationFrame`; click to burst |
+| [`examples/paint`](examples/paint) | JavaScript: mouse drawing on a canvas, palette and brush sizes |
+| [`examples/todo`](examples/todo) | Python: forms, filters, and a list kept in `localStorage` |
+| [`examples/repos`](examples/repos) | PHP: `fetch` from the GitHub API, as a sortable table |
 
 These pages only come alive in this browser. Other browsers ignore `text/python` and
 `text/php` scripts and show the static HTML.
@@ -124,7 +129,8 @@ packs/      the language packs (each builds to a .wasm the browser loads)
 examples/   demo pages, one per language
 docs/       pack contract (packs.md) and current status (status.md)
 spike/      the rendering-engine spike that picked Blitz over Servo and Gosub
-vendor/     Blitz (git submodule, fork with a few changes)
+vendor/     Blitz (git submodule, fork with a few changes); a patched copy of Blitz's GPU
+            renderer, anyrender_vello_hybrid (frees images a frame stops drawing)
 ```
 
 ## License

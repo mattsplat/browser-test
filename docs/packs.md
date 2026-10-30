@@ -424,10 +424,11 @@ into `packs/php/target/php_pack.wasm` (about 4.7 MB). The PHP side of the bridge
 - **The bridge:** `HostObject` maps `__get`, `__set` and `__call` to host get, set and call.
   PHP's syntax separates reading a member from calling it, so unlike JS and Python there is
   no `METHODS` list. Lists support `[$i]`, `['name']` and `foreach`; their size is `->length`.
-- **Globals:** `$document`, `$window`, `$console`, `$location`, `$history`, `$navigator`,
-  `$localStorage` and `$sessionStorage` are superglobals (registered in `pack.c`), so
-  functions and closures reach them without `global` or `use`. Page variables still need
-  `global` inside functions, as in any PHP.
+- **Globals:** none. The browser's objects and functions are static methods of the prelude's
+  `Unscripted` class (`Unscripted::document()`, `::window()`, `::console()`, `::fetch()`,
+  `::setTimeout()`, ...), so a page's own `$document` or `fetch()` never collides with
+  them, and they're reachable from any function or closure. `use Unscripted as U;` shortens
+  it.
 - **Output and errors:** `echo` and warnings go to the console, one entry per call into the
   pack. Fatal errors (parse errors, uncaught exceptions, PHP's 256 MB `memory_limit`) are
   returned with file and line.
@@ -435,4 +436,4 @@ into `packs/php/target/php_pack.wasm` (about 4.7 MB). The PHP side of the bridge
   PHP's CSPRNG) is seeded through `random_get`; clocks through `clock_time_get`.
 - **Not available:** Fibers (no stack switching; creating one throws), `sleep` and the
   process functions (disabled), files, sockets, `dl()`. There is no promise wrapper yet:
-  `fetch(...)->then($ok, $err)` calls the host promise directly.
+  `Unscripted::fetch(...)->then($ok, $err)` calls the host promise directly.

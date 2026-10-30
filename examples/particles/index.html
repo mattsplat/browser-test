@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PHP particles</title>
+  <style>
+    body { font-family: sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; color: #222; }
+    #sky { border-radius: 8px; display: block; }
+    .bar { display: flex; align-items: center; gap: 12px; margin: 12px 0; }
+    button { font-size: 15px; padding: 6px 14px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    #stats { color: #555; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <h1>PHP particles</h1>
+  <p>A canvas animation in PHP: gravity, bouncing and a frame loop on
+  <code>requestAnimationFrame</code>. Click the sky to burst more. The code is
+  <code>main.php</code>.</p>
+  <div class="bar">
+    <button id="more">Add 200</button>
+    <button id="clear">Clear</button>
+    <span id="stats">PHP isn't running on this page.</span>
+  </div>
+  <canvas id="sky" width="640" height="400"></canvas>
+  <script type="text/php" src="main.php"></script>
+</body>
+</html>

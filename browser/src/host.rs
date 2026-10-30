@@ -90,6 +90,9 @@ impl HostValue {
 }
 
 pub(crate) fn format_number(n: f64) -> String {
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
     if n.fract() == 0.0 && n.abs() < 1e21 { format!("{}", n as i64) } else { format!("{n}") }
 }
 
@@ -238,6 +241,9 @@ pub struct Xhr {
 /// The most canvases with a 2D context a page may have, and their pixels in all (256 MB).
 const MAX_CANVASES: usize = 256;
 const MAX_CANVAS_PIXELS: u64 = 64 << 20;
+
+/// How often a hidden page's timers may run.
+const HIDDEN_TIMER_GAP: Duration = Duration::from_secs(1);
 
 /// The most XMLHttpRequests a page may hold at once.
 const MAX_XHRS: usize = 64 * 1024;
@@ -441,6 +447,11 @@ pub struct Objects {
     pub listeners: HashMap<(NodeId, String), Vec<usize>>,
     timers: BTreeMap<u32, Timer>,
     next_timer: u32,
+    /// The page's tab isn't shown: no animation frames, and timers at most once a second
+    /// (`HIDDEN_TIMER_GAP`), as other browsers throttle background tabs.
+    hidden: bool,
+    /// When a hidden page may next run timers.
+    hidden_next: Instant,
     started: Instant,
     /// Callbacks nothing refers to any more; the document tells the pack to release them.
     released_callbacks: Vec<usize>,
@@ -506,6 +517,8 @@ impl Default for Objects {
             timers: BTreeMap::new(),
             next_timer: 1,
             started: Instant::now(),
+            hidden: false,
+            hidden_next: Instant::now(),
             released_callbacks: Vec::new(),
             caller: Default::default(),
             host_micros: Default::default(),
@@ -718,6 +731,11 @@ impl Objects {
     }
 
     pub fn release(&mut self, handle: u32) {
+        // A promise with callbacks waiting stays until it settles (`react` frees it then): PHP
+        // drops `fetch(...)`'s promise as soon as `->then(...)` returns.
+        if self.promises.get(&handle).is_some_and(|p| p.outcome.is_none() && !p.reactions.is_empty()) {
+            return;
+        }
         // A request or transaction whose events are still to come stays until they're done.
         if let Some(r) = self.idb.requests.get_mut(&handle).filter(|r| !r.finished) {
             r.release_when_done = true;
@@ -866,10 +884,28 @@ impl Objects {
     }
 
     fn get(&self, value: &HostValue) -> Result<Obj> {
+        self.peek(value).cloned()
+    }
+
+    /// `get` without the copy. Data (`Obj::Json`) can be a big array, read an item at a time,
+    /// so its reads and writes go through here: copying it per read made that quadratic.
+    fn peek(&self, value: &HostValue) -> Result<&Obj> {
         match value {
-            HostValue::Object(h) => self.objects.get(h).cloned().context("this object is no longer available"),
+            HostValue::Object(h) => self.objects.get(h).context("this object is no longer available"),
             other => bail!("expected a web object, got {}", other.display()),
         }
+    }
+
+    /// `target[prop]` when `target` is data: Some(None) for a missing field, None when it isn't
+    /// data.
+    fn json_field(&self, target: &HostValue, prop: &str) -> Option<Option<serde_json::Value>> {
+        let Ok(Obj::Json(value)) = self.peek(target) else { return None };
+        Some(match value {
+            serde_json::Value::Array(items) if prop == "length" => Some(serde_json::Value::from(items.len())),
+            serde_json::Value::Array(items) => prop.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
+            serde_json::Value::Object(fields) => fields.get(prop).cloned(),
+            _ => None,
+        })
     }
 
     fn add_timer(&mut self, callback: usize, delay: Duration, interval: Option<Duration>, frame: bool) -> HostValue {
@@ -1038,12 +1074,28 @@ impl Objects {
 
     /// When the next timer is due, if any.
     pub fn next_deadline(&self) -> Option<Instant> {
+        if self.hidden {
+            return self.timers.values().filter(|t| !t.frame).map(|t| t.due.max(self.hidden_next)).min();
+        }
         self.timers.values().map(|t| t.due).min()
     }
 
+    /// Hide or show the page (its tab was switched away from or back to).
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+    }
+
     /// Timers due at `now`, in due order. Intervals are rescheduled; the rest are removed.
+    /// Hidden, animation frames wait and the rest run at most once per `HIDDEN_TIMER_GAP`.
     pub fn take_due_timers(&mut self, now: Instant) -> Vec<DueTimer> {
-        let mut due: Vec<(Instant, u32)> = self.timers.iter().filter(|(_, t)| t.due <= now).map(|(h, t)| (t.due, *h)).collect();
+        if self.hidden && now < self.hidden_next {
+            return Vec::new();
+        }
+        let hidden = self.hidden;
+        let mut due: Vec<(Instant, u32)> = self.timers.iter().filter(|(_, t)| t.due <= now && !(hidden && t.frame)).map(|(h, t)| (t.due, *h)).collect();
+        if hidden && !due.is_empty() {
+            self.hidden_next = now + HIDDEN_TIMER_GAP;
+        }
         due.sort();
         let elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
         let mut out = Vec::new();
@@ -1406,7 +1458,7 @@ impl PageHost {
     }
 
     fn label(&self, target: &HostValue, member: &str) -> String {
-        match self.objects.borrow().get(target) {
+        match self.objects.borrow().peek(target) {
             // Keys typed into a form field (a password among them) are labelled apart, so the
             // AI's views can hide them (`debug::holds_secrets`).
             Ok(Obj::Event(e)) if matches!(member, "key" | "code") && self.is_field(e.target) => format!("FieldKeyEvent.{member}"),
@@ -1609,6 +1661,13 @@ impl PageHost {
     }
 
     fn do_get(&mut self, target: &HostValue, prop: &str) -> Result<HostValue> {
+        let field = self.objects.borrow().json_field(target, prop);
+        if let Some(field) = field {
+            return Ok(match field {
+                Some(v) => self.objects.borrow_mut().from_json(v),
+                None => HostValue::Undefined,
+            });
+        }
         let obj = self.objects.borrow().get(target)?;
         Ok(match (&obj, prop) {
             (Obj::Window, "document") => self.objects.borrow_mut().singleton("document", Obj::Document),
@@ -1917,18 +1976,6 @@ impl PageHost {
                 }
                 _ => bail!("Response.{prop} is not supported yet"),
             },
-            (Obj::Json(value), _) => {
-                let field = match value {
-                    serde_json::Value::Array(items) if prop == "length" => Some(serde_json::Value::from(items.len())),
-                    serde_json::Value::Array(items) => prop.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
-                    serde_json::Value::Object(fields) => fields.get(prop).cloned(),
-                    _ => None,
-                };
-                match field {
-                    Some(v) => self.objects.borrow_mut().from_json(v),
-                    None => HostValue::Undefined,
-                }
-            }
             (Obj::Event(e), _) => match self.event_prop(e, prop) {
                 Some(v) => v,
                 None => bail!("Event.{prop} is not supported yet"),
@@ -1938,6 +1985,15 @@ impl PageHost {
     }
 
     fn do_set(&mut self, target: &HostValue, prop: &str, value: &HostValue) -> Result<()> {
+        // Writing a field of data in place (see `Objects::peek`).
+        if matches!(self.objects.borrow().peek(target), Ok(Obj::Json(_))) {
+            let field = self.objects.borrow().to_json(value)?;
+            let HostValue::Object(handle) = target else { bail!("not an object") };
+            if let (Some(Obj::Json(serde_json::Value::Object(fields))), Some(field)) = (self.objects.borrow_mut().objects.get_mut(handle), field) {
+                fields.insert(prop.to_string(), field);
+            }
+            return Ok(());
+        }
         let obj = self.objects.borrow().get(target)?;
         match (&obj, prop) {
             // Setting a canvas's size clears it, as in browsers.
@@ -1956,14 +2012,6 @@ impl PageHost {
                 return Ok(());
             }
             (Obj::Element(_), _) => {}
-            (Obj::Json(_), _) => {
-                let field = self.objects.borrow().to_json(value)?;
-                let HostValue::Object(handle) = target else { bail!("not an object") };
-                if let (Some(Obj::Json(serde_json::Value::Object(fields))), Some(field)) = (self.objects.borrow_mut().objects.get_mut(handle), field) {
-                    fields.insert(prop.to_string(), field);
-                }
-                return Ok(());
-            }
             (Obj::Location, "href" | "hash") | (Obj::Window | Obj::Document, "location") => {
                 let text = value.display();
                 let target = match prop {
@@ -2086,6 +2134,15 @@ impl PageHost {
     }
 
     fn do_call(&mut self, target: &HostValue, method: &str, args: &[HostValue]) -> Result<HostValue> {
+        // Pushing onto data in place (see `Objects::peek`).
+        if method == "push" && matches!(self.objects.borrow().peek(target), Ok(Obj::Json(serde_json::Value::Array(_)))) {
+            let items = args.iter().map(|v| Ok(self.objects.borrow().to_json(v)?.unwrap_or(serde_json::Value::Null))).collect::<Result<Vec<_>>>()?;
+            let HostValue::Object(handle) = target else { bail!("not an array") };
+            let mut objects = self.objects.borrow_mut();
+            let Some(Obj::Json(serde_json::Value::Array(array))) = objects.objects.get_mut(handle) else { bail!("not an array") };
+            array.extend(items);
+            return Ok(HostValue::Num(array.len() as f64));
+        }
         let obj = self.objects.borrow().get(target)?;
         let text = |i: usize| args.get(i).map(|v| v.display()).with_context(|| format!("{method}: missing argument {i}"));
         let attr_name = |i: usize| text(i).map(|n| QualName::new(None, ns!(), LocalName::from(n.as_str())));
@@ -2766,14 +2823,6 @@ impl PageHost {
                 self.storage_write(*local, |a| Ok(a.remove(&key)))?
             }
             (Obj::Storage(local), "clear") => self.storage_write(*local, |a| Ok(a.clear()))?,
-            (Obj::Json(serde_json::Value::Array(_)), "push") => {
-                let items = args.iter().map(|v| Ok(self.objects.borrow().to_json(v)?.unwrap_or(serde_json::Value::Null))).collect::<Result<Vec<_>>>()?;
-                let HostValue::Object(handle) = target else { bail!("not an array") };
-                let mut objects = self.objects.borrow_mut();
-                let Some(Obj::Json(serde_json::Value::Array(array))) = objects.objects.get_mut(handle) else { bail!("not an array") };
-                array.extend(items);
-                HostValue::Num(array.len() as f64)
-            }
             (Obj::Promise, "then") => {
                 let HostValue::Object(promise) = target else { bail!("not a promise") };
                 let function = |i: usize| match args.get(i) {
@@ -3056,7 +3105,7 @@ impl Host for PageHost {
     }
 
     fn is_array(&mut self, value: &HostValue) -> bool {
-        matches!(self.objects.borrow().get(value), Ok(Obj::Json(serde_json::Value::Array(_))))
+        matches!(self.objects.borrow().peek(value), Ok(Obj::Json(serde_json::Value::Array(_))))
     }
 
     fn array(&mut self, items: Vec<HostValue>) -> Result<HostValue> {
@@ -3066,8 +3115,10 @@ impl Host for PageHost {
     }
 }
 
-/// How many trace entries are kept; older ones are dropped.
-const TRACE_CAPACITY: usize = 2000;
+/// How many trace entries are kept; older ones are dropped. Tests share one trace and many
+/// run at once, so they keep far more: a busy one (the benchmark example) mustn't push out
+/// the entries another is checking.
+const TRACE_CAPACITY: usize = if cfg!(test) { 1 << 20 } else { 2000 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TraceKind {

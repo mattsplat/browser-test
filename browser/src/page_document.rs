@@ -290,6 +290,15 @@ impl RunningPack {
         Ok(debug::describe(&self.doc.borrow(), node))
     }
 
+    /// The page's tab was hidden or shown: hidden, it gets no animation frames and its timers
+    /// are throttled (`Objects::set_hidden`); shown, anything that came due runs.
+    pub fn set_hidden(&self, hidden: bool) {
+        self.objects.borrow_mut().set_hidden(hidden);
+        if !hidden {
+            self.arm_timers();
+        }
+    }
+
     /// Let the pack run again after pausing on an exception.
     pub fn resume(&self) {
         self.objects.borrow_mut().tape.step(|| replay::Step::Resume);
@@ -1785,7 +1794,11 @@ mod tests {
             // network), so it closes rather than hanging open.
             let config = DocumentConfig { base_url: Some(url.clone()), ..Default::default() };
             let (partial, _) = replay::replay(&recording, config, Some(1)).await.unwrap();
-            partial.pack().deliver_sockets();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !output(&partial).contains("close:") && Instant::now() < until {
+                partial.pack().deliver_sockets();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             assert!(output(&partial).contains("close:1006,,false,3"), "{pack}: {}", output(&partial));
 
             let origin = format!("http://localhost:{port}");
@@ -2926,9 +2939,184 @@ setInterval(tick, 1)
         assert_eq!(text_of(&doc, "#log"), "Click 1, handled in PHP (click)Click 2, handled in PHP (click)");
     }
 
-    /// PHP reaches the DOM through the host: properties, methods, a closure as a listener (the
-    /// page's globals are superglobals, so it needs no `use`), echo to the console, and one
-    /// global scope across scripts.
+    /// The examples' folder, a page in it as a document at its `file:` URL (so it has storage),
+    /// and a script file from it.
+    fn example_url(path: &str) -> String {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples").join(path).canonicalize().unwrap();
+        blitz_traits::net::Url::from_file_path(&file).unwrap().to_string()
+    }
+
+    fn example_doc(path: &str) -> BaseDocument {
+        let html = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples").join(path)).unwrap();
+        HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(example_url(path)), ..Default::default() }).into_inner()
+    }
+
+    fn example_script(path: &str) -> Vec<Script> {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples").join(path);
+        vec![Script { name: path.to_string(), source: std::fs::read_to_string(file).unwrap(), module: false }]
+    }
+
+    /// Run a page's event loop (fetch results, then timers) until nothing is left or `limit`
+    /// passes.
+    fn run_timers_for(page: &mut PackDocument, limit: std::time::Duration) {
+        let until = Instant::now() + limit;
+        loop {
+            let delivered = page.pack.deliver_fetches();
+            if !delivered && (page.pack.objects.borrow().next_deadline().is_none() || Instant::now() >= until) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            page.pack.run_due_timers();
+        }
+    }
+
+    /// Errors an example page hit (the trace is shared by every test running at once).
+    fn example_errors(path: &str) -> Vec<String> {
+        errors_on(&example_url(path))
+    }
+
+    /// The benchmark example in all four languages: each runs its five tasks to the end and
+    /// computes the same check values (the canvas task draws the same pseudo-random sequence).
+    #[tokio::test]
+    async fn benchmark_example_computes_the_same_in_every_language() {
+        let wasm = compile("../examples/benchmark/bench.dart").await;
+        let no_imports = |url: String| async move { Err::<String, _>(anyhow::anyhow!("404 {url}")) };
+        let pages = [
+            ("dart", "Dart", crate::dart_pack::start(example_doc("benchmark/dart.html"), Default::default(), &wasm).unwrap()),
+            ("js", "JavaScript", crate::js_pack::start(example_doc("benchmark/js.html"), Default::default(), &example_script("benchmark/bench.js"), no_imports).await.unwrap()),
+            ("python", "Python", crate::python_pack::start(example_doc("benchmark/python.html"), Default::default(), &example_script("benchmark/bench.py")).unwrap()),
+            ("php", "PHP", crate::php_pack::start(example_doc("benchmark/php.html"), Default::default(), &example_script("benchmark/bench.php")).unwrap()),
+        ];
+        let mut all = Vec::new();
+        for (pack, name, mut page) in pages {
+            assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), format!("{name} is ready."), "{:?}", example_errors(&format!("benchmark/{pack}.html")));
+            dispatch(&mut page, "#run", click_at(0.0, 0.0, false));
+            run_timers_for(&mut page, std::time::Duration::from_secs(60));
+            let doc = page.pack.doc.borrow();
+            assert_eq!(text_of(&doc, "#status"), "Done. Run the other languages to compare them.", "{pack}: {:?}", example_errors(&format!("benchmark/{pack}.html")));
+            let cells: Vec<String> = doc.query_selector_all("#rows td").unwrap().iter().map(|&id| doc.get_node(id).unwrap().text_content()).collect();
+            let checks: Vec<String> = cells.iter().skip(2).step_by(3).cloned().collect();
+            eprintln!("{pack}: ms {:?} checks {checks:?}", cells.iter().skip(1).step_by(3).collect::<Vec<_>>());
+            all.push((pack, checks));
+        }
+        // fib(25), the primes below a million, the strings and elements made, then the canvas
+        // task's last pseudo-random number, which every language must reach.
+        for (pack, checks) in &all {
+            assert_eq!(checks[..4], ["75025", "78498", "20000", "1000"], "{pack}");
+            assert_eq!(checks[4], all[0].1[4], "{pack}'s canvas sequence differs from {}'s", all[0].0);
+        }
+    }
+
+    /// A mouse event at (x, y), shaped like `click_at`'s.
+    fn mouse_at(kind: fn(BlitzPointerEvent) -> DomEventData, x: f32, y: f32) -> DomEventData {
+        let DomEventData::Click(pointer) = click_at(x, y, false) else { unreachable!() };
+        kind(pointer)
+    }
+
+    /// The PHP particles example runs its frame loop: particles, a frame counter, and a
+    /// button that adds more.
+    #[test]
+    fn particles_example_animates_in_php() {
+        let mut page = crate::php_pack::start(example_doc("particles/index.html"), Default::default(), &example_script("particles/main.php")).unwrap();
+        let particles = |page: &PackDocument| -> usize {
+            let stats = text_of(&page.pack.doc.borrow(), "#stats");
+            stats.split(" particles · ").next().and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{stats:?} {:?}", example_errors("particles/index.html")))
+        };
+        run_timers_for(&mut page, std::time::Duration::from_millis(100));
+        let first = particles(&page);
+        assert!(first > 0);
+        // Each frame paints the background over everything, so the canvas keeps one frame's
+        // drawing (a background and a dot per particle), not every frame's.
+        dispatch(&mut page, "#more", click_at(0.0, 0.0, false));
+        run_timers_for(&mut page, std::time::Duration::from_millis(500));
+        let now = particles(&page);
+        assert!(now >= first);
+        let kept: Vec<usize> = page.pack.objects.borrow().canvases.values().map(|c| c.command_count()).collect();
+        assert_eq!(kept, [now + 1]);
+        assert_eq!(example_errors("particles/index.html"), Vec::<String>::new());
+    }
+
+    /// The JS paint example: a stroke (mousedown, moves, mouseup) is counted, and picking a
+    /// color rings its swatch.
+    #[test]
+    fn paint_example_draws_strokes_in_js() {
+        let no_imports = |url: String| async move { Err::<String, _>(anyhow::anyhow!("404 {url}")) };
+        let mut page = futures_lite_block_on(crate::js_pack::start(example_doc("paint/index.html"), Default::default(), &example_script("paint/paint.js"), no_imports)).unwrap();
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Ready: draw on the canvas.", "{:?}", example_errors("paint/index.html"));
+        dispatch(&mut page, "#pad", mouse_at(DomEventData::MouseDown, 10.0, 10.0));
+        dispatch(&mut page, "#pad", mouse_at(DomEventData::MouseMove, 40.0, 30.0));
+        dispatch(&mut page, "#pad", mouse_at(DomEventData::MouseMove, 80.0, 50.0));
+        dispatch(&mut page, "#pad", mouse_at(DomEventData::MouseUp, 80.0, 50.0));
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "1 stroke.");
+        dispatch(&mut page, "#colors div:nth-child(2)", click_at(0.0, 0.0, false));
+        let doc = page.pack.doc.borrow();
+        let ringed: Vec<String> = doc.query_selector_all(".swatch.on").unwrap().iter().map(|&id| doc.get_node(id).unwrap().attr(blitz_dom::LocalName::from("data-color")).unwrap_or_default().to_string()).collect();
+        assert_eq!(ringed, ["#E53935"]);
+        assert_eq!(example_errors("paint/index.html"), Vec::<String>::new());
+    }
+
+    /// The Python to-do example: starter items, adding and ticking one, filtering, and the
+    /// list saved to localStorage for the next visit.
+    #[test]
+    fn todo_example_keeps_its_list_in_python() {
+        let start = || crate::python_pack::start(example_doc("todo/index.html"), Default::default(), &example_script("todo/main.py")).unwrap();
+        let mut page = start();
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#left"), "3 items left", "{:?}", example_errors("todo/index.html"));
+        page.pack.eval("add('Buy milk')", debug::CONSOLE_PACK).unwrap();
+        page.pack.eval("toggle(0)", debug::CONSOLE_PACK).unwrap();
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#left"), "3 items left");
+        dispatch(&mut page, ".filter[data-filter=done]", click_at(0.0, 0.0, false));
+        assert_eq!(page.pack.doc.borrow().query_selector_all("#items li").unwrap().len(), 1);
+        drop(page);
+        // A new visit reads the saved list.
+        let page = start();
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#left"), "3 items left");
+        assert_eq!(page.pack.doc.borrow().query_selector_all("#items li").unwrap().len(), 4);
+        page.pack.eval("on_clear_done(None)", debug::CONSOLE_PACK).unwrap();
+        assert_eq!(page.pack.doc.borrow().query_selector_all("#items li").unwrap().len(), 3);
+        assert_eq!(example_errors("todo/index.html"), Vec::<String>::new());
+    }
+
+    /// The PHP repo browser asks GitHub on load; with no network (tests have none) it says it
+    /// couldn't load, and its own name check runs before any request. Its promise is dropped
+    /// as soon as `->then()` returns, as PHP does, and the callback must still run.
+    #[test]
+    fn repos_example_reports_a_failed_load_in_php() {
+        let mut page = crate::php_pack::start(example_doc("repos/index.html"), Default::default(), &example_script("repos/main.php")).unwrap();
+        run_timers_for(&mut page, std::time::Duration::from_millis(200));
+        let status = text_of(&page.pack.doc.borrow(), "#status");
+        assert!(status.starts_with("Couldn't load: TypeError"), "{status} {:?}", example_errors("repos/index.html"));
+        page.pack.eval("$repos->load('not a name!')", debug::CONSOLE_PACK).unwrap();
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "That isn't a GitHub user or organisation name.");
+    }
+
+    /// A hidden tab's page gets no animation frames and runs its timers at most once a
+    /// second; shown again, it runs at full speed.
+    #[test]
+    fn hidden_pages_are_throttled() {
+        let mut page = js_page("<p id=out></p>", &["
+            let ticks = 0, frames = 0;
+            setInterval(() => ticks++, 10);
+            const frame = () => { frames++; requestAnimationFrame(frame); };
+            requestAnimationFrame(frame);
+            globalThis.counts = () => (document.querySelector('#out').textContent = `${ticks} ${frames}`);
+        "]);
+        let counts = |page: &PackDocument| {
+            page.pack.eval("counts()", debug::CONSOLE_PACK).unwrap();
+            let out = text_of(&page.pack.doc.borrow(), "#out");
+            let (ticks, frames) = out.split_once(' ').unwrap();
+            (ticks.parse::<u32>().unwrap(), frames.parse::<u32>().unwrap())
+        };
+        page.pack.set_hidden(true);
+        run_timers_for(&mut page, std::time::Duration::from_millis(500));
+        let (ticks, frames) = counts(&page);
+        assert!(ticks <= 1 && frames == 0, "hidden: {ticks} ticks, {frames} frames");
+        page.pack.set_hidden(false);
+        run_timers_for(&mut page, std::time::Duration::from_millis(200));
+        let (ticks, frames) = counts(&page);
+        assert!(ticks >= 5 && frames >= 3, "shown: {ticks} ticks, {frames} frames");
+    }
+
     /// `performance` is the page's clock in every interpreter: `now()` counts milliseconds from
     /// the page's start and never goes back, and `timeOrigin` is the wall time it started.
     #[test]
@@ -2937,7 +3125,7 @@ setInterval(tick, 1)
         let pages = [
             ("js", js_page(html, &["document.querySelector('#out').textContent = [performance.now(), performance.now(), performance.timeOrigin].join(' ')"])),
             ("python", python_page(html, &["document.querySelector('#out').textContent = ' '.join(str(x) for x in [performance.now(), performance.now(), performance.timeOrigin])"])),
-            ("php", php_page(html, &["$document->querySelector('#out')->textContent = implode(' ', [$performance->now(), $performance->now(), $performance->timeOrigin]);"])),
+            ("php", php_page(html, &["Unscripted::document()->querySelector('#out')->textContent = implode(' ', [Unscripted::performance()->now(), Unscripted::performance()->now(), Unscripted::performance()->timeOrigin]);"])),
         ];
         let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
         for (name, page) in pages {
@@ -2950,17 +3138,35 @@ setInterval(tick, 1)
         }
     }
 
+    /// The browser takes no names in the page's own code: a page's `$document`, `$window` or
+    /// `fetch` are its own, and `Unscripted` (or a `use` alias of it) still reaches the page.
+    #[test]
+    fn php_pages_own_their_names() {
+        let page = php_page("<p id=out></p>", &[r#"<?php
+            use Unscripted as U;
+            function fetch() { return 'mine'; }
+            function clobber() { $document = 'mine'; $window = null; }
+            $document = 'also mine';
+            clobber();
+            U::document()->querySelector('#out')->textContent = implode(',', [$document, fetch(), U::window() instanceof HostObject ? 'window' : '?']);
+        "#]);
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#out"), "also mine,mine,window");
+    }
+
+    /// PHP reaches the DOM through the host: properties, methods, a closure as a listener (the
+    /// browser's objects come from the `Unscripted` class, so it needs no `use`), echo to the
+    /// console, and one global scope across scripts.
     #[test]
     fn php_runs_and_handles_clicks() {
         let page = php_page("<button id=increment>+</button><p id=count>0</p><ul id=log></ul><p id=status></p>", &[
-            "<?php\n$clicks = 0;\n$document->querySelector('#status')->textContent = 'PHP ' . PHP_VERSION . ' is running';",
-            r#"$document->querySelector('#increment')->addEventListener('click', function ($event) {
+            "<?php\n$clicks = 0;\nUnscripted::document()->querySelector('#status')->textContent = 'PHP ' . PHP_VERSION . ' is running';",
+            r#"Unscripted::document()->querySelector('#increment')->addEventListener('click', function ($event) {
                 global $clicks;
                 $clicks++;
-                $document->querySelector('#count')->textContent = (string) $clicks;
-                $item = $document->createElement('li');
+                Unscripted::document()->querySelector('#count')->textContent = (string) $clicks;
+                $item = Unscripted::document()->createElement('li');
                 $item->textContent = "Click $clicks ({$event->type})";
-                $document->querySelector('#log')->appendChild($item);
+                Unscripted::document()->querySelector('#log')->appendChild($item);
                 echo "clicked $clicks\n";
             });
             echo json_encode(['pcre' => preg_match('/^\d+$/', '42'), 'hash' => substr(hash('sha256', 'x'), 0, 8)]);"#,
@@ -2986,7 +3192,7 @@ setInterval(tick, 1)
     fn php_errors_are_reported() {
         let page = php_page("<p id=out></p>", &[
             "function inner() { throw new RuntimeException('php broke'); }\ninner();",
-            "try { $document->fooBar(); } catch (Error $e) { $document->querySelector('#out')->textContent = $e->getMessage(); }",
+            "try { Unscripted::document()->fooBar(); } catch (Error $e) { Unscripted::document()->querySelector('#out')->textContent = $e->getMessage(); }",
             "function broken( {",
             "$f = new Fiber(fn() => 1); $f->start();",
             "echo $undefined_variable;",
@@ -3013,10 +3219,10 @@ setInterval(tick, 1)
         assert_eq!(eval("strlen(random_bytes(16))").unwrap(), "16");
         assert_eq!(eval("bump()").unwrap(), "42");
         assert_eq!(eval("[1, 'a', null];").unwrap(), "array (\n  0 => 1,\n  1 => 'a',\n  2 => NULL,\n)");
-        assert_eq!(eval("$x = 5; $document->querySelector('#out')->textContent = 'from the console';").unwrap(), "");
+        assert_eq!(eval("$x = 5; Unscripted::document()->querySelector('#out')->textContent = 'from the console';").unwrap(), "");
         assert_eq!(output(&page), "from the console");
         assert_eq!(eval("$x * 2").unwrap(), "10");
-        assert_eq!(eval("$document->querySelector('#out')").unwrap(), "<p id=\"out\">");
+        assert_eq!(eval("Unscripted::document()->querySelector('#out')").unwrap(), "<p id=\"out\">");
         let err = eval("missing()").unwrap_err().to_string();
         assert!(err.contains("Call to undefined function missing()"), "{err}");
     }
@@ -3025,7 +3231,7 @@ setInterval(tick, 1)
     #[test]
     fn runaway_php_is_stopped() {
         let mut page = php_page("<button id=b>go</button>", &[
-            "$document->querySelector('#b')->addEventListener('click', function () { while (true) {} });",
+            "Unscripted::document()->querySelector('#b')->addEventListener('click', function () { while (true) {} });",
         ]);
         dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
         assert!(host::trace().iter().any(|e| e.pack == "php" && e.result.contains("script ran too long and was stopped (PHP)")));
@@ -3048,7 +3254,7 @@ setInterval(tick, 1)
                 try { $f('true', 'r'); $reachable[] = $f; } catch (Error) {}
             }
             try { if (@dl('x.so')) $reachable[] = 'dl'; } catch (Error) {}
-            $document->querySelector('#out')->textContent = $reachable ? implode(',', $reachable) : 'none';
+            Unscripted::document()->querySelector('#out')->textContent = $reachable ? implode(',', $reachable) : 'none';
         "#]);
         assert_eq!(output(&page), "none");
     }

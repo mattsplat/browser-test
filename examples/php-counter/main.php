@@ -1,23 +1,16 @@
 <?php
-// The page's globals come from the browser. For editor completion, open the repo root: IDEs
-// index typings/browser.stub.php, and these lines name the globals' types.
-/** @var Document $document */
-/** @var Console $console */
+// The browser's objects come from the Unscripted class; `use` gives it a short name.
+use Unscripted as U;
 
+$document = U::document();
 $document->querySelector('#status')->textContent = 'PHP ' . PHP_VERSION . ' is running, as a pack in WebAssembly.';
 $clicks = 0;
 
-// $document is a superglobal here, so the closure needs no `use`.
-$document->querySelector('#increment')->addEventListener('click', function ($event) {
-    global $clicks;
-
+$document->querySelector('#increment')->addEventListener('click', function ($event) use ($document, &$clicks) {
     $clicks++;
     $document->querySelector('#count')->textContent = (string) $clicks;
-
     $item = $document->createElement('li');
     $item->textContent = "Click $clicks, handled in PHP ({$event->type})";
-
     $document->querySelector('#log')->appendChild($item);
-    $console->log("click $clicks");
-    $console->log(var_export($document, true));
+    U::console()->log("click $clicks");
 });

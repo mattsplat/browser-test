@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Benchmark: Python</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Benchmark: Python</h1>
+  <p class="nav">The same five tasks in every language:
+    <a href="js.html">JavaScript</a> · <a href="python.html">Python</a> ·
+    <a href="php.html">PHP</a> · <a href="dart.html">Dart</a>.
+    Results are kept in this browser, so the chart compares every language you've run here.
+    The Check column shows each language computed the same thing.</p>
+  <p id="status">Python isn't running on this page.</p>
+  <p><button id="run">Run</button><button id="clear">Clear all results</button></p>
+  <table>
+    <thead><tr><th>Task</th><th>ms</th><th>Check</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <canvas id="chart" width="640" height="380"></canvas>
+  <canvas id="scratch" width="300" height="150"></canvas>
+  <ul id="dom"></ul>
+  <script type="text/python" src="bench.py"></script>
+</body>
+</html>

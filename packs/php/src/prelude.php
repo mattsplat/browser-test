@@ -1,6 +1,6 @@
 // Runs before any page script. Turns host handles into PHP objects: property reads and writes
 // and method calls on them become host requests, so pages use the same web platform names the
-// Dart, JS and Python packs do ($document->querySelector('#count')->textContent). `__host`
+// Dart, JS and Python packs do (Unscripted::document()->querySelector('#count')->textContent). `__host`
 // (from pack.c) is the only way out. No `<?php` tag: pack.c compiles this as code.
 //
 // Unlike JS and Python, PHP's syntax says whether a member is read (`$el->focus`, __get) or
@@ -131,44 +131,91 @@ final class HostObject implements ArrayAccess, IteratorAggregate {
 	}
 }
 
-// The page's globals. pack.c makes these superglobals, so functions and closures see them
-// without `global` or `use`.
-$window = __request(['op' => 'global', 'name' => 'window']);
-$document = __request(['op' => 'global', 'name' => 'document']);
-$console = __request(['op' => 'global', 'name' => 'console']);
-$location = $window->location;
-$navigator = $window->navigator;
-$performance = $window->performance;
-$history = $window->history;
-$localStorage = $window->localStorage;
-$sessionStorage = $window->sessionStorage;
+/**
+ * The browser, for page code: its objects and functions as static methods, so nothing takes a
+ * name in the page's own code. `use Unscripted as U;` shortens it to `U::document()`.
+ *
+ * Return types are `object` (every one is a HostObject); the docblocks name the web interface,
+ * for editors (typings/browser.stub.php declares them).
+ */
+final class Unscripted {
+	/** @var array<string, HostObject> */
+	private static array $objects = [];
 
-// Timers and the network come from the host, as for every pack. Extra arguments are passed to
-// the callback, as in browsers.
-function setTimeout(callable $f, int|float $ms = 0, mixed ...$args): int {
-	return $GLOBALS['window']->setTimeout($args ? fn() => $f(...$args) : Closure::fromCallable($f), $ms);
-}
+	private static function get(string $name): HostObject {
+		return self::$objects[$name] ??= match ($name) {
+			'window', 'document', 'console' => __request(['op' => 'global', 'name' => $name]),
+			default => self::window()->$name,
+		};
+	}
 
-function setInterval(callable $f, int|float $ms = 0, mixed ...$args): int {
-	return $GLOBALS['window']->setInterval($args ? fn() => $f(...$args) : Closure::fromCallable($f), $ms);
-}
+	/** @return Window */
+	public static function window(): object { return self::get('window'); }
+	/** @return Document */
+	public static function document(): object { return self::get('document'); }
+	/** @return Console */
+	public static function console(): object { return self::get('console'); }
+	/** @return Location */
+	public static function location(): object { return self::get('location'); }
+	/** @return History */
+	public static function history(): object { return self::get('history'); }
+	/** @return Navigator */
+	public static function navigator(): object { return self::get('navigator'); }
+	/** @return Performance */
+	public static function performance(): object { return self::get('performance'); }
+	/** @return Storage */
+	public static function localStorage(): object { return self::get('localStorage'); }
+	/** @return Storage */
+	public static function sessionStorage(): object { return self::get('sessionStorage'); }
+	/** @return IDBFactory */
+	public static function indexedDB(): object { return self::get('indexedDB'); }
 
-function clearTimeout(?int $handle): void {
-	$GLOBALS['window']->clearTimeout($handle);
-}
+	// Timers and the network come from the host, as for every pack. Extra arguments are passed
+	// to the callback, as in browsers.
+	public static function setTimeout(callable $f, int|float $ms = 0, mixed ...$args): int {
+		return self::window()->setTimeout($args ? fn() => $f(...$args) : Closure::fromCallable($f), $ms);
+	}
 
-function clearInterval(?int $handle): void {
-	$GLOBALS['window']->clearInterval($handle);
-}
+	public static function setInterval(callable $f, int|float $ms = 0, mixed ...$args): int {
+		return self::window()->setInterval($args ? fn() => $f(...$args) : Closure::fromCallable($f), $ms);
+	}
 
-function requestAnimationFrame(callable $f): int {
-	return $GLOBALS['window']->requestAnimationFrame(Closure::fromCallable($f));
-}
+	public static function clearTimeout(?int $handle): void {
+		self::window()->clearTimeout($handle);
+	}
 
-/** The network, through the page's gate: a host Promise of a Response; `->then($ok, $err)`
- * calls one of them later, from the event loop. */
-function fetch(string $input, ?array $init = null): HostObject {
-	return $GLOBALS['window']->fetch($input, $init);
+	public static function clearInterval(?int $handle): void {
+		self::window()->clearInterval($handle);
+	}
+
+	/** @param callable(float): void $f */
+	public static function requestAnimationFrame(callable $f): int {
+		return self::window()->requestAnimationFrame(Closure::fromCallable($f));
+	}
+
+	public static function cancelAnimationFrame(?int $handle): void {
+		self::window()->cancelAnimationFrame($handle);
+	}
+
+	/**
+	 * The network, through the page's gate: a host Promise of a Response; `->then($ok, $err)`
+	 * calls one of them later, from the event loop.
+	 * @param array{method?: string, headers?: array<string, string>, body?: string, credentials?: string}|null $init
+	 * @return Promise
+	 */
+	public static function fetch(string $input, ?array $init = null): object {
+		return self::window()->fetch($input, $init);
+	}
+
+	/** Text messages only. @return WebSocket */
+	public static function WebSocket(string $url, string|array|null $protocols = null): object {
+		return self::window()->WebSocket($url, $protocols);
+	}
+
+	/** Async only. @return XMLHttpRequest */
+	public static function XMLHttpRequest(): object {
+		return self::window()->XMLHttpRequest();
+	}
 }
 
 // The page runs on the browser's UI thread, so it must never block: sleep() and its kin are
