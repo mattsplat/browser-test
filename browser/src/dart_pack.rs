@@ -278,7 +278,7 @@ impl DartRuntime {
 /// fails the start: the loader traces it and shows it in place of the page.
 pub fn start(doc: blitz_dom::BaseDocument, env: crate::host::PageEnv, wasm: &[u8]) -> Result<PackDocument> {
     let origin = crate::settings::origin_of(doc.url());
-    let module = compiled(wasm, &origin, crate::profile::dir())?;
+    let module = compiled(wasm, &origin, crate::profile::dir(), "dart")?;
     let (host, startup) = PackDocument::starting(doc, env, "dart");
     let mut runtime = DartRuntime::load(wasm, &module, Box::new(host))?;
     if let Err(e) = runtime.run_main() {
@@ -300,10 +300,12 @@ const KEEP_COMPILED: usize = 32;
 /// machine ran some other site's program, or ran it in another profile. Only compiled code
 /// is shared; every page still gets its own instance and store. With no profile folder
 /// (tests), nothing is saved.
-fn compiled(wasm: &[u8], origin: &str, profile: Option<&std::path::Path>) -> Result<Module> {
-    let dir = profile.map(|p| p.join("compiled-dart"));
+/// `kind` names the folder (`compiled-dart`, `compiled-rust`): Rust pages, also compiled ahead
+/// of time, are kept the same way.
+pub(crate) fn compiled(wasm: &[u8], origin: &str, profile: Option<&std::path::Path>, kind: &str) -> Result<Module> {
+    let dir = profile.map(|p| p.join(format!("compiled-{kind}")));
     let path = dir.as_ref().map(|d| d.join(format!("{}.cwasm", crate::page_document::code_key(wasm, origin))));
-    let (module, fresh) = crate::page_document::load_or_compile(wasm, path.as_deref(), "Dart program")?;
+    let (module, fresh) = crate::page_document::load_or_compile(wasm, path.as_deref(), &format!("{kind} program"))?;
     if let (true, Some(dir)) = (fresh, &dir) {
         prune_compiled(dir, KEEP_COMPILED);
     }
@@ -1048,10 +1050,10 @@ mod tests {
             f.sort();
             f
         };
-        compiled(&wasm, "https://a.test", Some(&profile)).unwrap();
+        compiled(&wasm, "https://a.test", Some(&profile), "dart").unwrap();
         let first = files();
         assert_eq!(first.len(), 1);
-        let again = compiled(&wasm, "https://a.test", Some(&profile)).unwrap();
+        let again = compiled(&wasm, "https://a.test", Some(&profile), "dart").unwrap();
         assert_eq!(files(), first, "loaded, not compiled and written again");
         assert!(again.imports().len() > 0, "a usable module");
         // Another site's key differs, so it can never hit this entry.

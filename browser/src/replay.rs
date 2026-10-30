@@ -116,6 +116,8 @@ impl Step {
 #[derive(Clone, Debug)]
 pub enum Program {
     Dart(Vec<u8>),
+    /// A Rust page's program (its `.wasm`).
+    Rust(Vec<u8>),
     /// "js", "python" or "php": its scripts, and (JS) each module import fetched, URL → source.
     Scripts { pack: &'static str, scripts: Vec<Script>, imports: Vec<(String, String)> },
 }
@@ -417,6 +419,7 @@ pub async fn replay(recording: &Recording, config: DocumentConfig, upto: Option<
     }
     let started = match program {
         Program::Dart(wasm) => crate::dart_pack::start(doc, Default::default(), wasm),
+        Program::Rust(wasm) => crate::rust_pack::start(doc, Default::default(), wasm),
         Program::Scripts { pack: "python", scripts, .. } => crate::python_pack::start(doc, Default::default(), scripts),
         Program::Scripts { pack: "php", scripts, .. } => crate::php_pack::start(doc, Default::default(), scripts),
         Program::Scripts { scripts, imports, .. } => {

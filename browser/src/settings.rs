@@ -64,6 +64,8 @@ pub struct Settings {
     pub python_blocked: BTreeSet<String>,
     /// Origins where the PHP pack may not run. PHP, like Dart, is on everywhere else.
     pub php_blocked: BTreeSet<String>,
+    /// Origins where Rust programs may not run. Rust, like Dart, is on everywhere else.
+    pub rust_blocked: BTreeSet<String>,
     /// Refuse requests a page makes to other sites, unless allowed for that page's origin.
     pub block_third_party: bool,
     /// Other sites (registrable domains) each origin may reach.
@@ -95,6 +97,7 @@ impl Default for Settings {
             dart_blocked: BTreeSet::new(),
             python_blocked: BTreeSet::new(),
             php_blocked: BTreeSet::new(),
+            rust_blocked: BTreeSet::new(),
             // Default-deny for third-party requests, as the design says.
             block_third_party: true,
             allowed_third_party: BTreeMap::new(),

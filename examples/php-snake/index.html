@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PHP snake</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; color: #222; }
+    .bar { display: flex; align-items: center; gap: 16px; margin: 12px 0; font-variant-numeric: tabular-nums; }
+    #status { flex: 1; color: #6A5ACD; }
+    button { font-size: 15px; padding: 6px 14px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    #board { border-radius: 8px; display: block; }
+    .keys { color: #666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>PHP snake</h1>
+  <p class="keys">Arrow keys or WASD to steer, Space to pause, Enter or the button to start
+  again. In PHP: <code>main.php</code>.</p>
+  <div class="bar">
+    <span id="status">PHP isn't running on this page.</span>
+    <span>Score <b id="score">0</b></span>
+    <span>Best <b id="best">0</b></span>
+    <button id="restart">New game</button>
+  </div>
+  <canvas id="board" width="400" height="400"></canvas>
+  <script type="text/php" src="main.php"></script>
+</body>
+</html>

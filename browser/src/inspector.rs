@@ -354,6 +354,7 @@ fn language(pack: &str) -> &str {
         "js" => "JavaScript",
         "python" => "Python",
         "php" => "PHP",
+        "rust" => "Rust",
         other => other,
     }
 }

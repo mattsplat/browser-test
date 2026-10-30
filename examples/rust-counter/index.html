@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Rust counter</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+    #status { color: #B7410E; }
+    .counter { display: flex; align-items: center; gap: 16px; margin: 24px 0; }
+    #count { font-size: 48px; font-weight: bold; min-width: 64px; }
+    button { font-size: 16px; padding: 8px 16px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; }
+    #log { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Rust counter</h1>
+  <p>The same counter as the other examples, in Rust. Rust is compiled ahead of time, like
+  Dart: the page ships <code>app.wasm</code>, built from <code>src/lib.rs</code> with
+  <code>packs/rust/build.sh examples/rust-counter</code>.</p>
+  <p id="status">Rust isn't running on this page.</p>
+  <div class="counter">
+    <span id="count">0</span>
+    <button id="increment">Add one</button>
+  </div>
+  <ul id="log"></ul>
+  <script type="application/rust" src="app.wasm"></script>
+</body>
+</html>

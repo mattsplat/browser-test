@@ -20,6 +20,7 @@ pub static PYTHON: Language = Language {
     prefix: "py",
     path: concat!(env!("CARGO_MANIFEST_DIR"), "/../packs/python/target/wasm32-wasip1/release/python_pack.wasm"),
     build: "packs/python/build.sh",
+    can_eval: true,
     module: OnceLock::new(),
 };
 

@@ -1,0 +1,16 @@
+# Snake, in Rust. Build: packs/rust/build.sh examples/snake (writes app.wasm).
+[package]
+name = "snake"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+unscripted = { path = "../../packs/rust" }
+
+[profile.release]
+opt-level = "s"
+lto = true

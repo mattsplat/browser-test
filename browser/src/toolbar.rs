@@ -8,7 +8,7 @@ use dioxus_native::{NodeHandle, SubDocumentAttr, prelude::*};
 use crate::about_pages::AboutPage;
 use crate::history::HistoryNav;
 use crate::icons::{self, IconButton};
-use crate::nav::{is_enter_key, open_in_external_browser, req_from_string};
+use crate::nav::{complete_path, is_enter_key, open_in_external_browser, req_from_string};
 use crate::tab::{Tab, TabId, TabStoreExt, TabStoreImplExt, active_tab};
 use crate::url_suggestions::{Suggestion, SuggestionKind, UrlSuggester, UrlSuggestions};
 use crate::{IS_MOBILE, Panel, StdNetProvider, settings};
@@ -45,7 +45,10 @@ pub fn Toolbar(
     let mut selected_suggestion = use_signal::<Option<usize>>(|| None);
 
     let suggester = use_context::<UrlSuggester>();
-    let suggestions = suggester.suggestions();
+    // Tab completion's files and folders, shown instead of history while there are some.
+    let mut path_matches = use_signal(Vec::<Suggestion>::new);
+    let history_suggestions = suggester.suggestions();
+    let suggestions = use_memo(move || if path_matches.read().is_empty() { history_suggestions() } else { path_matches() });
     use_effect(move || suggester.set_query(url_input_value.read().clone()));
 
     use_effect(move || {
@@ -74,7 +77,12 @@ pub fn Toolbar(
     let navigate_from_urlbar = use_callback(move |req: Request| {
         blur_urlbar(());
         clear_document_focus(());
-        active_tab(tabs, active_tab_id()).navigate(req);
+        let tab = active_tab(tabs, active_tab_id());
+        tab.navigate(req);
+        // Keys now go to the page, as after Enter in any browser's address bar.
+        if let Some(view) = tab.node_handle().cloned() {
+            crate::tab::focus_view(&view, true);
+        }
     });
 
     let on_pick = use_callback(move |s: Suggestion| {
@@ -83,6 +91,15 @@ pub fn Toolbar(
         // row is here so users can return to "what Enter would do" after
         // moving through the list with arrow keys.
         let req = match s.kind {
+            // A folder opens its contents for the next pick, as Tab into it would.
+            SuggestionKind::Path { text, is_dir: true } => {
+                let listed = complete_path(&text).map(|c| c.matches).unwrap_or_default();
+                *url_input_value.write() = text;
+                path_matches.set(listed.into_iter().map(Suggestion::path).collect());
+                selected_suggestion.set(None);
+                return;
+            }
+            SuggestionKind::Path { text, is_dir: false } => req_from_string(&text),
             SuggestionKind::History(entry) => Some(Request::get(entry.url)),
             SuggestionKind::Literal | SuggestionKind::Search => {
                 req_from_string(&url_input_value.read())
@@ -376,6 +393,18 @@ pub fn Toolbar(
                                 evt.prevent_default();
                                 blur_urlbar(());
                             }
+                            // A path completes like a terminal's; anything else keeps Tab's
+                            // usual meaning.
+                            Key::Named(NamedKey::Tab) => {
+                                let typed = url_input_value.read().clone();
+                                if let Some(done) = complete_path(&typed) {
+                                    evt.prevent_default();
+                                    let several = done.matches.len() > 1;
+                                    *url_input_value.write() = done.text;
+                                    path_matches.set(if several { done.matches.into_iter().map(Suggestion::path).collect() } else { Vec::new() });
+                                    selected_suggestion.set(None);
+                                }
+                            }
                             k if is_enter_key(k) => {
                                 evt.prevent_default();
                                 submit_urlbar(());
@@ -384,6 +413,7 @@ pub fn Toolbar(
                         }
                     },
                     oninput: move |evt| {
+                        path_matches.set(Vec::new());
                         *url_input_value.write() = evt.value();
                         selected_suggestion.set(Some(0));
                     },

@@ -1,0 +1,12 @@
+# Rust page code for the Unscripted browser: the browser's objects and functions over its host.
+# A page depends on this crate, builds to wasm32-wasip1 (packs/rust/build.sh) and ships the
+# .wasm: <script type="application/rust" src="app.wasm">.
+[package]
+name = "unscripted"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde_json = "1"

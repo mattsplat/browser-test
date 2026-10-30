@@ -607,6 +607,15 @@ impl RunningPack {
     /// listener called `preventDefault`. Idle, or with no listener on the chain, nothing runs.
     fn dispatch(&self, chain: &[NodeId], kind: &str, details: EventDetails) -> bool {
         let Some(&target) = chain.first() else { return false };
+        // Blitz's chain stops at the root element; in the DOM an event goes on to the document
+        // and the window, whose listeners are kept on the root node (`PageHost::scope`).
+        // Without it, `document.addEventListener('keydown', ...)` never heard a key.
+        let root = self.doc.borrow().root_node().id;
+        let mut chain = chain.to_vec();
+        if chain.last() != Some(&root) {
+            chain.push(root);
+        }
+        let chain = &chain[..];
         let listening = |node: &NodeId| self.objects.borrow().listeners.contains_key(&(*node, kind.to_string()));
         // Paused on an exception or stopped, the page's listeners don't run (Blitz's defaults still do).
         if self.idle() || !chain.iter().any(listening) {
@@ -3115,6 +3124,169 @@ setInterval(tick, 1)
         run_timers_for(&mut page, std::time::Duration::from_millis(200));
         let (ticks, frames) = counts(&page);
         assert!(ticks >= 5 && frames >= 3, "shown: {ticks} ticks, {frames} frames");
+    }
+
+    // ---- Rust: the page ships a program built on `packs/rust` (the `unscripted` crate).
+
+    /// Build a Rust page crate (`packs/rust/build.sh`, once per crate per test run) and read
+    /// the program it writes, `app.wasm`.
+    fn rust_program(dir: &str) -> Vec<u8> {
+        static BUILT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_dir = root.join(dir).canonicalize().unwrap();
+        let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+        if !built.contains(&dir.to_string()) {
+            let status = std::process::Command::new(root.join("../packs/rust/build.sh")).arg(&crate_dir).stdout(std::process::Stdio::null()).status().unwrap();
+            assert!(status.success(), "packs/rust/build.sh {dir} failed");
+            built.push(dir.to_string());
+        }
+        std::fs::read(crate_dir.join("app.wasm")).unwrap()
+    }
+
+    /// The probe page in `mode`, at its own URL (so its trace entries are its own).
+    fn rust_probe(mode: &str) -> (PackDocument, String) {
+        let url = format!("https://rust-{mode}.test/");
+        let html = format!("<p id=mode>{mode}</p><p id=out></p><button id=b>go</button>");
+        let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.clone()), ..Default::default() }).into_inner();
+        (crate::rust_pack::start(doc, Default::default(), &rust_program("tests/fixtures/rust-probe")).unwrap(), url)
+    }
+
+    fn console_on(page: &str) -> Vec<String> {
+        host::trace().into_iter().filter(|e| e.page == page && e.kind == TraceKind::Console).map(|e| e.args).collect()
+    }
+
+    /// The Rust counter example, end to end: its program (built from src/lib.rs) on the
+    /// interpreter packs' runtime, the same host, the real Blitz DOM. `println!` goes to the
+    /// console; the console can't evaluate Rust.
+    #[test]
+    fn rust_counter_example_runs_and_handles_clicks() {
+        let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/rust-counter/index.html")).unwrap();
+        assert!(html.contains(r#"<script type="application/rust" src="app.wasm"></script>"#));
+        let url = "https://rust-counter.test/";
+        let doc = HtmlDocument::from_html(&html, DocumentConfig { base_url: Some(url.into()), ..Default::default() }).into_inner();
+        let page = crate::rust_pack::start(doc, Default::default(), &rust_program("../examples/rust-counter")).unwrap();
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#status"), "Rust is running, as a pack in WebAssembly.", "{:?}", errors_on(url));
+        let (button, id) = listener(&page, "#increment", "click");
+        for _ in 0..2 {
+            let event = HostValue::Object(page.pack.objects.borrow_mut().event("click", button, Default::default()));
+            page.pack.fire(id, &[event]).unwrap();
+        }
+        let doc = page.pack.doc.borrow();
+        assert_eq!(text_of(&doc, "#count"), "2");
+        assert_eq!(text_of(&doc, "#log"), "Click 1, handled in Rust (click)Click 2, handled in Rust (click)");
+        drop(doc);
+        assert!(console_on(url).iter().any(|line| line.trim() == "click 2"), "{:?}", console_on(url));
+        assert!(!page.pack.can_eval());
+        let err = page.pack.eval("1 + 1", debug::CONSOLE_PACK).unwrap_err().to_string();
+        assert!(err.starts_with("Rust pages can't evaluate code"), "{err}");
+    }
+
+    /// A member the browser lacks is an error Rust handles as a `Result`; a panic is reported
+    /// on the console and stops the page.
+    #[test]
+    fn rust_errors_are_reported() {
+        let (mut page, url) = rust_probe("errors");
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#out"), "Document.fooBar() is not supported yet");
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        assert!(console_on(&url).iter().any(|line| line.contains("Rust panic") && line.contains("rust broke")), "{:?}", console_on(&url));
+        assert!(errors_on(&url).iter().any(|e| e.contains("the Rust pack crashed")), "{:?}", errors_on(&url));
+        assert!(page.pack.idle());
+    }
+
+    /// Rust's std reaches nothing outside the page: files, sockets, environment, processes
+    /// and threads all fail.
+    #[test]
+    fn rust_has_no_side_doors() {
+        let (page, _) = rust_probe("doors");
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#out"), "none");
+    }
+
+    /// Timers and fetch come back through the event loop; with no network, fetch's error
+    /// callback runs.
+    #[test]
+    fn rust_timers_and_fetch_run_later() {
+        let (mut page, url) = rust_probe("async");
+        run_timers_for(&mut page, std::time::Duration::from_millis(300));
+        let out = text_of(&page.pack.doc.borrow(), "#out");
+        let mut notes: Vec<&str> = out.split("; ").collect();
+        notes.sort();
+        assert_eq!(notes.len(), 2, "{out} {:?}", errors_on(&url));
+        assert!(notes[0].starts_with("fetch failed: TypeError: Failed to fetch") && notes[1] == "timer ran", "{out}");
+        assert!(console_on(&url).iter().any(|line| line.trim() == "hello from Rust"));
+    }
+
+    /// Events bubble past the root element to the document and the window, as in the DOM;
+    /// `stopPropagation` still stops them on the way.
+    #[test]
+    fn document_and_window_listeners_hear_bubbling_events() {
+        let mut page = js_page("<p id=out></p><button id=b>go</button><button id=stop>stop</button>", &["
+            const seen = [];
+            const note = (where) => () => { seen.push(where); document.querySelector('#out').textContent = seen.join(','); };
+            document.querySelector('#b').addEventListener('click', note('button'));
+            document.addEventListener('click', note('document'));
+            window.addEventListener('click', note('window'));
+            document.querySelector('#stop').addEventListener('click', (e) => e.stopPropagation());
+            document.addEventListener('keydown', (e) => note('key ' + e.key)());
+        "]);
+        dispatch(&mut page, "#b", click_at(0.0, 0.0, false));
+        assert_eq!(output(&page), "button,document,window");
+        dispatch(&mut page, "#stop", click_at(0.0, 0.0, false));
+        assert_eq!(output(&page), "button,document,window", "stopped at the button");
+        dispatch(&mut page, "html", key_down("x", Code::KeyX, false));
+        assert_eq!(output(&page), "button,document,window,key x");
+    }
+
+    /// The Rust snake example: left alone it runs into the wall; Space pauses and resumes,
+    /// Enter starts again, and the keys reach a listener on the document.
+    #[test]
+    fn snake_example_plays_in_rust() {
+        let wasm = rust_program("../examples/snake");
+        let url = example_url("snake/index.html");
+        let mut page = crate::rust_pack::start(example_doc("snake/index.html"), Default::default(), &wasm).unwrap();
+        let status = |page: &PackDocument| text_of(&page.pack.doc.borrow(), "#status");
+        assert_eq!(status(&page), "Go!", "{:?}", errors_on(&url));
+
+        dispatch(&mut page, "html", key_down(" ", Code::Space, false));
+        assert_eq!(status(&page), "Paused. Space to carry on.");
+        run_timers_for(&mut page, std::time::Duration::from_millis(400));
+        assert_eq!(status(&page), "Paused. Space to carry on.", "paused, it doesn't move");
+        dispatch(&mut page, "html", key_down(" ", Code::Space, false));
+
+        // Heading right from the middle with no turns, it reaches the wall in 13 steps.
+        run_timers_for(&mut page, std::time::Duration::from_millis(2500));
+        assert_eq!(status(&page), "Game over. Press Enter for another.", "{:?}", errors_on(&url));
+        dispatch(&mut page, "html", key_down("Enter", Code::Enter, false));
+        assert_eq!(status(&page), "Go!");
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#score"), "0");
+        assert_eq!(errors_on(&url), Vec::<String>::new());
+    }
+
+    /// The PHP snake example plays as the Rust one does: Space pauses and resumes, left alone
+    /// it runs into the wall, Enter starts again.
+    #[test]
+    fn php_snake_example_plays() {
+        let url = example_url("php-snake/index.html");
+        let mut page = crate::php_pack::start(example_doc("php-snake/index.html"), Default::default(), &example_script("php-snake/main.php")).unwrap();
+        let status = |page: &PackDocument| text_of(&page.pack.doc.borrow(), "#status");
+        assert_eq!(status(&page), "Go!", "{:?}", errors_on(&url));
+        dispatch(&mut page, "html", key_down(" ", Code::Space, false));
+        assert_eq!(status(&page), "Paused. Space to carry on.");
+        run_timers_for(&mut page, std::time::Duration::from_millis(400));
+        assert_eq!(status(&page), "Paused. Space to carry on.", "paused, it doesn't move");
+        dispatch(&mut page, "html", key_down(" ", Code::Space, false));
+        run_timers_for(&mut page, std::time::Duration::from_millis(2500));
+        assert_eq!(status(&page), "Game over. Press Enter for another.", "{:?}", errors_on(&url));
+        dispatch(&mut page, "html", key_down("Enter", Code::Enter, false));
+        assert_eq!(status(&page), "Go!");
+        assert_eq!(text_of(&page.pack.doc.borrow(), "#score"), "0");
+        assert_eq!(errors_on(&url), Vec::<String>::new());
+    }
+
+    #[test]
+    fn runaway_rust_is_stopped() {
+        let (page, url) = rust_probe("loop");
+        assert!(errors_on(&url).iter().any(|e| e.contains("script ran too long and was stopped (Rust)")), "{:?}", errors_on(&url));
+        assert!(page.pack.idle());
     }
 
     /// `performance` is the page's clock in every interpreter: `now()` counts milliseconds from

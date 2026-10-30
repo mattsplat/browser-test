@@ -3,7 +3,7 @@
 The web, unscripted: an experimental browser where JavaScript isn't the language of the web,
 just one of several.
 
-Pages can be written in **Dart, JavaScript, Python or PHP**. Each language is a *pack*: a
+Pages can be written in **Dart, JavaScript, Python, PHP or Rust**. Each language is a *pack*: a
 WebAssembly module running in [wasmtime](https://wasmtime.dev) that reaches the page only
 through one host. HTML and CSS are rendered by [Blitz](https://github.com/DioxusLabs/blitz),
 with no scripting engine built in.
@@ -46,14 +46,15 @@ page code can call, in each language, is in [`docs/api.md`](docs/api.md).
 
 ## What's in it
 
-- **Four language packs.**
+- **Five language packs.**
   - Dart: dart2wasm output.
   - JS: [Boa](https://boajs.dev).
   - Python: [RustPython](https://rustpython.github.io).
   - PHP: php-src 8.4, embed SAPI.
+  - Rust: the page's own program, on the `unscripted` crate (`packs/rust`).
 
-  JS, Python and PHP share one runtime; adding another interpreted language is a new crate
-  under `packs/`. See [`docs/packs.md`](docs/packs.md).
+  JS, Python, PHP and Rust share one runtime; adding another interpreted language is a new
+  crate under `packs/`. See [`docs/packs.md`](docs/packs.md).
 - **Web platform.**
   - DOM and events, timers and `fetch` (gated and CORS-checked).
   - Cookies, `localStorage`/`sessionStorage` and `location`/`history`.
@@ -112,6 +113,9 @@ Tests: `cd browser && cargo test --release`. They need the JS, Python and PHP pa
 | [`examples/js-modules`](examples/js-modules) | JavaScript, ES modules |
 | [`examples/python-counter`](examples/python-counter) | Python |
 | [`examples/php-counter`](examples/php-counter) | PHP, from a separate `main.php` |
+| [`examples/rust-counter`](examples/rust-counter) | Rust: build first with `packs/rust/build.sh examples/rust-counter` |
+| [`examples/php-snake`](examples/php-snake) | PHP: the same Snake game, from `main.php` (no build step) |
+| [`examples/snake`](examples/snake) | Rust: Snake on a canvas, keyboard controls, best score in `localStorage`. Build with `packs/rust/build.sh examples/snake` |
 | [`examples/benchmark`](examples/benchmark) | One page per language (`js.html`, `python.html`, `php.html`, `dart.html`): the same five timed tasks, and a chart comparing every language you've run. Build the Dart one first: `packs/dart/build.sh examples/benchmark/bench.dart` |
 | [`examples/particles`](examples/particles) | PHP: a canvas animation on `requestAnimationFrame`; click to burst |
 | [`examples/paint`](examples/paint) | JavaScript: mouse drawing on a canvas, palette and brush sizes |

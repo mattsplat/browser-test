@@ -1,0 +1,12 @@
+# A Rust page for the Rust pack's tests: its main reads #mode from the page and does that.
+[package]
+name = "rust-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+unscripted = { path = "../../../../packs/rust" }

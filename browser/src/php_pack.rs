@@ -19,6 +19,7 @@ pub static PHP: Language = Language {
     prefix: "php",
     path: concat!(env!("CARGO_MANIFEST_DIR"), "/../packs/php/target/php_pack.wasm"),
     build: "packs/php/build.sh",
+    can_eval: true,
     module: OnceLock::new(),
 };
 

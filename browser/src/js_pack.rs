@@ -19,6 +19,7 @@ pub static JS: Language = Language {
     prefix: "js",
     path: concat!(env!("CARGO_MANIFEST_DIR"), "/../packs/js/target/wasm32-wasip1/release/js_pack.wasm"),
     build: "packs/js/build.sh",
+    can_eval: true,
     module: OnceLock::new(),
 };
 

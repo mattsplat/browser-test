@@ -36,6 +36,7 @@ filled its atlas and crashed the app within seconds. The changes are marked `bro
 | Phase E | Per-site CSS, Split View, dev-mode hot reload with state restore, Dart compiled-code cache (per site and profile), time-travel replay |
 | Parity 1 | `document.cookie` (per-profile jar, persisted, SameSite), `fetch` (gated per hop, CORS, bounded), local/sessionStorage, location/history, window basics |
 | Parity 2 | DOM breadth and form events, WebSocket, IndexedDB subset, canvas 2D subset, async XHR |
+| Rust pack | The page ships a Rust program on `packs/rust` (`unscripted` crate), run on the interpreter runtime; `<script type="application/rust">`, per-site block, `examples/rust-counter`. No `web-sys` yet |
 | PHP pack | php-src 8.4 (embed SAPI) in wasm; `<script type="text/php">`, per-site block in the Site panel, `examples/php-counter` |
 
 Every web API works identically in Dart, JS and Python; cross-pack tests enforce it. PHP has
@@ -67,6 +68,7 @@ its own tests (`php_*` in `page_document.rs`) but isn't in the cross-pack ones y
 - [ ] **Dev mode:** prompt on `examples/counter/dev.html`; every Site panel toggle; JS bar on `examples/js-counter` (Allow this visit / Always / Keep off).
 - [ ] **Inspector:** Elements highlight follows selection; Toggle DevTools, then click an element: it's selected in Elements; Console eval on JS and Python pages; Dart shows the "can't evaluate" note; pause on exceptions, then Resume.
 - [ ] **AI access:** turn on, connect Claude Code (command below); cookies, storage and form values show `(hidden)`; AI control appears only while access is on.
+- [ ] **Address bar paths:** type `~/Doc`, press Tab (completes to `~/Documents/`), Tab again lists its contents; arrow keys and Enter pick; a folder opens as a listing; a file opens.
 - [ ] **Tabs and profiles:** Cmd+K; vertical tabs layout (traffic lights, panel offset); restart restores tabs; Cmd+Shift+T; new profile opens a second window; existing history appears under Default.
 - [ ] **Python:** `examples/python-counter`; a `while True: pass` handler stops after ~5 s.
 - [ ] **PHP:** `examples/php-counter`; Console eval (`Unscripted::document()->querySelector('h1')->textContent`); block PHP in the Site panel and reload.

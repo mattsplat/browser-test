@@ -48,6 +48,7 @@ mod profile;
 mod prompt;
 mod php_pack;
 mod python_pack;
+mod rust_pack;
 mod replay;
 mod request_panel;
 mod settings;

@@ -22,6 +22,9 @@ pub enum SuggestionKind {
     // worst-case enum size set by HistoryEntry.
     History(Box<HistoryEntry>),
     Search,
+    /// A file or folder Tab completion found (`nav::complete_path`): the address bar text that
+    /// picks it.
+    Path { text: String, is_dir: bool },
 }
 
 #[derive(Clone, PartialEq)]
@@ -32,6 +35,11 @@ pub struct Suggestion {
 }
 
 impl Suggestion {
+    pub fn path(found: crate::nav::PathMatch) -> Self {
+        let name = if found.is_dir { format!("{}/", found.name) } else { found.name };
+        Suggestion { kind: SuggestionKind::Path { text: found.text, is_dir: found.is_dir }, display_title: name, display_subtitle: String::new() }
+    }
+
     /// Stable identity for list diffing. Without this, Dioxus matches rows by
     /// position; as the suggestion set shifts while typing it would reuse a
     /// row's `<img>` for a different entry, leaving the previous (already
@@ -42,6 +50,7 @@ impl Suggestion {
             SuggestionKind::Literal => "literal".to_string(),
             SuggestionKind::Search => "search".to_string(),
             SuggestionKind::History(entry) => format!("history:{}", entry.url),
+            SuggestionKind::Path { text, .. } => format!("path:{text}"),
         }
     }
 }
@@ -314,7 +323,7 @@ fn SuggestionRow(
     };
     let (favicon_url, show_subtitle) = match &suggestion.kind {
         SuggestionKind::History(entry) => (entry.favicon_url.clone(), true),
-        SuggestionKind::Literal | SuggestionKind::Search => (None, false),
+        SuggestionKind::Literal | SuggestionKind::Search | SuggestionKind::Path { .. } => (None, false),
     };
     let pick = suggestion.clone();
     rsx! {

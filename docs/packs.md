@@ -1,16 +1,18 @@
 # Language packs
 
-A language pack runs a page's code in one language. There are four: **Dart** (dart2wasm
+A language pack runs a page's code in one language. There are five: **Dart** (dart2wasm
 output), **JS** (Boa compiled to `wasm32-wasip1`), **Python** (RustPython compiled to
-`wasm32-wasip1`) and **PHP** (php-src's embed SAPI compiled to `wasm32-wasip1` with wasi-sdk). They all run in wasmtime on the UI thread and reach the page only through
+`wasm32-wasip1`), **PHP** (php-src's embed SAPI compiled to `wasm32-wasip1` with wasi-sdk)
+and **Rust** (the page's own program, built for `wasm32-wasip1` on the `unscripted` crate). They all run in wasmtime on the UI thread and reach the page only through
 the host (`browser/src/host.rs`). This document says what a pack implements and what the
 host guarantees in return. The code is the reference; the module named in each section is
 where to look.
 
 Two kinds of pack exist today:
 
-- **Compiled** (Dart): the page ships Wasm. The pack is a Rust adapter between that Wasm's
-  imports and the host (`dart_pack.rs`).
+- **Compiled** (Dart, Rust): the page ships Wasm. Dart's pack is a Rust adapter between that
+  Wasm's imports and the host (`dart_pack.rs`). A Rust page is built on `packs/rust`, which
+  speaks the interpreter ABI below, so `rust_pack.rs` runs it on the interpreter runtime.
 - **Interpreter** (JS, Python, PHP): the page ships source. The pack is an interpreter compiled to
   Wasm with a fixed ABI, and one shared Rust runtime (`interpreter.rs`) loads any such
   interpreter. Adding an interpreted language is a new crate under `packs/` and a
@@ -437,3 +439,22 @@ into `packs/php/target/php_pack.wasm` (about 4.7 MB). The PHP side of the bridge
 - **Not available:** Fibers (no stack switching; creating one throws), `sleep` and the
   process functions (disabled), files, sockets, `dl()`. There is no promise wrapper yet:
   `Unscripted::fetch(...)->then($ok, $err)` calls the host promise directly.
+
+## Rust pack
+
+- **What a page ships:** a `cdylib` crate built for `wasm32-wasip1` with
+  `packs/rust/build.sh <crate>`, which writes `<crate>/app.wasm`. The page loads it with
+  `<script type="application/rust" src="app.wasm">`. `examples/rust-counter` is the smallest
+  one.
+- **The crate** (`packs/rust`, `unscripted`): `document()`, `window()`, `console()`,
+  `create(tag)`, `random()`, `now()`, timers, `fetch`; an `Object` has `get`, `set` and `call` with the web
+  platform's names, plus helpers (`query`, `on`, `text`, `set_text`, `append`, `then`).
+  `unscripted::main!(start)` names the entry point and defines the exports the browser calls.
+- **ABI:** the interpreter packs' (`host.request`, `rust_alloc`/`free`/`fire`/`release`/
+  `host_api`), with `rust_main` instead of `run`. So `rust_pack.rs` loads the page's module
+  with `Interpreter::load_module` (compiled code kept per site and profile in
+  `compiled-rust/`, as Dart's is) and calls `run_main`.
+- **Std:** `println!` and panics reach the console (a panic then stops the page). Time comes
+  from the host. Files, sockets, environment, processes and threads all fail.
+- **Not available:** console eval (compiled ahead of time). `web-sys`/`wasm-bindgen` code
+  doesn't run yet; that needs a Dart-style adapter for wasm-bindgen's imports.

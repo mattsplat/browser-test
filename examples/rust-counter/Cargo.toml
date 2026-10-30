@@ -1,0 +1,16 @@
+# The counter example in Rust. Build: packs/rust/build.sh examples/rust-counter (writes app.wasm).
+[package]
+name = "rust-counter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+unscripted = { path = "../../packs/rust" }
+
+[profile.release]
+opt-level = "s"
+lto = true

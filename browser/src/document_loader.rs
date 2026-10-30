@@ -20,7 +20,7 @@ use crate::dev_compile;
 use crate::favicon::favicon_candidate;
 use crate::gate::PageGate;
 use crate::host::{self, TraceEntry, TraceKind};
-use crate::{dart_pack, js_pack, php_pack, python_pack};
+use crate::{dart_pack, js_pack, php_pack, python_pack, rust_pack};
 use crate::js_permission;
 use crate::prompt;
 use crate::replay;
@@ -155,7 +155,11 @@ impl DocumentLoader {
 
         let req = req.signal(signal.clone());
 
-        let response = net_provider.fetch_async(req).await;
+        // A folder gets the browser's own listing of it (Blitz reads file: URLs as files).
+        let response = match folder_listing(&req.url) {
+            Some(html) => Ok((req.url.to_string(), html.into_bytes().into())),
+            None => net_provider.fetch_async(req).await,
+        };
 
         match response {
             Ok((resolved_url, bytes)) => {
@@ -238,8 +242,8 @@ impl Drop for DocumentLoader {
 
 /// Build the document for a loaded page, returning the document, its title, and its
 /// favicon URL (if any). A page runs one pack, the first of: Dart (`<script
-/// type="application/dart" src="app.wasm">`), Python (`<script type="text/python">`), PHP
-/// (`<script type="text/php">`), JS
+/// type="application/dart" src="app.wasm">`), Rust (`<script type="application/rust"
+/// src="app.wasm">`), Python (`<script type="text/python">`), PHP (`<script type="text/php">`), JS
 /// (plain `<script>`, only where JS is allowed). Any other script is ignored.
 async fn build_page_document(
     html: &str,
@@ -276,6 +280,33 @@ async fn build_page_document(
     // What the page's code reaches beyond its document: the network, through its gate.
     let env = crate::host::PageEnv { gate: Some(Arc::clone(net_provider)), signal: Some(signal.clone()), ..env };
     let Some(src) = dart_script_url(&document) else {
+        // Rust, compiled ahead of time like Dart: the page ships its program, run on the
+        // interpreter packs' runtime (`rust_pack.rs`). Runs unless blocked for the site.
+        if let Some(src) = program_url(&document, "application/rust") {
+            trace_skipped(&document, &page_url, "Rust", &["python", "php", "js"]);
+            if settings::get().rust_blocked.contains(&origin) {
+                trace_pack_load("rust", &page_url, &src, format!("skipped: Rust is blocked for {origin}"));
+                return (shown(document), title, favicon_url);
+            }
+            let wasm = match fetch_dart_program(&src, &page_url, net_provider, signal).await {
+                Ok(wasm) => wasm,
+                Err(e) => {
+                    trace_pack_load("rust", &page_url, &src, format!("ERROR {e:#}"));
+                    return (shown(document), title, favicon_url);
+                }
+            };
+            arm(&page_url);
+            return match rust_pack::start(document, env, &wasm) {
+                Ok(rust) => {
+                    record(&rust, replay::Program::Rust(wasm));
+                    (shown_pack(rust), title, favicon_url)
+                }
+                Err(e) => {
+                    trace_pack_load("rust", &page_url, &src, format!("ERROR {e:#}"));
+                    ((error_document(&format!("Rust pack failed: {e:#}")), None), title, favicon_url)
+                }
+            };
+        }
         // Python, like Dart, runs unless blocked for the site.
         let scripts = page_scripts(&document, "python");
         if !scripts.is_empty() {
@@ -528,13 +559,18 @@ async fn dev_mode_compile(
 
 /// The `src` of the page's Dart script, resolved against the page URL.
 fn dart_script_url(document: &BaseDocument) -> Option<Url> {
-    let node = document.query_selector(r#"script[type="application/dart"]"#).ok()??;
+    program_url(document, "application/dart")
+}
+
+/// The `src` of the page's compiled program of `kind` (Dart's or Rust's `.wasm`).
+fn program_url(document: &BaseDocument, kind: &str) -> Option<Url> {
+    let node = document.query_selector(&format!(r#"script[type="{kind}"]"#)).ok()??;
     let src = document.get_node(node)?.attr(local_name!("src"))?;
     document.url().join(src).ok()
 }
 
-/// Fetch a Dart program: one `.wasm`, with its import table embedded by
-/// `packs/dart/build.sh`. It goes through the gate like any other request.
+/// Fetch a compiled program: one `.wasm` (Dart's has its import table embedded by
+/// `packs/dart/build.sh`). It goes through the gate like any other request.
 async fn fetch_dart_program(
     wasm_url: &Url,
     page: &Url,
@@ -544,6 +580,45 @@ async fn fetch_dart_program(
     let request = Request::get(wasm_url.clone()).signal(signal.clone());
     let (_, wasm) = net_provider.fetch_for_page(request, page).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(wasm.to_vec())
+}
+
+/// The most entries a folder listing shows.
+const MAX_LISTED: usize = 5000;
+
+/// A `file:` URL naming a folder, as a page linking to what's in it (folders first), like
+/// other browsers' listings. It's the browser's page: no script runs on it.
+fn folder_listing(url: &Url) -> Option<String> {
+    if url.scheme() != "file" {
+        return None;
+    }
+    let folder = url.to_file_path().ok().filter(|p| p.is_dir())?;
+    let escape = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let mut entries: Vec<(bool, String, String)> = std::fs::read_dir(&folder)
+        .map(|dir| dir.flatten().take(MAX_LISTED).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| {
+            let path = e.path();
+            let is_dir = std::fs::metadata(&path).is_ok_and(|m| m.is_dir());
+            let link = if is_dir { Url::from_directory_path(&path) } else { Url::from_file_path(&path) }.ok()?;
+            Some((is_dir, e.file_name().to_string_lossy().into_owned(), link.to_string()))
+        })
+        .collect();
+    entries.sort_by_key(|(is_dir, name, _)| (!is_dir, name.to_lowercase()));
+    let shown = folder.display().to_string();
+    let mut html = format!(
+        "<!doctype html><html><head><meta charset=utf-8><title>{t}</title><style>body{{font-family:sans-serif;max-width:760px;margin:32px auto;padding:0 16px}}li{{padding:2px 0}}a{{text-decoration:none}}.dir{{font-weight:bold}}</style></head><body><h1>{t}</h1><ul>",
+        t = escape(&shown)
+    );
+    if let Some(parent) = folder.parent().and_then(|p| Url::from_directory_path(p).ok()) {
+        html.push_str(&format!("<li><a href=\"{}\">../</a></li>", escape(parent.as_str())));
+    }
+    for (is_dir, name, link) in &entries {
+        let (class, slash) = if *is_dir { (" class=dir", "/") } else { ("", "") };
+        html.push_str(&format!("<li><a{class} href=\"{}\">{}{slash}</a></li>", escape(link), escape(name)));
+    }
+    html.push_str("</ul></body></html>");
+    Some(html)
 }
 
 /// A page without a pack, shown as is.
@@ -568,6 +643,25 @@ fn error_document(message: &str) -> SubDocumentAttr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder's file: URL is the browser's listing of it: folders first, names escaped,
+    /// a link up, and no script.
+    #[test]
+    fn folders_are_listed() {
+        let dir = std::env::temp_dir().join(format!("folder-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("zeta")).unwrap();
+        std::fs::write(dir.join("alpha <b>.txt"), "x").unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let html = folder_listing(&Url::from_directory_path(&dir).unwrap()).unwrap();
+        let zeta = html.find(">zeta/</a>").unwrap();
+        let alpha = html.find(">alpha &lt;b&gt;.txt</a>").unwrap();
+        assert!(zeta < alpha, "folders first: {html}");
+        assert!(html.contains(">../</a>") && !html.contains("<script"));
+        assert!(html.contains(&Url::from_file_path(dir.join("alpha <b>.txt")).unwrap().to_string()));
+        assert_eq!(folder_listing(&Url::from_file_path(dir.join("alpha <b>.txt")).unwrap()), None, "a file is read as a file");
+        assert_eq!(folder_listing(&Url::parse("https://example.com/").unwrap()), None);
+    }
     use settings::Settings;
 
     #[test]

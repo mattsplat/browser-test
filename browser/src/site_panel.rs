@@ -68,6 +68,7 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
     let dart_on = !current.dart_blocked.contains(&origin);
     let python_on = !current.python_blocked.contains(&origin);
     let php_on = !current.php_blocked.contains(&origin);
+    let rust_on = !current.rust_blocked.contains(&origin);
     // This site's JavaScript state: its own choice, or the global default.
     let this_visit = js_permission::allowed_this_visit(&origin);
     let (js_text, js_class) = if current.js_blocked.contains(&origin) {
@@ -107,6 +108,15 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
         apply(changes, Box::new(move |s| {
             if !s.php_blocked.remove(&o) {
                 s.php_blocked.insert(o);
+            }
+        }))
+    };
+    let o = origin.clone();
+    let toggle_rust = move |_| {
+        let o = o.clone();
+        apply(changes, Box::new(move |s| {
+            if !s.rust_blocked.remove(&o) {
+                s.rust_blocked.insert(o);
             }
         }))
     };
@@ -186,6 +196,12 @@ pub fn SitePanel(tabs: Store<Vec<Tab>>, active_tab_id: Signal<TabId>) -> Element
                     span { "PHP" }
                     div { class: if php_on { "request-toggle" } else { "request-toggle on" }, onclick: toggle_php,
                         if php_on { "Allowed" } else { "Blocked" }
+                    }
+                }
+                div { class: "site-row",
+                    span { "Rust" }
+                    div { class: if rust_on { "request-toggle" } else { "request-toggle on" }, onclick: toggle_rust,
+                        if rust_on { "Allowed" } else { "Blocked" }
                     }
                 }
                 div { class: "site-row",

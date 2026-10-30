@@ -204,6 +204,15 @@ fn commit_loaded_document<Lens>(
     });
 }
 
+/// Give a tab's view keyboard focus in the browser's window, so key presses reach its page.
+/// Unless `take`, only when nothing else has focus (the address bar may be in use).
+pub fn focus_view(view: &NodeHandle, take: bool) {
+    let mut window = view.doc_mut();
+    if take || window.get_focussed_node_id().is_none() {
+        window.set_focus_to(view.node_id());
+    }
+}
+
 #[component]
 pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<TabId>) -> Element {
     // This tab, looked up by id each time: a lens from `tabs.iter()` is a position in the list,
@@ -225,6 +234,19 @@ pub fn TabWebView(tabs: Store<Vec<Tab>>, tab_id: TabId, active_tab_id: Signal<Ta
             ever_shown.set(true);
         }
     });
+    // Keys go to whatever has focus in the browser's window, and reach a page only when its
+    // tab's view has it. So the tab shown takes focus when nothing else has it: at start, on
+    // switching tabs, when its page loads. The address bar keeps focus while it's in use.
+    use_effect(move || {
+        if !shown() || active_tab_id() != tab_id {
+            return;
+        }
+        let Some(tab) = current() else { return };
+        let _new_page = tab.page().read().is_some();
+        let Some(view) = tab.node_handle().cloned() else { return };
+        focus_view(&view, false);
+    });
+
     // A hidden tab's page gets no animation frames, and its timers run at most once a second.
     use_effect(move || {
         let hidden = !shown();

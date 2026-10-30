@@ -1,8 +1,8 @@
 # Page API reference
 
 What a page's code can use, in any language. Every pack reaches the page through one host
-(`browser/src/host.rs`), so this list is the same for Dart, JavaScript, Python and PHP; only
-the syntax differs. Names are the standard web ones (`querySelector`, `textContent`).
+(`browser/src/host.rs`), so this list is the same for Dart, JavaScript, Python, PHP and Rust;
+only the syntax differs. Names are the standard web ones (`querySelector`, `textContent`).
 
 Anything not listed here fails with a clear error, such as
 `Element.click() is not supported yet` or `Document.title is not supported yet`. The code is
@@ -48,6 +48,20 @@ U::document()->querySelector('#go')->addEventListener('click', function ($event)
 });
 ```
 
+```rust
+// Rust: a crate on packs/rust, built with packs/rust/build.sh; <script type="application/rust" src="app.wasm">
+use unscripted::{document, Object};
+
+fn start() {
+    document().query("#go").unwrap().on("click", |event: Object| {
+        let x = event.get("clientX").ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        document().query("#out").unwrap().set_text(&format!("clicked at {x}"));
+    });
+}
+
+unscripted::main!(start);
+```
+
 ```dart
 // Dart: package:web, compiled with packs/dart/build.sh; <script type="application/dart" src="main.wasm">
 import 'package:web/web.dart';
@@ -61,15 +75,15 @@ void main() {
 
 How each language sees the API:
 
-| | JavaScript | Python | PHP | Dart |
-|---|---|---|---|---|
-| Globals | `document`, `window`, ... | `document`, `window`, ... | static methods: `Unscripted::document()`, `Unscripted::fetch(...)`, ... (`use Unscripted as U;` to shorten); nothing else takes a name | `package:web`'s `document`, `window` |
-| Members | `el.textContent`, `el.focus()` | `el.textContent`, `el.focus()` | `$el->textContent`, `$el->focus()` | `el.textContent`, `el.focus()` |
-| Lists | `for...of`, spread, `forEach`, `[i]` | `for`, `len()`, `[i]` | `foreach`, `[$i]`, `->length` | `.item(i)`, `.length` |
-| Promises (`fetch`, `text()`, `json()`) | real `Promise`: `await` or `.then` | `.then(on_value, on_error)`; nest, don't chain; no `await` | `->then($ok, $err)` | `.toDart` and `await` |
-| Plain data (`fetch` options) | object literal | `dict` | array (`['method' => 'POST']`) | `JSObject` / `.jsify()` |
-| `print`/`echo` | — | `print()` goes to the console | `echo` goes to the console | `print()` goes to the console |
-| Console eval (Inspector, AI) | yes | yes | yes | no (compiled ahead of time) |
+| | JavaScript | Python | PHP | Dart | Rust |
+|---|---|---|---|---|---|
+| Globals | `document`, `window`, ... | `document`, `window`, ... | static methods: `Unscripted::document()`, `Unscripted::fetch(...)`, ... (`use Unscripted as U;` to shorten); nothing else takes a name | `package:web`'s `document`, `window` | `unscripted::document()`, `window()`, `fetch(...)` |
+| Members | `el.textContent`, `el.focus()` | `el.textContent`, `el.focus()` | `$el->textContent`, `$el->focus()` | `el.textContent`, `el.focus()` | `el.get("textContent")`, `el.call("focus", &[])`, or helpers (`el.text()`, `el.set_text(..)`) |
+| Lists | `for...of`, spread, `forEach`, `[i]` | `for`, `len()`, `[i]` | `foreach`, `[$i]`, `->length` | `.item(i)`, `.length` | `el.query_all(sel)` and `list.items()` give a `Vec` |
+| Promises (`fetch`, `text()`, `json()`) | real `Promise`: `await` or `.then` | `.then(on_value, on_error)`; nest, don't chain; no `await` | `->then($ok, $err)` | `.toDart` and `await` | `.then(ok, err)` closures |
+| Plain data (`fetch` options) | object literal | `dict` | array (`['method' => 'POST']`) | `JSObject` / `.jsify()` | `serde_json::json!({...})` |
+| `print`/`echo` | — | `print()` goes to the console | `echo` goes to the console | `print()` goes to the console | `println!` goes to the console |
+| Console eval (Inspector, AI) | yes | yes | yes | no (compiled ahead of time) | no (compiled ahead of time) |
 
 Numbers from the host are doubles; Python and PHP read whole ones as ints.
 
@@ -79,6 +93,8 @@ Keep page code in its own file (`<script type="text/python" src="main.py">`,
 `<script type="text/php" src="main.php">`): editors don't analyze code inside HTML. Then
 open the repo root in the editor.
 
+- **Rust:** the `unscripted` crate is ordinary Rust, so rust-analyzer completes it. Members
+  are named as strings (`get("textContent")`), so a typo shows at runtime.
 - **Dart:** `package:web` is fully typed. It also has APIs this browser lacks; those fail at
   runtime.
 - **JavaScript:** editors include the browser's DOM types. Like Dart, they show more than

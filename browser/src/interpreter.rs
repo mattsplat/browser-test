@@ -30,6 +30,9 @@ pub struct Language {
     pub path: &'static str,
     /// How to build it, for the error when it's missing.
     pub build: &'static str,
+    /// Whether console input can run: an interpreter can, a program compiled ahead of time
+    /// (Rust) ships no compiler.
+    pub can_eval: bool,
     /// The compiled module, once per process: each page gets a fresh instance of it.
     pub module: std::sync::OnceLock<Module>,
 }
@@ -126,7 +129,11 @@ fn check_host_api(lang: &Language, built_for: Option<u32>) -> Result<()> {
 
 impl Interpreter {
     pub fn load(lang: &'static Language, host: Box<dyn Host>) -> Result<Self> {
-        let module = module(lang)?;
+        Self::load_module(lang, module(lang)?, host)
+    }
+
+    /// A page's own program (Rust: the page ships the Wasm), on the same ABI and host.
+    pub fn load_module(lang: &'static Language, module: &Module, host: Box<dyn Host>) -> Result<Self> {
         let mut store = Store::new(engine(), State { lang, host, limits: memory_limits() });
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(TIME_LIMIT_TICKS);
@@ -213,6 +220,13 @@ impl Interpreter {
         self.check(status)
     }
 
+    /// Run a compiled program's entry point (`<prefix>_main`, Rust's `main!`).
+    pub fn run_main(&mut self) -> Result<()> {
+        self.enter()?;
+        let status = self.call::<(), u64>("main", ())?;
+        self.check(status)
+    }
+
     /// Run the page's classic scripts in order. Like a browser, one failing is reported and
     /// the next still runs.
     pub fn run_scripts(&mut self, scripts: &[Script], startup: &mut Startup) {
@@ -225,7 +239,14 @@ impl Interpreter {
 }
 
 impl PackRuntime for Interpreter {
+    fn can_eval(&self) -> bool {
+        self.lang.can_eval
+    }
+
     fn eval(&mut self, source: &str) -> Result<String> {
+        if !self.lang.can_eval {
+            bail!("{} pages can't evaluate code: they're compiled ahead of time and ship no compiler. Inspect the page in Elements, or log from the source.", self.lang.label);
+        }
         self.enter()?;
         let (ptr, len) = self.write_str(source)?;
         let packed = self.call::<(u32, u32), u64>("eval", (ptr, len))?;
